@@ -1,0 +1,17 @@
+{
+  "name": "better-jsonl",
+  "version": "0.1.0",
+  "big": 9007199254740993,
+  "maintainers": [
+    { "name": "Ada", "email": "ada@example.com", "roles": ["owner"] },
+    { "name": "Lin", "email": "lin@example.com", "roles": ["dev", "ops"] }
+  ],
+  "config": {
+    "indent": 2,
+    "views": ["formatted", "grid", "graph"],
+    "limits": { "graphNodes": 1500, "previewChars": 2000 },
+    "flags": { "beta": false, "telemetry": null }
+  },
+  "empty": {},
+  "list": []
+}

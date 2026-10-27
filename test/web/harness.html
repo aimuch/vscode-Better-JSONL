@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Better JSONL harness</title>
+<link rel="stylesheet" href="/dist/webview.css">
+<style id="theme-dark">
+  html[data-theme="dark"] {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --vscode-font-size: 13px;
+    --vscode-editor-font-family: Menlo, Monaco, "Courier New", monospace;
+    --vscode-editor-font-size: 12px;
+    --vscode-editor-background: #1f1f1f;
+    --vscode-editor-foreground: #cccccc;
+    --vscode-descriptionForeground: #9d9d9d;
+    --vscode-widget-border: #313131;
+    --vscode-panel-border: #2b2b2b;
+    --vscode-editorGroupHeader-tabsBackground: #181818;
+    --vscode-sideBar-background: #181818;
+    --vscode-input-background: #313131;
+    --vscode-input-foreground: #cccccc;
+    --vscode-input-border: #3c3c3c;
+    --vscode-input-placeholderForeground: #989898;
+    --vscode-list-inactiveSelectionBackground: #37373d;
+    --vscode-list-hoverBackground: #2a2d2e;
+    --vscode-list-activeSelectionBackground: #04395e;
+    --vscode-focusBorder: #0078d4;
+    --vscode-errorForeground: #f85149;
+    --vscode-inputValidation-errorBackground: #5a1d1d;
+    --vscode-inputValidation-errorBorder: #be1100;
+    --vscode-editorWidget-background: #202020;
+    --vscode-button-background: #0078d4;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #026ec1;
+    --vscode-button-secondaryBackground: #313131;
+    --vscode-button-secondaryForeground: #cccccc;
+    --vscode-button-secondaryHoverBackground: #3c3c3c;
+    --vscode-button-border: rgba(255, 255, 255, 0.07);
+    --vscode-toolbar-hoverBackground: rgba(90, 93, 94, 0.31);
+    --vscode-inputOption-activeBackground: rgba(36, 137, 219, 0.51);
+    --vscode-inputOption-activeBorder: #2488db;
+    --vscode-inputOption-activeForeground: #ffffff;
+    --vscode-badge-background: #616161;
+    --vscode-badge-foreground: #f8f8f8;
+    --vscode-editorInfo-foreground: #3794ff;
+    --vscode-editorLineNumber-foreground: #6e7681;
+    --vscode-editorLineNumber-activeForeground: #cccccc;
+    --vscode-editor-findMatchHighlightBackground: rgba(234, 92, 0, 0.33);
+    --vscode-editor-findMatchBackground: #9e6a03;
+    --vscode-editorIndentGuide-background1: #404040;
+    --vscode-editorIndentGuide-activeBackground1: #707070;
+    --vscode-editorWarning-foreground: #cca700;
+    --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
+  }
+  html[data-theme="light"] {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --vscode-font-size: 13px;
+    --vscode-editor-font-family: Menlo, Monaco, "Courier New", monospace;
+    --vscode-editor-font-size: 12px;
+    --vscode-editor-background: #ffffff;
+    --vscode-editor-foreground: #3b3b3b;
+    --vscode-descriptionForeground: #5f5f5f;
+    --vscode-widget-border: #e5e5e5;
+    --vscode-panel-border: #e5e5e5;
+    --vscode-editorGroupHeader-tabsBackground: #f8f8f8;
+    --vscode-sideBar-background: #f8f8f8;
+    --vscode-input-background: #ffffff;
+    --vscode-input-foreground: #3b3b3b;
+    --vscode-input-border: #cecece;
+    --vscode-input-placeholderForeground: #767676;
+    --vscode-list-inactiveSelectionBackground: #e4e6f1;
+    --vscode-list-hoverBackground: #f2f2f2;
+    --vscode-focusBorder: #005fb8;
+    --vscode-errorForeground: #c72e0f;
+    --vscode-inputValidation-errorBackground: #f2dede;
+    --vscode-inputValidation-errorBorder: #be1100;
+    --vscode-editorWidget-background: #f8f8f8;
+    --vscode-button-background: #005fb8;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #0258a8;
+    --vscode-button-secondaryBackground: #e5e5e5;
+    --vscode-button-secondaryForeground: #3b3b3b;
+    --vscode-button-secondaryHoverBackground: #cccccc;
+    --vscode-badge-background: #cccccc;
+    --vscode-badge-foreground: #3b3b3b;
+    --vscode-editorLineNumber-foreground: #6e7681;
+    --vscode-editorLineNumber-activeForeground: #171184;
+    --vscode-editor-findMatchHighlightBackground: rgba(234, 92, 0, 0.33);
+    --vscode-editorIndentGuide-background1: #d3d3d3;
+    --vscode-editorIndentGuide-activeBackground1: #939393;
+    --vscode-widget-shadow: rgba(0, 0, 0, 0.16);
+  }
+</style>
+<script>
+  // Stands in for the VS Code webview API. Tests read window.__posted.
+  window.__posted = [];
+  window.__state = undefined;
+  window.acquireVsCodeApi = () => ({
+    postMessage: (m) => window.__posted.push(JSON.parse(JSON.stringify(m))),
+    getState: () => window.__state,
+    setState: (s) => (window.__state = s),
+  });
+  window.harness = {
+    lastReport() {
+      for (let i = window.__posted.length - 1; i >= 0; i--) if (window.__posted[i].type === 'report') return window.__posted[i].report;
+      return undefined;
+    },
+    posted(type) {
+      return window.__posted.filter((m) => m.type === type);
+    },
+    send(msg) {
+      window.postMessage(msg, '*');
+    },
+    async load(file, opts = {}) {
+      const text = opts.text ?? (await (await fetch('/test/fixtures/' + file)).text());
+      const isJsonl = /\.(jsonl|ndjson)$/.test(file);
+      window.harness.send({
+        type: 'init',
+        doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview' },
+        text,
+        version: 1,
+        config: Object.assign({ defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true }, opts.config || {}),
+      });
+    },
+  };
+  const params = new URLSearchParams(location.search);
+  document.documentElement.dataset.theme = params.get('theme') || 'dark';
+</script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+  document.body.className = 'vscode-' + (params.get('theme') || 'dark');
+</script>
+<script src="/dist/webview.js"></script>
+<script>
+  if (params.get('file')) window.harness.load(params.get('file'));
+</script>
+</body>
+</html>

@@ -1,0 +1,320 @@
+{
+  "name": "better-jsonl",
+  "displayName": "Better JSONL",
+  "description": "View JSON and JSON Lines as formatted cards, a nested grid, or a node graph. Focus or expand-all mode for JSONL, synced with your editor cursor.",
+  "version": "0.2.0",
+  "publisher": "andy",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Formatters",
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "jsonl",
+    "ndjson",
+    "json lines",
+    "json",
+    "viewer",
+    "formatter",
+    "grid",
+    "graph"
+  ],
+  "galleryBanner": {
+    "color": "#14161b",
+    "theme": "dark"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:jsonl",
+    "onWebviewPanel:betterJsonl.preview"
+  ],
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "betterJsonl.viewer",
+        "displayName": "Better JSONL",
+        "selector": [
+          {
+            "filenamePattern": "*.jsonl"
+          },
+          {
+            "filenamePattern": "*.ndjson"
+          },
+          {
+            "filenamePattern": "*.jsonlines"
+          },
+          {
+            "filenamePattern": "*.json"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "betterJsonl.openPreviewToSide",
+        "title": "Better JSONL: Open Preview to the Side",
+        "icon": {
+          "light": "media/glyph-light.svg",
+          "dark": "media/glyph-dark.svg"
+        }
+      },
+      {
+        "command": "betterJsonl.openPreview",
+        "title": "Better JSONL: Open Preview"
+      },
+      {
+        "command": "betterJsonl.openInViewer",
+        "title": "Better JSONL: Open Full View"
+      },
+      {
+        "command": "betterJsonl.openAsText",
+        "title": "Better JSONL: Open as Text",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "betterJsonl.showFormatted",
+        "title": "Better JSONL: Show Formatted View"
+      },
+      {
+        "command": "betterJsonl.showGrid",
+        "title": "Better JSONL: Show Grid View"
+      },
+      {
+        "command": "betterJsonl.showGraph",
+        "title": "Better JSONL: Show Graph View"
+      },
+      {
+        "command": "betterJsonl.toggleExpandMode",
+        "title": "Better JSONL: Toggle Focus / Expand All"
+      },
+      {
+        "command": "betterJsonl.toggleWordWrap",
+        "title": "Better JSONL: Toggle Word Wrap"
+      },
+      {
+        "command": "betterJsonl.expandLines",
+        "title": "Better JSONL: Expand Selected Lines"
+      },
+      {
+        "command": "betterJsonl.compactLines",
+        "title": "Better JSONL: Compact Lines"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "betterJsonl.openPreviewToSide",
+          "when": "resourceLangId == json || resourceLangId == jsonc || resourceLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "group": "navigation@-100"
+        },
+        {
+          "command": "betterJsonl.openAsText",
+          "when": "activeCustomEditorId == betterJsonl.viewer",
+          "group": "navigation"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "betterJsonl.openPreviewToSide",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@1"
+        },
+        {
+          "command": "betterJsonl.openInViewer",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "betterJsonl.openPreviewToSide",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@1"
+        },
+        {
+          "command": "betterJsonl.openInViewer",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@2"
+        },
+        {
+          "command": "betterJsonl.expandLines",
+          "when": "editorLangId == jsonl || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@3"
+        },
+        {
+          "command": "betterJsonl.compactLines",
+          "when": "editorLangId == jsonl || resourceExtname == .jsonlines",
+          "group": "0_betterJsonl@4"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "betterJsonl.openPreviewToSide",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "group": "navigation@20"
+        },
+        {
+          "command": "betterJsonl.openInViewer",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "group": "navigation@21"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "betterJsonl.openAsText",
+          "when": "activeCustomEditorId == betterJsonl.viewer"
+        },
+        {
+          "command": "betterJsonl.expandLines",
+          "when": "editorLangId == jsonl || resourceExtname == .jsonlines"
+        },
+        {
+          "command": "betterJsonl.compactLines",
+          "when": "editorLangId == jsonl || resourceExtname == .jsonlines || editorLangId == json"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "betterJsonl.openPreviewToSide",
+        "key": "ctrl+k j",
+        "mac": "cmd+k j",
+        "when": "editorTextFocus && editorLangId == json || editorTextFocus && editorLangId == jsonc || editorTextFocus && editorLangId == jsonl || editorTextFocus && resourceExtname == .jsonlines"
+      },
+      {
+        "command": "betterJsonl.toggleWordWrap",
+        "key": "alt+z",
+        "when": "activeWebviewPanelId == 'betterJsonl.preview' || activeCustomEditorId == 'betterJsonl.viewer'"
+      }
+    ],
+    "configuration": {
+      "title": "Better JSONL",
+      "properties": {
+        "betterJsonl.defaultView": {
+          "type": "string",
+          "enum": [
+            "formatted",
+            "grid",
+            "graph"
+          ],
+          "enumDescriptions": [
+            "Formatted cards (Focus or Expand all for JSONL).",
+            "Grid of records with nested sub-grids.",
+            "Node graph of the current record."
+          ],
+          "default": "formatted",
+          "description": "The view that opens first."
+        },
+        "betterJsonl.theme": {
+          "type": "string",
+          "enum": [
+            "vscode",
+            "light",
+            "dark",
+            "system"
+          ],
+          "enumDescriptions": [
+            "Follow the VS Code color theme.",
+            "Always light.",
+            "Always dark.",
+            "Follow the operating system (light or dark)."
+          ],
+          "default": "vscode",
+          "description": "Color theme of the Better JSONL views."
+        },
+        "betterJsonl.wordWrap": {
+          "type": "string",
+          "enum": [
+            "followEditor",
+            "on",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Use the \"editor.wordWrap\" setting.",
+            "Always wrap long lines.",
+            "Never wrap; scroll sideways."
+          ],
+          "default": "followEditor",
+          "description": "Wrap long lines in the Formatted and Grid views. Alt+Z (Option+Z) toggles it in the open view."
+        },
+        "betterJsonl.jsonl.expandMode": {
+          "type": "string",
+          "enum": [
+            "focus",
+            "all"
+          ],
+          "enumDescriptions": [
+            "Only the current or selected lines are pretty-printed. Other lines stay on one line.",
+            "All lines are pretty-printed."
+          ],
+          "default": "focus",
+          "description": "How the Formatted view shows JSON Lines files."
+        },
+        "betterJsonl.indent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 2,
+          "description": "Spaces per indent level in formatted output."
+        },
+        "betterJsonl.graph.maxNodes": {
+          "type": "integer",
+          "minimum": 50,
+          "maximum": 20000,
+          "default": 1500,
+          "description": "The Graph view stops adding nodes after this number."
+        },
+        "betterJsonl.preview.followActiveEditor": {
+          "type": "boolean",
+          "default": true,
+          "description": "The preview switches to the JSON or JSONL editor that becomes active."
+        },
+        "betterJsonl.syncSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Sync the current line between the text editor and the Better JSONL view."
+        },
+        "betterJsonl.formatDocument.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Let \"Format Document\" rewrite JSON Lines files: each line becomes compact and canonical (records are never expanded). Off by default, so Format Document does not change JSONL files."
+        },
+        "betterJsonl.expandLines.showReminder": {
+          "type": "boolean",
+          "default": true,
+          "description": "After \"Expand Selected Lines\", show a reminder that the file is not valid JSON Lines until you compact it, with a \"Compact Lines\" button."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit -p .",
+    "icon": "rsvg-convert -w 128 -h 128 media/icon.svg -o media/icon.png",
+    "package": "npm run typecheck && node esbuild.mjs --production && node -e \"require('fs').mkdirSync('dist-vsix',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links -o dist-vsix/",
+    "test:e2e:host": "node esbuild.mjs && node test/host/run.mjs",
+    "test:e2e:web": "node esbuild.mjs && node test/web/run.mjs",
+    "test:e2e": "npm run test:e2e:host && npm run test:e2e:ui && npm run test:e2e:web",
+    "test:e2e:ui": "npm run package && node test/ui/run.mjs"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.17.0",
+    "@types/vscode": "~1.85.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "jsonc-parser": "^3.3.1",
+    "mocha": "^10.8.2",
+    "playwright-core": "^1.48.2",
+    "typescript": "^5.6.3"
+  }
+}

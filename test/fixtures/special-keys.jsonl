@@ -1,0 +1,2 @@
+{"a.b":{"c d":1,"say \"hi\"":[10,20]},"plain":{"x":true}}
+{"a.b":{"c d":2,"say \"hi\"":[30]},"plain":{"x":false}}

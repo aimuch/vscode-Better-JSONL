@@ -1,0 +1,21 @@
+{"id":1001,"ts":"2026-10-27T09:12:03Z","level":"info","user":{"id":"u_81","name":"Lin"},"msg":"login ok"}
+{"id":1002,"ts":"2026-10-27T09:12:09Z","level":"debug","user":{"id":"u_81","name":"Lin"},"msg":"GET /api/orders","ms":42}
+{"id":1003,"ts":"2026-10-27T09:12:11Z","level":"warn","user":{"id":"u_17","name":"Ada","roles":["admin","ops"]},"msg":"slow query","ms":1840,"tags":["db","orders"],"trace":9007199254740993}
+{"id":1004,"ts":"2026-10-27T09:12:30Z","level":"info","user":{"id":"u_17","name":"Ada"},"msg":"export started","job":"exp_7731"}
+{"id":1005,"ts":"2026-10-27T09:13:02Z","level":"info","user":{"id":"u_09","name":"Kai"},"msg":"logout"}
+{"id":1006,"ts":"2026-10-27T09:13:40Z","level":"error","msg":"upstream timeout",}
+{"id":1007,"ts":"2026-10-27T09:14:05Z","level":"info","user":{"id":"u_33","name":"Mo"},"msg":"login ok"}
+{"id":1008,"ts":"2026-10-27T09:14:06Z","level":"debug","user":{"id":"u_33","name":"Mo"},"msg":"GET /api/cart","ms":17}
+{"id":1009,"ts":"2026-10-27T09:14:21Z","level":"info","user":{"id":"u_33","name":"Mo"},"msg":"checkout","total":129.5,"items":[{"sku":"A-1","qty":1,"price":99.5},{"sku":"B-7","qty":2,"price":15}]}
+
+{"id":1010,"ts":"2026-10-27T09:15:00Z","level":"warn","user":{"id":"u_81","name":"Lin"},"msg":"retry","attempt":2}
+{"id":1011,"ts":"2026-10-27T09:15:02Z","level":"info","user":{"id":"u_81","name":"Lin"},"msg":"retry ok"}
+{"id":1012,"ts":"2026-10-27T09:15:40Z","level":"info","user":null,"msg":"healthcheck","ok":true}
+["not","an","object",3]
+"just a string"
+{"id":1013,"ts":"2026-10-27T09:16:12Z","level":"debug","user":{"id":"u_09","name":"Kai"},"msg":"GET /api/me","ms":8,"meta":{}}
+{"id":1014,"ts":"2026-10-27T09:16:30Z","level":"info","user":{"id":"u_09","name":"Kai"},"msg":"settings saved","diff":{"theme":["light","dark"],"font":{"from":12,"to":14}}}
+{"id":1015,"ts":"2026-10-27T09:17:01Z","level":"info","user":{"id":"u_17","name":"Ada"},"msg":"export done","job":"exp_7731","rows":48213,"big":12345678901234567890}
+{"id":1016,"ts":"2026-10-27T09:17:44Z","level":"warn","user":{"id":"u_17","name":"Ada"},"msg":"quota 80%","escaped":"tab\there \"quoted\" é"}
+{"id": 1017, "ts": "2026-10-27T09:18:00Z", "level": "info", "msg": "spaced out record"}
+{"id":1018,"level":"error","msg":"bad json" "missing comma"}

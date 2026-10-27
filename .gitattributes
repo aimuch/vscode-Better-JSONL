@@ -1,0 +1,3 @@
+# These fixtures test exact bytes (CRLF line ends, UTF-8 BOM). Git must not convert them.
+test/fixtures/crlf.jsonl -text
+test/fixtures/bom.jsonl -text

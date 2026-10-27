@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test-and-package:
+    name: E2E tests and VSIX package
+    # The E2E suites drive VS Code and Chrome; they were written and verified on macOS.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+
+      - name: Extension host E2E (downloads VS Code)
+        run: npm run test:e2e:host
+
+      - name: Package VSIX and UI E2E in a real VS Code window
+        run: |
+          app="$(ls -d .vscode-test/vscode-*/Visual\ Studio\ Code.app 2>/dev/null | head -n 1)"
+          [ -n "$app" ] || app="/Applications/Visual Studio Code.app"
+          echo "Using $app"
+          VSCODE_APP="$app" npm run test:e2e:ui
+
+      - name: Webview E2E (Chrome)
+        run: npm run test:e2e:web
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: dist-vsix/*.vsix
+          if-no-files-found: error
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: test-results/
+          if-no-files-found: ignore
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test-and-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: dist-vsix
+
+      - name: Create the release with the offline installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist-vsix/*.vsix \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Better JSONL $GITHUB_REF_NAME" \
+            --generate-notes

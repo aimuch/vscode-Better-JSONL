@@ -1,0 +1,7 @@
+{
+  // editor settings
+  "editor.fontSize": 14,
+  "files.exclude": { "**/.git": true, },
+  /* trailing comma below */
+  "list": [1, 2, 3,],
+}
