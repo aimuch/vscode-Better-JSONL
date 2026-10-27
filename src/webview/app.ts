@@ -1,3 +1,4 @@
+import { setLang, t } from '../shared/i18n';
 import { prettyJson } from '../shared/jsonText';
 import type { DocInfo, ExpandMode, HostMessage, RenderReport, ViewerConfig, ViewKind, WebviewMessage } from '../shared/protocol';
 import { esc, formatBytes } from './json';
@@ -93,7 +94,7 @@ export class App {
       this.scheduleReport();
     });
     document.addEventListener('keydown', (e) => this.onKey(e));
-    root.innerHTML = `<div class="boot">Loading…</div>`;
+    root.innerHTML = `<div class="boot">${t('Loading…')}</div>`;
     this.post({ type: 'ready' });
   }
 
@@ -132,6 +133,10 @@ export class App {
         this.config = m.config;
         this.applyTheme();
         if (!this.views) break;
+        if (old.lang !== m.config.lang) {
+          this.relabel();
+          break;
+        }
         if (old.wordWrap !== m.config.wordWrap || old.wrap !== m.config.wrap) this.setWrap(m.config.wrap);
         else if (old.indent !== m.config.indent || old.graphMaxNodes !== m.config.graphMaxNodes) this.activeView.render();
         this.settings?.refresh();
@@ -161,6 +166,8 @@ export class App {
     const sameDoc = saved.uri === doc.uri;
     this.doc = doc;
     this.config = config;
+    setLang(config.lang);
+    document.documentElement.lang = config.lang === 'zh-cn' ? 'zh-CN' : 'en';
     this.version = version;
     this.model = new DocModel(text, doc.isJsonl);
     const prev = this.state;
@@ -276,6 +283,18 @@ export class App {
     this.scheduleReport();
   }
 
+  /** The UI language changed: rebuild the toolbar, views and panels with the new text. */
+  private relabel(): void {
+    setLang(this.config.lang);
+    document.documentElement.lang = this.config.lang === 'zh-cn' ? 'zh-CN' : 'en';
+    const reopen = !!this.settings?.open;
+    this.buildShell();
+    this.applyTheme();
+    document.body.classList.toggle('wrap', this.state.wrap);
+    this.renderAll();
+    if (reopen) this.settings?.show();
+  }
+
   /** Word wrap for this view (Alt+Z, the toolbar button, or the setting). */
   setWrap(on: boolean): void {
     this.state.wrap = on;
@@ -314,7 +333,7 @@ export class App {
     this.editOriginal = raw;
     const panel = this.root.querySelector('.editpanel') as HTMLElement;
     const ta = panel.querySelector('textarea') as HTMLTextAreaElement;
-    (panel.querySelector('.ep-title') as HTMLElement).textContent = `Edit line ${r + 1}`;
+    (panel.querySelector('.ep-title') as HTMLElement).textContent = t('Edit line {0}', r + 1);
     (panel.querySelector('.ep-err') as HTMLElement).textContent = '';
     ta.value = p.kind === 'value' ? prettyJson(raw, this.config.indent) : raw;
     panel.hidden = false;
@@ -338,7 +357,7 @@ export class App {
       err.textContent = e instanceof Error ? e.message : String(e);
       return;
     }
-    err.textContent = 'Saving…';
+    err.textContent = t('Saving…');
     this.post({ type: 'editLine', line: this.editRecord, original: this.editOriginal, text: ta.value });
   }
 
@@ -348,24 +367,24 @@ export class App {
       return;
     }
     const err = this.root.querySelector('.ep-err') as HTMLElement | null;
-    if (err) err.textContent = message ?? 'The edit failed.';
+    if (err) err.textContent = message ?? t('The edit failed.');
   }
 
   // ---------- shell ----------
 
   private buildShell(): void {
     this.root.innerHTML = `
-      <div class="toolbar" role="toolbar" aria-label="Better JSONL toolbar"></div>
+      <div class="toolbar" role="toolbar" aria-label="${t('Better JSONL toolbar')}"></div>
       <div class="banner" hidden></div>
       <div class="body"></div>
       <div class="status"></div>
-      <div class="editpanel" hidden role="dialog" aria-label="Edit record">
+      <div class="editpanel" hidden role="dialog" aria-label="${t('Edit record')}">
         <div class="ep-head"><span class="ep-title"></span><span class="ep-err" role="alert"></span></div>
-        <textarea spellcheck="false" aria-label="Record JSON"></textarea>
+        <textarea spellcheck="false" aria-label="${t('Record JSON')}"></textarea>
         <div class="ep-actions">
-          <button class="btn primary ep-apply">Apply <kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+Enter</kbd></button>
-          <button class="btn ep-cancel">Cancel <kbd>Esc</kbd></button>
-          <span class="ep-hint">The record is saved back as one compact line.</span>
+          <button class="btn primary ep-apply">${t('Apply')} <kbd>${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+Enter</kbd></button>
+          <button class="btn ep-cancel">${t('Cancel')} <kbd>Esc</kbd></button>
+          <span class="ep-hint">${t('The record is saved back as one compact line.')}</span>
         </div>
       </div>`;
     this.toolbar = this.root.querySelector('.toolbar') as HTMLElement;
@@ -399,46 +418,46 @@ export class App {
       v.hide();
     }
     this.activeView.show();
-    if (this.model.detectedJsonl) this.showBanner('This .json file holds one JSON value per line. It is shown as JSON Lines.');
-    else if (this.model.jsonc) this.showBanner('Parsed as JSON with Comments (comments or trailing commas found).');
+    if (this.model.detectedJsonl) this.showBanner(t('This .json file holds one JSON value per line. It is shown as JSON Lines.'));
+    else if (this.model.jsonc) this.showBanner(t('Parsed as JSON with Comments (comments or trailing commas found).'));
   }
 
   private buildToolbar(): void {
     const tb = this.toolbar;
     const mac = navigator.platform.includes('Mac');
     tb.innerHTML = `
-      <div class="seg" role="tablist" aria-label="View">
-        ${VIEWS.map((v) => `<button role="tab" class="seg-btn" data-view="${v.id}">${icon(v.id)}<span>${v.label}</span></button>`).join('')}
+      <div class="seg" role="tablist" aria-label="${t('View')}">
+        ${VIEWS.map((v) => `<button role="tab" class="seg-btn" data-view="${v.id}">${icon(v.id)}<span>${t(v.label)}</span></button>`).join('')}
       </div>
-      <div class="seg mode" role="radiogroup" aria-label="JSONL format mode">
-        <button role="radio" class="seg-btn sub" data-mode="focus" title="Only the current or selected lines are pretty-printed">Focus</button>
-        <button role="radio" class="seg-btn sub" data-mode="all" title="All lines are pretty-printed">Expand all</button>
+      <div class="seg mode" role="radiogroup" aria-label="${t('JSONL format mode')}">
+        <button role="radio" class="seg-btn sub" data-mode="focus" title="${t('Only the current or selected lines are pretty-printed')}">${t('Focus')}</button>
+        <button role="radio" class="seg-btn sub" data-mode="all" title="${t('All lines are pretty-printed')}">${t('Expand all')}</button>
       </div>
-      <div class="seg foldall" role="group" aria-label="Fold">
-        <button class="seg-btn sub" data-fold="expand" title="Expand every node">Expand all</button>
-        <button class="seg-btn sub" data-fold="collapse" title="Collapse every node below the root">Collapse all</button>
+      <div class="seg foldall" role="group" aria-label="${t('Fold')}">
+        <button class="seg-btn sub" data-fold="expand" title="${t('Expand every node')}">${t('Expand all')}</button>
+        <button class="seg-btn sub" data-fold="collapse" title="${t('Collapse every node below the root')}">${t('Collapse all')}</button>
       </div>
-      <div class="linesel" role="group" aria-label="Line selector">
-        <span class="dim">Line</span>
-        <button class="icon-btn" data-line="-1" aria-label="Previous line">${icon('chev-left')}</button>
-        <input class="line-input" type="text" inputmode="numeric" aria-label="Line number">
-        <button class="icon-btn" data-line="1" aria-label="Next line">${icon('chev-right')}</button>
+      <div class="linesel" role="group" aria-label="${t('Line selector')}">
+        <span class="dim">${t('Line')}</span>
+        <button class="icon-btn" data-line="-1" aria-label="${t('Previous line')}">${icon('chev-left')}</button>
+        <input class="line-input" type="text" inputmode="numeric" aria-label="${t('Line number')}">
+        <button class="icon-btn" data-line="1" aria-label="${t('Next line')}">${icon('chev-right')}</button>
         <span class="dim line-of"></span>
       </div>
       <label class="search">
         ${icon('search')}
-        <span class="sr">Search</span>
-        <input type="search" placeholder="Search · or path:text, path=value  (${mac ? '⌘' : 'Ctrl+'}F)" spellcheck="false">
+        <span class="sr">${t('Search')}</span>
+        <input type="search" placeholder="${t('Search · or path:text, path=value  ({0}F)', mac ? '⌘' : 'Ctrl+')}" spellcheck="false">
         <span class="count dim"></span>
-        <button class="icon-btn" data-step="-1" aria-label="Previous match">${icon('chev-up')}</button>
-        <button class="icon-btn" data-step="1" aria-label="Next match">${icon('chev-down')}</button>
-        <button class="icon-btn filter-btn" aria-label="Show only matching lines" aria-pressed="false" title="Show only matching lines">${icon('filter')}</button>
+        <button class="icon-btn" data-step="-1" aria-label="${t('Previous match')}">${icon('chev-up')}</button>
+        <button class="icon-btn" data-step="1" aria-label="${t('Next match')}">${icon('chev-down')}</button>
+        <button class="icon-btn filter-btn" aria-label="${t('Show only matching lines')}" aria-pressed="false" title="${t('Show only matching lines')}">${icon('filter')}</button>
       </label>
       <div class="spring"></div>
       <div class="stats"></div>
-      <button class="icon-btn wrap-btn" aria-label="Word wrap (${mac ? '⌥Z' : 'Alt+Z'})" title="Word wrap (${mac ? '⌥Z' : 'Alt+Z'})" aria-pressed="false">${icon('wrap')}</button>
-      <button class="icon-btn open-text" aria-label="Open as text" title="Open as text">${icon('file-code')}</button>
-      <button class="icon-btn gear-btn" aria-label="Settings" title="Settings">${icon('gear')}</button>`;
+      <button class="icon-btn wrap-btn" aria-label="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" title="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" aria-pressed="false">${icon('wrap')}</button>
+      <button class="icon-btn open-text" aria-label="${t('Open as text')}" title="${t('Open as text')}">${icon('file-code')}</button>
+      <button class="icon-btn gear-btn" aria-label="${t('Settings')}" title="${t('Settings')}">${icon('gear')}</button>`;
 
     tb.addEventListener('click', (e) => {
       const t = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
@@ -563,7 +582,7 @@ export class App {
     filterBtn.setAttribute('aria-pressed', String(s.filterOnly));
     const lineInput = tb.querySelector('.line-input') as HTMLInputElement;
     if (document.activeElement !== lineInput) lineInput.value = String(s.active + 1);
-    (tb.querySelector('.line-of') as HTMLElement).textContent = `of ${m.count.toLocaleString()}`;
+    (tb.querySelector('.line-of') as HTMLElement).textContent = t('of {0}', m.count.toLocaleString());
     const count = tb.querySelector('.count') as HTMLElement;
     const ri = this.matches.indexOf(s.active);
     count.textContent = this.query.text && m.isJsonl ? `${ri >= 0 ? ri + 1 : '–'} / ${this.matches.length.toLocaleString()}` : '';
@@ -571,18 +590,18 @@ export class App {
 
     const parts: string[] = [];
     if (m.isJsonl) {
-      parts.push(`Line ${s.active + 1}`);
-      if (s.selected.size > 1) parts.push(`${s.selected.size} selected`);
-    } else parts.push(m.jsonc ? 'JSON with Comments' : 'JSON');
-    if (s.view === 'formatted' && m.isJsonl) parts.push(s.expandMode === 'focus' ? 'Focus: selected lines are expanded' : 'All lines expanded');
+      parts.push(t('Line {0}', s.active + 1));
+      if (s.selected.size > 1) parts.push(t('{0} selected', s.selected.size));
+    } else parts.push(m.jsonc ? t('JSON with Comments') : 'JSON');
+    if (s.view === 'formatted' && m.isJsonl) parts.push(s.expandMode === 'focus' ? t('Focus: selected lines are expanded') : t('All lines expanded'));
     const hint =
       s.view === 'graph'
-        ? `Drag or scroll to pan · ${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+scroll to zoom · click a node to inspect`
+        ? t('Drag or scroll to pan · {0}+scroll to zoom · click a node to inspect', navigator.platform.includes('Mac') ? '⌘' : 'Ctrl')
         : s.view === 'grid'
-          ? 'Click a header to sort · drag a header edge to resize'
+          ? t('Click a header to sort · drag a header edge to resize')
           : m.isJsonl
-            ? '↑/↓ move · Shift extends · Enter edits · double-click jumps to source'
-            : 'Click ▸ to fold · double-click jumps to source';
+            ? t('↑/↓ move · Shift extends · Enter edits · double-click jumps to source')
+            : t('Click ▸ to fold · double-click jumps to source');
     this.status.innerHTML = `<span>${esc(parts.join(' · '))}</span><span class="spring"></span><span class="dim">${esc(hint)}</span>`;
   }
 
@@ -590,12 +609,12 @@ export class App {
     const m = this.model;
     const st = this.toolbar.querySelector('.stats') as HTMLElement;
     const bits: string[] = [];
-    if (m.isJsonl) bits.push(`<span>${m.count.toLocaleString()} lines</span>`);
+    if (m.isJsonl) bits.push(`<span>${t('{0} lines', m.count.toLocaleString())}</span>`);
     else bits.push(`<span class="badge">${m.jsonc ? 'JSONC' : 'JSON'}</span>`);
-    if (!m.complete) bits.push(`<span class="dim">parsing ${Math.floor((m.parsed / Math.max(1, m.count)) * 100)}%</span>`);
+    if (!m.complete) bits.push(`<span class="dim">${t('parsing {0}%', Math.floor((m.parsed / Math.max(1, m.count)) * 100))}</span>`);
     if (m.errors) {
       bits.push(
-        `<button class="chip err-chip" title="Go to the next error">${icon('warning')}${m.errors.toLocaleString()} error${m.errors === 1 ? '' : 's'}</button>`,
+        `<button class="chip err-chip" title="${t('Go to the next error')}">${icon('warning')}${t(m.errors === 1 ? '{0} error' : '{0} errors', m.errors.toLocaleString())}</button>`,
       );
     }
     bits.push(`<span class="dim">${formatBytes(m.bytes)}</span>`);
@@ -695,6 +714,7 @@ export class App {
       wrap: s.wrap,
       theme: this.effectiveTheme,
       settingsOpen: !!this.settings?.open,
+      lang: this.config.lang,
       version: this.version,
     };
     this.activeView.fillReport(r);

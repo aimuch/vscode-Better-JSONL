@@ -1,3 +1,4 @@
+import { t } from '../../shared/i18n';
 import type { JsonPath, RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
 import { childKey, entriesOf, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
@@ -71,21 +72,21 @@ export class GraphView implements View {
     this.el = document.createElement('div');
     this.el.className = 'view graph';
     this.el.innerHTML = `
-      <div class="gcanvas" aria-label="Graph canvas">
+      <div class="gcanvas" aria-label="${t('Graph canvas')}">
         <svg class="gsvg" xmlns="http://www.w3.org/2000/svg"><g class="vp"></g></svg>
         <div class="gnote" hidden></div>
-        <div class="exportbar" role="group" aria-label="Export graph">
+        <div class="exportbar" role="group" aria-label="${t('Export graph')}">
           <button class="btn" data-export="svg">${icon('download')}SVG</button>
           <button class="btn" data-export="png">${icon('download')}PNG</button>
         </div>
-        <div class="zoombar" role="group" aria-label="Zoom">
-          <button class="icon-btn" data-z="out" aria-label="Zoom out">${icon('minus')}</button>
+        <div class="zoombar" role="group" aria-label="${t('Zoom')}">
+          <button class="icon-btn" data-z="out" aria-label="${t('Zoom out')}">${icon('minus')}</button>
           <span class="zlabel">100%</span>
-          <button class="icon-btn" data-z="in" aria-label="Zoom in">${icon('plus')}</button>
-          <button class="icon-btn" data-z="fit" aria-label="Fit to view">${icon('fit')}</button>
+          <button class="icon-btn" data-z="in" aria-label="${t('Zoom in')}">${icon('plus')}</button>
+          <button class="icon-btn" data-z="fit" aria-label="${t('Fit to view')}">${icon('fit')}</button>
         </div>
       </div>
-      <aside class="inspector" aria-label="Node inspector"></aside>`;
+      <aside class="inspector" aria-label="${t('Node inspector')}"></aside>`;
     this.canvasEl = this.el.querySelector('.gcanvas') as HTMLElement;
     this.svg = this.el.querySelector('.gsvg') as SVGSVGElement;
     this.vp = this.el.querySelector('.vp') as SVGGElement;
@@ -169,7 +170,7 @@ export class GraphView implements View {
     const out: Source[] = [];
     for (const l of lines) {
       const v = m.value(l);
-      if (v !== undefined) out.push({ title: `line ${l + 1}`, line: l, value: v });
+      if (v !== undefined) out.push({ title: t('line {0}', l + 1), line: l, value: v });
     }
     return out;
   }
@@ -206,7 +207,7 @@ export class GraphView implements View {
     };
     const multi = sources.length > 1;
     if (multi) {
-      const root = make(undefined, `${sources.length} selected lines`, 'sel', -1, [], 0);
+      const root = make(undefined, t('{0} selected lines', sources.length), 'sel', -1, [], 0);
       for (const s of sources) {
         const row: GRow = { label: s.title, isIdx: false, text: isContainer(s.value) ? summary(s.value) : primText(s.value), cls: isContainer(s.value) ? 'dim' : primClass(s.value) };
         row.child = make(s.value, s.title, `L${s.line}`, s.line, [], 1);
@@ -241,7 +242,7 @@ export class GraphView implements View {
         }
         n.rows.push(row);
       }
-      if (ents.length > MAX_ROWS) n.rows.push({ label: '', isIdx: false, text: `… ${ents.length - MAX_ROWS} more`, cls: 'dim', note: true });
+      if (ents.length > MAX_ROWS) n.rows.push({ label: '', isIdx: false, text: t('… {0} more', ents.length - MAX_ROWS), cls: 'dim', note: true });
     }
     for (const n of nodes) {
       n.rows.forEach((r, i) => {
@@ -255,8 +256,8 @@ export class GraphView implements View {
     this.nodes = nodes;
     if (!sources.length) {
       const p = this.app.model.isJsonl ? this.app.model.get(this.app.state.active) : this.app.model.get(0);
-      this.showNote(p.kind === 'error' ? `Line ${this.app.state.active + 1} is not valid JSON: ${p.message}` : 'Nothing to show for this line.');
-    } else if (this.truncated) this.showNote(`The graph stops at ${max.toLocaleString()} nodes (setting betterJsonl.graph.maxNodes). Collapse nodes or pick a smaller record.`);
+      this.showNote(p.kind === 'error' ? t('Line {0} is not valid JSON: {1}', this.app.state.active + 1, p.message) : t('Nothing to show for this line.'));
+    } else if (this.truncated) this.showNote(t('The graph stops at {0} nodes (setting betterJsonl.graph.maxNodes). Collapse nodes or pick a smaller record.', max.toLocaleString()));
     else this.showNote('');
   }
 
@@ -364,7 +365,7 @@ export class GraphView implements View {
           return `${hit}${sep}<text x="10" y="${y + ROW_H / 2 + 4}">${label}<tspan class="${r.cls}">${esc(r.text)}</tspan></text>`;
         })
         .join('');
-      const kind = n.value === undefined ? 'selection' : isContainer(n.value) ? `${kindOf(n.value)} · ${sizeOf(n.value as JObj)}` : kindOf(n.value);
+      const kind = n.value === undefined ? t('selection') : isContainer(n.value) ? `${t(kindOf(n.value))} · ${sizeOf(n.value as JObj)}` : t(kindOf(n.value));
       const canFold = n.value !== undefined && isContainer(n.value) && sizeOf(n.value as JObj) > 0 && n.id !== 0;
       const chev = canFold
         ? `<g class="gtoggle" data-toggle="${esc(n.key)}" transform="translate(${n.w - 22},5)"><rect width="16" height="16" rx="3"/><path d="${n.collapsed ? 'M6 4l4 4-4 4' : 'M4 6l4 4 4-4'}"/></g>`
@@ -443,21 +444,24 @@ export class GraphView implements View {
   private paintInspector(): void {
     const n = this.selectedNode();
     if (!n || n.value === undefined) {
-      this.inspector.innerHTML = `<div class="insp-empty dim">Click a node to see its path and value.</div>`;
+      this.inspector.innerHTML = `<div class="insp-empty dim">${t('Click a node to see its path and value.')}</div>`;
       return;
     }
-    const line = this.app.model.isJsonl ? `line ${n.line + 1}` : '';
+    const line = this.app.model.isJsonl ? t('line {0}', n.line + 1) : '';
     const v = n.value;
-    const type = isContainer(v) ? `${kindOf(v)} · ${sizeOf(v as JObj)} ${Array.isArray(v) ? 'items' : 'keys'}` : kindOf(v);
+    const size = isContainer(v) ? sizeOf(v as JObj) : 0;
+    const type = isContainer(v)
+      ? `${t(kindOf(v))} · ${t(Array.isArray(v) ? (size === 1 ? '{0} item' : '{0} items') : size === 1 ? '{0} key' : '{0} keys', size)}`
+      : t(kindOf(v));
     this.inspector.innerHTML = `
-      <div class="insp-head"><span class="insp-title">Node</span><span class="dim">${esc(line)}</span></div>
-      <div class="insp-sec"><span class="insp-label">PATH</span>
-        <div class="insp-path"><span class="mono">${esc(pathToString(n.path))}</span><button class="icon-btn" data-i="copy-path" aria-label="Copy path">${icon('copy')}</button></div></div>
-      <div class="insp-sec"><span class="insp-label">TYPE</span><span>${esc(type)}</span></div>
-      <div class="insp-sec spring"><span class="insp-label">VALUE</span><pre class="insp-val mono">${esc(stringifyPretty(v, this.app.config.indent, 20_000))}</pre></div>
+      <div class="insp-head"><span class="insp-title">${t('Node')}</span><span class="dim">${esc(line)}</span></div>
+      <div class="insp-sec"><span class="insp-label">${t('PATH')}</span>
+        <div class="insp-path"><span class="mono">${esc(pathToString(n.path))}</span><button class="icon-btn" data-i="copy-path" aria-label="${t('Copy path')}">${icon('copy')}</button></div></div>
+      <div class="insp-sec"><span class="insp-label">${t('TYPE')}</span><span>${esc(type)}</span></div>
+      <div class="insp-sec spring"><span class="insp-label">${t('VALUE')}</span><pre class="insp-val mono">${esc(stringifyPretty(v, this.app.config.indent, 20_000))}</pre></div>
       <div class="insp-actions">
-        <button class="btn primary" data-i="reveal">Reveal in editor</button>
-        <div class="row2"><button class="btn" data-i="copy-path">Copy path</button><button class="btn" data-i="copy-value">Copy value</button></div>
+        <button class="btn primary" data-i="reveal">${t('Reveal in editor')}</button>
+        <div class="row2"><button class="btn" data-i="copy-path">${t('Copy path')}</button><button class="btn" data-i="copy-value">${t('Copy value')}</button></div>
       </div>`;
   }
 

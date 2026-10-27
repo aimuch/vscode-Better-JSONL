@@ -1,3 +1,4 @@
+import { languageName, t } from '../shared/i18n';
 import type { SettingKey } from '../shared/protocol';
 import type { App } from './app';
 import { esc } from './json';
@@ -18,11 +19,11 @@ export class SettingsPanel {
     this.el = document.createElement('div');
     this.el.className = 'settings';
     this.el.setAttribute('role', 'dialog');
-    this.el.setAttribute('aria-label', 'Better JSONL settings');
+    this.el.setAttribute('aria-label', t('Better JSONL settings'));
     this.el.innerHTML = `
-      <div class="settings-head"><h2>Settings</h2><span class="dim">Better JSONL</span><button class="icon-btn settings-close" aria-label="Close settings">${icon('close', 16)}</button></div>
+      <div class="settings-head"><h2>${t('Settings')}</h2><span class="dim">Better JSONL</span><button class="icon-btn settings-close" aria-label="${t('Close settings')}">${icon('close', 16)}</button></div>
       <div class="settings-content"></div>
-      <div class="settings-foot"><span class="dim">Saved to your VS Code user settings.</span><a href="#" class="settings-link">Open in VS Code Settings</a></div>`;
+      <div class="settings-foot"><span class="dim">${t('Saved to your VS Code user settings.')}</span><a href="#" class="settings-link">${t('Open in VS Code Settings')}</a></div>`;
     this.content = this.el.querySelector('.settings-content') as HTMLElement;
     this.el.querySelector('.settings-close')!.addEventListener('click', () => this.close());
     this.el.querySelector('.settings-link')!.addEventListener('click', (e) => {
@@ -66,20 +67,26 @@ export class SettingsPanel {
       `<label class="settings-check"><input type="checkbox" data-key="${key}"${value ? ' checked' : ''}><span><span class="settings-check-label">${esc(label)}</span><span class="settings-hint">${esc(hint)}</span></span></label>`;
     const alt = navigator.platform.includes('Mac') ? '⌥Z' : 'Alt+Z';
     this.content.innerHTML = `
-      <section class="settings-section"><h3>APPEARANCE</h3>
-        ${row('Theme', seg('theme', [['vscode', 'Follow VS Code'], ['light', 'Light'], ['dark', 'Dark'], ['system', 'Follow system']], c.theme))}
-        ${row('Word wrap', seg('wordWrap', [['followEditor', 'Follow editor'], ['on', 'On'], ['off', 'Off']], c.wordWrap), `${alt} toggles wrap in the open view.`)}
-        ${row('Indent', seg('indent', [['2', '2 spaces'], ['4', '4 spaces']], String(c.indent)), 'Used by the views and the record editor.')}
+      <section class="settings-section"><h3>${t('APPEARANCE')}</h3>
+        ${row(t('Theme'), seg('theme', [['vscode', t('Follow VS Code')], ['light', t('Light')], ['dark', t('Dark')], ['system', t('Follow system')]], c.theme))}
+        ${row(t('Word wrap'), seg('wordWrap', [['followEditor', t('Follow editor')], ['on', t('On')], ['off', t('Off')]], c.wordWrap), t('{0} toggles wrap in the open view.', alt))}
+        ${row(t('Indent'), seg('indent', [['2', t('{0} spaces', 2)], ['4', t('{0} spaces', 4)]], String(c.indent)), t('Used by the views and the record editor.'))}
       </section>
-      <section class="settings-section"><h3>VIEWS</h3>
-        ${row('Default view', seg('defaultView', [['formatted', 'Formatted'], ['grid', 'Grid'], ['graph', 'Graph']], c.defaultView))}
-        ${row('JSON Lines', seg('jsonl.expandMode', [['focus', 'Focus'], ['all', 'Expand all']], c.expandMode), 'The mode a new view starts in.')}
-        ${row('Graph nodes', `<input class="settings-num" type="number" min="50" max="20000" step="50" data-key="graph.maxNodes" value="${c.graphMaxNodes}" aria-label="Graph node limit">`, 'The graph stops adding nodes after this number.')}
+      <section class="settings-section"><h3>${t('LANGUAGE')}</h3>
+        <div class="settings-control">
+          ${seg('language', [['auto', t('Follow VS Code (current: {0})', languageName(c.vscodeLanguage))], ['en', 'English'], ['zh-cn', '简体中文']], c.language)}
+          <span class="settings-hint">${esc(t('Right-click menus and the VS Code Settings editor always use the VS Code display language.'))}</span>
+        </div>
       </section>
-      <section class="settings-section"><h3>TEXT EDITOR</h3>
-        ${check('syncSelection', 'Sync the current line with the text editor', c.syncSelection, 'Moving the cursor expands that line; clicking a line moves the cursor.')}
-        ${check('formatDocument.enabled', 'Format Document compacts JSONL lines', c.formatDocument, 'Off: Format Document does not change .jsonl files.')}
-        ${check('expandLines.showReminder', 'Remind me after Expand Selected Lines', c.expandReminder, 'The file is not valid JSON Lines until you compact it.')}
+      <section class="settings-section"><h3>${t('VIEWS')}</h3>
+        ${row(t('Default view'), seg('defaultView', [['formatted', t('Formatted')], ['grid', t('Grid')], ['graph', t('Graph')]], c.defaultView))}
+        ${row(t('JSON Lines'), seg('jsonl.expandMode', [['focus', t('Focus')], ['all', t('Expand all')]], c.expandMode), t('The mode a new view starts in.'))}
+        ${row(t('Graph nodes'), `<input class="settings-num" type="number" min="50" max="20000" step="50" data-key="graph.maxNodes" value="${c.graphMaxNodes}" aria-label="${esc(t('Graph node limit'))}">`, t('The graph stops adding nodes after this number.'))}
+      </section>
+      <section class="settings-section"><h3>${t('TEXT EDITOR')}</h3>
+        ${check('syncSelection', t('Sync the current line with the text editor'), c.syncSelection, t('Moving the cursor expands that line; clicking a line moves the cursor.'))}
+        ${check('formatDocument.enabled', t('Format Document compacts JSONL lines'), c.formatDocument, t('Off: Format Document does not change .jsonl files.'))}
+        ${check('expandLines.showReminder', t('Remind me after Expand Selected Lines'), c.expandReminder, t('The file is not valid JSON Lines until you compact it.'))}
       </section>`;
   }
 

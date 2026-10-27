@@ -1,4 +1,5 @@
 // Messages between the extension host and the Better JSONL webview.
+import type { Lang, LanguageSetting } from './i18n';
 
 export type ViewKind = 'formatted' | 'grid' | 'graph';
 export type ExpandMode = 'focus' | 'all';
@@ -18,6 +19,7 @@ export const SETTING_KEYS = [
   'syncSelection',
   'formatDocument.enabled',
   'expandLines.showReminder',
+  'language',
 ] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
 
@@ -33,6 +35,10 @@ export interface ViewerConfig {
   wrap: boolean;
   formatDocument: boolean;
   expandReminder: boolean;
+  /** The language setting, the language in use, and the VS Code display language. */
+  language: LanguageSetting;
+  lang: Lang;
+  vscodeLanguage: string;
 }
 
 export interface DocInfo {
@@ -62,6 +68,7 @@ export interface RenderReport {
   /** The theme in use: 'vscode' when the VS Code theme applies. */
   theme: 'vscode' | 'light' | 'dark';
   settingsOpen: boolean;
+  lang: Lang;
   version: number;
 }
 

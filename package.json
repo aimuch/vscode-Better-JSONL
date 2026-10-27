@@ -1,7 +1,7 @@
 {
   "name": "better-jsonl",
   "displayName": "Better JSONL",
-  "description": "View JSON and JSON Lines as formatted cards, a nested grid, or a node graph. Focus or expand-all mode for JSONL, synced with your editor cursor.",
+  "description": "%description%",
   "version": "0.2.0",
   "publisher": "andy",
   "license": "MIT",
@@ -59,7 +59,7 @@
     "commands": [
       {
         "command": "betterJsonl.openPreviewToSide",
-        "title": "Better JSONL: Open Preview to the Side",
+        "title": "%command.openPreviewToSide%",
         "icon": {
           "light": "media/glyph-light.svg",
           "dark": "media/glyph-dark.svg"
@@ -67,44 +67,44 @@
       },
       {
         "command": "betterJsonl.openPreview",
-        "title": "Better JSONL: Open Preview"
+        "title": "%command.openPreview%"
       },
       {
         "command": "betterJsonl.openInViewer",
-        "title": "Better JSONL: Open Full View"
+        "title": "%command.openInViewer%"
       },
       {
         "command": "betterJsonl.openAsText",
-        "title": "Better JSONL: Open as Text",
+        "title": "%command.openAsText%",
         "icon": "$(go-to-file)"
       },
       {
         "command": "betterJsonl.showFormatted",
-        "title": "Better JSONL: Show Formatted View"
+        "title": "%command.showFormatted%"
       },
       {
         "command": "betterJsonl.showGrid",
-        "title": "Better JSONL: Show Grid View"
+        "title": "%command.showGrid%"
       },
       {
         "command": "betterJsonl.showGraph",
-        "title": "Better JSONL: Show Graph View"
+        "title": "%command.showGraph%"
       },
       {
         "command": "betterJsonl.toggleExpandMode",
-        "title": "Better JSONL: Toggle Focus / Expand All"
+        "title": "%command.toggleExpandMode%"
       },
       {
         "command": "betterJsonl.toggleWordWrap",
-        "title": "Better JSONL: Toggle Word Wrap"
+        "title": "%command.toggleWordWrap%"
       },
       {
         "command": "betterJsonl.expandLines",
-        "title": "Better JSONL: Expand Selected Lines"
+        "title": "%command.expandLines%"
       },
       {
         "command": "betterJsonl.compactLines",
-        "title": "Better JSONL: Compact Lines"
+        "title": "%command.compactLines%"
       }
     ],
     "menus": {
@@ -205,12 +205,12 @@
             "graph"
           ],
           "enumDescriptions": [
-            "Formatted cards (Focus or Expand all for JSONL).",
-            "Grid of records with nested sub-grids.",
-            "Node graph of the current record."
+            "%config.defaultView.formatted%",
+            "%config.defaultView.grid%",
+            "%config.defaultView.graph%"
           ],
           "default": "formatted",
-          "description": "The view that opens first."
+          "description": "%config.defaultView%"
         },
         "betterJsonl.theme": {
           "type": "string",
@@ -221,13 +221,28 @@
             "system"
           ],
           "enumDescriptions": [
-            "Follow the VS Code color theme.",
-            "Always light.",
-            "Always dark.",
-            "Follow the operating system (light or dark)."
+            "%config.theme.vscode%",
+            "%config.theme.light%",
+            "%config.theme.dark%",
+            "%config.theme.system%"
           ],
           "default": "vscode",
-          "description": "Color theme of the Better JSONL views."
+          "description": "%config.theme%"
+        },
+        "betterJsonl.language": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "en",
+            "zh-cn"
+          ],
+          "enumDescriptions": [
+            "%config.language.auto%",
+            "English",
+            "简体中文"
+          ],
+          "default": "auto",
+          "description": "%config.language%"
         },
         "betterJsonl.wordWrap": {
           "type": "string",
@@ -237,12 +252,12 @@
             "off"
           ],
           "enumDescriptions": [
-            "Use the \"editor.wordWrap\" setting.",
-            "Always wrap long lines.",
-            "Never wrap; scroll sideways."
+            "%config.wordWrap.followEditor%",
+            "%config.wordWrap.on%",
+            "%config.wordWrap.off%"
           ],
           "default": "followEditor",
-          "description": "Wrap long lines in the Formatted and Grid views. Alt+Z (Option+Z) toggles it in the open view."
+          "description": "%config.wordWrap%"
         },
         "betterJsonl.jsonl.expandMode": {
           "type": "string",
@@ -251,45 +266,45 @@
             "all"
           ],
           "enumDescriptions": [
-            "Only the current or selected lines are pretty-printed. Other lines stay on one line.",
-            "All lines are pretty-printed."
+            "%config.jsonl.expandMode.focus%",
+            "%config.jsonl.expandMode.all%"
           ],
           "default": "focus",
-          "description": "How the Formatted view shows JSON Lines files."
+          "description": "%config.jsonl.expandMode%"
         },
         "betterJsonl.indent": {
           "type": "integer",
           "minimum": 1,
           "maximum": 8,
           "default": 2,
-          "description": "Spaces per indent level in formatted output."
+          "description": "%config.indent%"
         },
         "betterJsonl.graph.maxNodes": {
           "type": "integer",
           "minimum": 50,
           "maximum": 20000,
           "default": 1500,
-          "description": "The Graph view stops adding nodes after this number."
+          "description": "%config.graph.maxNodes%"
         },
         "betterJsonl.preview.followActiveEditor": {
           "type": "boolean",
           "default": true,
-          "description": "The preview switches to the JSON or JSONL editor that becomes active."
+          "description": "%config.preview.followActiveEditor%"
         },
         "betterJsonl.syncSelection": {
           "type": "boolean",
           "default": true,
-          "description": "Sync the current line between the text editor and the Better JSONL view."
+          "description": "%config.syncSelection%"
         },
         "betterJsonl.formatDocument.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Let \"Format Document\" rewrite JSON Lines files: each line becomes compact and canonical (records are never expanded). Off by default, so Format Document does not change JSONL files."
+          "description": "%config.formatDocument.enabled%"
         },
         "betterJsonl.expandLines.showReminder": {
           "type": "boolean",
           "default": true,
-          "description": "After \"Expand Selected Lines\", show a reminder that the file is not valid JSON Lines until you compact it, with a \"Compact Lines\" button."
+          "description": "%config.expandLines.showReminder%"
         }
       }
     }

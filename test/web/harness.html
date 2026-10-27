@@ -119,7 +119,7 @@
         doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview' },
         text,
         version: 1,
-        config: Object.assign({ defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true }, opts.config || {}),
+        config: Object.assign({ defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en' }, opts.config || {}),
       });
     },
   };

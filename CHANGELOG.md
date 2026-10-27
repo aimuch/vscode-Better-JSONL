@@ -6,6 +6,7 @@
 - Settings panel (gear button): theme, word wrap, indent, default view and mode, graph node limit, editor sync, Format Document and the Expand reminder. Changes are saved to your VS Code user settings.
 - Theme setting `betterJsonl.theme`: follow VS Code, light, dark, or follow the operating system.
 - Grid: a nested value now opens under its own column, not at the left edge.
+- Language setting `betterJsonl.language` (Follow VS Code / English / 简体中文) for the views and messages, also in the settings panel. Menus and setting descriptions are translated through `package.nls.zh-cn.json`.
 
 ## 0.1.4
 

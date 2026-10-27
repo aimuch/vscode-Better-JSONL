@@ -1,3 +1,4 @@
+import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
 import { decodeKey, esc, highlightRaw } from '../json';
@@ -57,7 +58,7 @@ export class FormattedView implements View {
   constructor(private readonly app: App) {
     this.el = document.createElement('div');
     this.el.className = 'view formatted';
-    this.el.innerHTML = `<div class="scroller" tabindex="0" aria-label="Formatted records"><div class="spacer"><div class="rows code"></div></div></div>`;
+    this.el.innerHTML = `<div class="scroller" tabindex="0" aria-label="${t('Formatted records')}"><div class="spacer"><div class="rows code"></div></div></div>`;
     this.scroller = this.el.querySelector('.scroller') as HTMLElement;
     this.spacer = this.el.querySelector('.spacer') as HTMLElement;
     this.rows = this.el.querySelector('.rows') as HTMLElement;
@@ -360,7 +361,7 @@ export class FormattedView implements View {
     const last = Math.min(this.total, this.rowAt(virtTop + vh) + 5);
     this.rows.style.transform = `translateY(${st + this.topOf(first) - virtTop}px)`;
     if (this.total === 0) {
-      this.rows.innerHTML = `<div class="empty-note">${app.state.filterOnly && app.query.text ? 'No line matches the search.' : 'The file is empty.'}</div>`;
+      this.rows.innerHTML = `<div class="empty-note">${app.state.filterOnly && app.query.text ? t('No line matches the search.') : t('The file is empty.')}</div>`;
       this.rendered = 0;
       return;
     }
@@ -425,25 +426,25 @@ export class FormattedView implements View {
     } else if (p.kind === 'error') {
       cls.push('err');
       if (j === 0) {
-        fold = `<span class="mark-err" title="Invalid JSON">${icon('warning', 12)}</span>`;
+        fold = `<span class="mark-err" title="${t('Invalid JSON')}">${icon('warning', 12)}</span>`;
         const raw = m.lines[r];
         code = highlightRaw(raw.slice(0, preview)) + (raw.length > preview ? this.truncNote(raw.length, preview) : '');
         actions = this.actionsHtml(r);
       } else {
-        const col = p.offset !== undefined ? `, col ${p.offset + 1}` : '';
-        code = `<span class="err-msg">${esc(`${p.message} · line ${r + 1}${col}`)}</span>`;
+        const col = p.offset !== undefined ? t(', col {0}', p.offset + 1) : '';
+        code = `<span class="err-msg">${esc(t('{0} · line {1}', p.message, r + 1) + col)}</span>`;
       }
     } else if (!this.isExpanded(r)) {
       cls.push('collapsed');
       const raw = m.lines[r];
-      fold = `<span class="fold closed" data-expand="1" title="Expand">${icon('chev-right', 12)}</span>`;
+      fold = `<span class="fold closed" data-expand="1" title="${t('Expand')}">${icon('chev-right', 12)}</span>`;
       code = highlightRaw(raw.slice(0, preview)) + (raw.length > preview ? this.truncNote(raw.length, preview) : '');
     } else {
       const l = this.linesOf(r)[j];
       if (l) {
         path = l.path;
-        if (l.kind === 'open') fold = `<span class="fold" data-k="${esc(l.path)}" title="Fold">${icon('chev-down', 12)}</span>`;
-        else if (l.kind === 'folded') fold = `<span class="fold closed" data-k="${esc(l.path)}" title="Unfold">${icon('chev-right', 12)}</span>`;
+        if (l.kind === 'open') fold = `<span class="fold" data-k="${esc(l.path)}" title="${t('Fold')}">${icon('chev-down', 12)}</span>`;
+        else if (l.kind === 'folded') fold = `<span class="fold closed" data-k="${esc(l.path)}" title="${t('Unfold')}">${icon('chev-right', 12)}</span>`;
         code = lineHtml(l, app.config.indent, !wrap);
         // Hanging indent: wrapped parts of a line start under its first character.
         if (wrap && l.d) indentStyle = ` style="padding-left:${l.d * app.config.indent}ch"`;
@@ -455,11 +456,12 @@ export class FormattedView implements View {
   }
 
   private actionsHtml(r: number): string {
-    return `<span class="acts"><button class="rbtn a-edit" data-r="${r}" title="Edit this record (Enter)">${icon('edit', 12)}Edit</button><button class="rbtn a-copy" data-r="${r}" title="Copy the raw line">${icon('copy', 12)}Copy</button><button class="rbtn a-goto" data-r="${r}" title="Reveal in the text editor">${icon('goto', 12)}Source</button></span>`;
+    return `<span class="acts"><button class="rbtn a-edit" data-r="${r}" title="${t('Edit this record (Enter)')}">${icon('edit', 12)}${t('Edit')}</button><button class="rbtn a-copy" data-r="${r}" title="${t('Copy the raw line')}">${icon('copy', 12)}${t('Copy')}</button><button class="rbtn a-goto" data-r="${r}" title="${t('Reveal in the text editor')}">${icon('goto', 12)}${t('Source')}</button></span>`;
   }
 
+
   private truncNote(len: number, shown: number): string {
-    return `<span class="trunc"> … ${(len - shown).toLocaleString()} more chars</span>`;
+    return `<span class="trunc">${t(' … {0} more chars', (len - shown).toLocaleString())}</span>`;
   }
 
   private markMatches(q: string): void {

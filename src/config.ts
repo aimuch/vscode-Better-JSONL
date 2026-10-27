@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { resolveLang, type LanguageSetting } from './shared/i18n';
 import type { ViewerConfig, WrapSetting } from './shared/protocol';
 
 /** Settings for a viewer. `doc` scopes "editor.wordWrap" to the document's language. */
@@ -17,7 +18,15 @@ export function readConfig(doc?: vscode.TextDocument): ViewerConfig {
     wrap: wordWrap === 'on' || (wordWrap === 'followEditor' && editorWrap !== 'off'),
     formatDocument: c.get('formatDocument.enabled', false),
     expandReminder: c.get('expandLines.showReminder', true),
+    language: c.get<LanguageSetting>('language', 'auto'),
+    lang: uiLanguage(),
+    vscodeLanguage: vscode.env.language,
   };
+}
+
+/** The UI language: the "betterJsonl.language" setting, or the VS Code display language. */
+export function uiLanguage() {
+  return resolveLang(vscode.workspace.getConfiguration('betterJsonl').get<string>('language', 'auto'), vscode.env.language);
 }
 
 /** Off by default: Format Document must not change JSONL files unless the user asks for it. */

@@ -1,3 +1,4 @@
+import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
 import { childKey, decodeKey, entriesOf, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
@@ -37,7 +38,7 @@ export class GridView implements View {
     this.rowH = app.rh + 6;
     this.el = document.createElement('div');
     this.el.className = 'view grid';
-    this.el.innerHTML = `<div class="gscroll" tabindex="0" aria-label="Grid"><div class="ghead" role="row"></div><div class="gbody"><div class="grows"></div></div></div>`;
+    this.el.innerHTML = `<div class="gscroll" tabindex="0" aria-label="${t('Grid')}"><div class="ghead" role="row"></div><div class="gbody"><div class="grows"></div></div></div>`;
     this.scroll = this.el.querySelector('.gscroll') as HTMLElement;
     this.head = this.el.querySelector('.ghead') as HTMLElement;
     this.bodyEl = this.el.querySelector('.gbody') as HTMLElement;
@@ -216,7 +217,7 @@ export class GridView implements View {
     this.head.innerHTML = cols
       .map((c, i) => {
         const sorted = sort && sort.col === c ? (sort.dir > 0 ? icon('chev-up', 11) : icon('chev-down', 11)) : '';
-        const label = c === VALUE_COL ? '<span class="dim">(value)</span>' : esc(c);
+        const label = c === VALUE_COL ? `<span class="dim">${t('(value)')}</span>` : this.mode === 'object' ? esc(t(c)) : esc(c);
         return `<div class="gh${c === '#' ? ' num' : ''}" role="columnheader" data-col="${esc(c)}" style="width:var(--w${i})" title="${esc(c)}"><span class="gh-l">${label}</span>${sorted}<span class="rz" data-rz="${esc(c)}"></span></div>`;
       })
       .join('');
@@ -228,7 +229,7 @@ export class GridView implements View {
     if (this.el.hidden || !this.app.model) return;
     if (!this.rowIds.length) {
       this.rowsEl.style.transform = '';
-      this.rowsEl.innerHTML = `<div class="empty-note">${this.app.query.text ? 'No row matches the filter.' : 'No rows.'}</div>`;
+      this.rowsEl.innerHTML = `<div class="empty-note">${this.app.query.text ? t('No row matches the filter.') : t('No rows.')}</div>`;
       return;
     }
     const vh = this.scroll.clientHeight || 600;
@@ -353,8 +354,9 @@ export class GridView implements View {
   private detailHtml(id: number, col: string, v: JVal): string {
     const rel = this.cellPath(id, col);
     const path = this.recordPath(id, rel);
-    const where = this.app.model.isJsonl ? `line ${id + 1} · ` : '';
-    const kind = Array.isArray(v) ? `array · ${v.length} item${v.length === 1 ? '' : 's'}` : `object · ${sizeOf(v as JObj)} keys`;
+    const where = this.app.model.isJsonl ? t('line {0} · ', id + 1) : '';
+    const n = sizeOf(v as JObj);
+    const kind = Array.isArray(v) ? `${t('array')} · ${t(n === 1 ? '{0} item' : '{0} items', n)}` : `${t('object')} · ${t(n === 1 ? '{0} key' : '{0} keys', n)}`;
     // The sub-grid starts under the column that was opened.
     const i = Math.max(0, this.allCols().indexOf(this.mode === 'object' ? 'value' : col));
     return `<div class="gsub" style="margin-left:var(--x${i})"><div class="gsub-h"><span class="mono">${esc(pathToString(path))}</span><span class="dim">${where}${kind}</span></div>${this.nested(v, id, rel, 0)}</div>`;
@@ -394,7 +396,7 @@ export class GridView implements View {
         );
       });
     } else {
-      rows.push(`<tr><th>${isArr(v) ? '#' : 'key'}</th><th>value</th></tr>`);
+      rows.push(`<tr><th>${isArr(v) ? '#' : t('key')}</th><th>${t('value')}</th></tr>`);
       entriesOf(v)
         .slice(0, NESTED_ROWS)
         .forEach(([k, child]) => {
@@ -402,7 +404,7 @@ export class GridView implements View {
           rows.push(`<tr>${label}<td>${inner(child, childKey(rel, k))}</td></tr>`);
         });
     }
-    const more = sizeOf(v) > NESTED_ROWS ? `<div class="dim more">… ${(sizeOf(v) - NESTED_ROWS).toLocaleString()} more</div>` : '';
+    const more = sizeOf(v) > NESTED_ROWS ? `<div class="dim more">${t('… {0} more', (sizeOf(v) - NESTED_ROWS).toLocaleString())}</div>` : '';
     return `<table class="ng">${rows.join('')}</table>${more}`;
   }
 
@@ -485,7 +487,7 @@ export class GridView implements View {
 }
 
 function chip(v: JVal, key: string, open: boolean): string {
-  return `<button class="vchip${open ? ' open' : ''}" data-c="${esc(key)}" title="${open ? 'Collapse' : 'Expand'} ${kindOf(v)}">${icon(open ? 'chev-down' : 'chev-right', 10)}${summary(v as JObj)}</button>`;
+  return `<button class="vchip${open ? ' open' : ''}" data-c="${esc(key)}" title="${t(open ? 'Collapse' : 'Expand')} ${t(kindOf(v))}">${icon(open ? 'chev-down' : 'chev-right', 10)}${summary(v as JObj)}</button>`;
 }
 
 function rank(v: JVal | undefined): number {

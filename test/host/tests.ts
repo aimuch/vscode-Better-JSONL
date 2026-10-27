@@ -303,7 +303,12 @@ describe('Better JSONL · extension host', () => {
     assert.ok(/^navigation@-\d+$/.test(title.group ?? ''), `title button group: ${title.group}`);
     const whens = [...Object.values(menus).flat().map((m) => m.when ?? ''), ...pkg.contributes.keybindings.map((k: { when: string }) => k.when)];
     assert.ok(whens.every((w) => !w.includes('=~')), 'no regex conditions');
-    for (const c of pkg.contributes.commands as { title: string }[]) assert.ok(c.title.startsWith('Better JSONL: '), c.title);
+    // Titles come from package.nls.json ("%command.x%" placeholders) unless VS Code already resolved them.
+    const nls = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(vscode.extensions.getExtension('andy.better-jsonl')!.extensionUri, 'package.nls.json'))).toString('utf8'));
+    for (const c of pkg.contributes.commands as { title: string }[]) {
+      const title = /^%(.+)%$/.test(c.title) ? nls[c.title.slice(1, -1)] : c.title;
+      assert.ok(typeof title === 'string' && title.startsWith('Better JSONL: '), c.title);
+    }
   });
 
   it('H18 every packaged icon file is a real, non-empty image', async () => {
@@ -385,6 +390,26 @@ describe('Better JSONL · extension host', () => {
       await mine.update('wordWrap', undefined, vscode.ConfigurationTarget.Global);
       await editor.update('wordWrap', undefined, vscode.ConfigurationTarget.Global);
     }
+  });
+
+  it('H22 the language setting switches the view language; menus are localized through package.nls', async () => {
+    const s = await customEditorFor('events.jsonl');
+    const cfg = vscode.workspace.getConfiguration('betterJsonl');
+    try {
+      assert.strictEqual((s.lastReport as RenderReport).lang, vscode.env.language.startsWith('zh') ? 'zh-cn' : 'en');
+      await s.handle({ type: 'setSetting', key: 'language', value: 'zh-cn' });
+      await s.waitForReport((x) => x.lang === 'zh-cn');
+      await s.handle({ type: 'setSetting', key: 'language', value: 'en' });
+      await s.waitForReport((x) => x.lang === 'en');
+    } finally {
+      await cfg.update('language', undefined, vscode.ConfigurationTarget.Global);
+    }
+    const ext = vscode.extensions.getExtension('andy.better-jsonl') as vscode.Extension<unknown>;
+    const read = async (name: string) => JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(ext.extensionUri, name))).toString('utf8'));
+    const en = await read('package.nls.json');
+    const zh = await read('package.nls.zh-cn.json');
+    assert.deepStrictEqual(Object.keys(zh).sort(), Object.keys(en).sort(), 'every English entry has a Chinese one');
+    assert.strictEqual(zh['command.openPreviewToSide'], 'Better JSONL: 在侧边打开预览');
   });
 
   it('H15 the preview follows the active JSON editor', async () => {

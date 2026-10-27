@@ -495,7 +495,7 @@ await scenario('W23', 'Theme setting: light, dark and follow system override the
     await send(page, { type: 'config', config: { ...base, theme } });
   };
   await page.evaluate(() => {
-    window.__lastConfig = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true };
+    window.__lastConfig = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en' };
   });
   await cfg('light');
   let r = await report(page, (x) => x.theme === 'light');
@@ -585,6 +585,37 @@ await scenario('W25', 'Grid: a nested value opens under its own column', [], asy
     col: Math.round(document.querySelector('.gh[data-col="tags"]').getBoundingClientRect().left),
   }));
   check.ok('still aligned after a column resize', Math.abs(after.sub - after.col) <= 1, after);
+});
+
+await scenario('W26', 'Language: Simplified Chinese UI, switch in the settings panel, state is kept', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl', { config: { language: 'auto', lang: 'zh-cn', vscodeLanguage: 'zh-cn' } });
+  await complete(page);
+  await send(page, { type: 'selection', lines: [2], active: 2 });
+  let r = await report(page, (x) => x.active === 2 && x.lang === 'zh-cn');
+  const text = (sel) => page.evaluate((s) => document.querySelector(s)?.textContent?.trim() ?? '', sel);
+  check.eq('view tab in Chinese', await text('[data-view="formatted"]'), '格式化');
+  check.eq('mode button in Chinese', await text('[data-mode="all"]'), '全部展开');
+  check.ok('status bar in Chinese', (await text('.status')).includes('第 3 行'), await text('.status'));
+  check.ok('line count in Chinese', (await text('.stats')).includes('21 行'), await text('.stats'));
+  check.ok('error chip in Chinese', (await text('.err-chip')).includes('2 个错误'), await text('.err-chip'));
+  check.ok('record buttons in Chinese', (await text('.formatted .row.first[data-r="2"] .acts')).includes('编辑'));
+  await shot('Chinese UI (VS Code display language zh-cn)');
+  await page.click('.gear-btn');
+  await page.locator('.settings.active').waitFor({ state: 'visible', timeout: 3000 });
+  check.ok('settings panel in Chinese', (await text('.settings-head h2')) === '设置');
+  check.ok('language row shows the VS Code language', (await text('.settings-seg[data-key="language"] .seg-btn[data-value="auto"]')).includes('简体中文'));
+  await page.waitForTimeout(250);
+  await shot('Settings panel in Chinese with the language section');
+  await page.click('.settings-seg[data-key="language"] .seg-btn[data-value="en"]');
+  check.eq('language sent to VS Code', (await posted(page, 'setSetting')).at(-1), { type: 'setSetting', key: 'language', value: 'en' });
+  // The host answers with a config message; the UI switches without losing the state.
+  const base = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true };
+  await send(page, { type: 'config', config: { ...base, language: 'en', lang: 'en', vscodeLanguage: 'zh-cn' } });
+  r = await report(page, (x) => x.lang === 'en');
+  check.eq('view tab in English', await text('[data-view="formatted"]'), 'Formatted');
+  check.eq('active line kept', r.active, 2);
+  check.eq('settings panel stays open', r.settingsOpen, true);
+  check.eq('settings panel in English', await text('.settings-head h2'), 'Settings');
 });
 
 await browser.close();

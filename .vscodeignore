@@ -1,5 +1,7 @@
 **
 !package.json
+!package.nls.json
+!package.nls.zh-cn.json
 !README.md
 !CHANGELOG.md
 !LICENSE

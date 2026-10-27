@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { t } from './shared/i18n';
 import { compactText, minifyJson, prettyJson } from './shared/jsonText';
 
 function eolOf(doc: vscode.TextDocument): string {
@@ -53,11 +54,11 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
   const cfg = vscode.workspace.getConfiguration('betterJsonl');
   if (ok && count > 0 && cfg.get('expandLines.showReminder', true)) {
     // Not awaited: the command must finish without waiting for the notification.
-    const compact = 'Compact Lines';
-    const never = "Don't Show Again";
+    const compact = t('Compact Lines');
+    const never = t("Don't Show Again");
     void vscode.window
       .showInformationMessage(
-        `Better JSONL: expanded ${count} record(s). The file is not valid JSON Lines until you compact it again.`,
+        t('Better JSONL: expanded {0} record(s). The file is not valid JSON Lines until you compact it again.', count),
         compact,
         never,
       )
@@ -82,7 +83,7 @@ export async function compactLines(editor: vscode.TextEditor): Promise<boolean> 
   const res = compactText(src, eol);
   if (!res.ok) {
     void vscode.window.showErrorMessage(
-      `Better JSONL: line ${range.start.line + res.line} is not valid JSON (${res.message}). Nothing changed.`,
+      t('Better JSONL: line {0} is not valid JSON ({1}). Nothing changed.', range.start.line + res.line, res.message),
     );
     return false;
   }

@@ -1,5 +1,6 @@
 // Turns a parsed value into display lines for the Formatted view.
 // Iterative on purpose: deep nesting must not overflow the call stack.
+import { t } from '../../shared/i18n';
 import { childKey, entriesOf, esc, isContainer, primClass, primText, sizeOf, type JVal } from '../json';
 
 export interface PLine {
@@ -121,9 +122,9 @@ export function lineHtml(l: PLine, indent: number, indentText = true): string {
       parts.push(`<span class="tp">${l.br}</span>`);
       break;
     case 'folded': {
-      const what = l.br === '[]' ? `${l.count} item${l.count === 1 ? '' : 's'}` : `${l.count} key${l.count === 1 ? '' : 's'}`;
+      const what = l.br === '[]' ? t(l.count === 1 ? '{0} item' : '{0} items', l.count as number) : t(l.count === 1 ? '{0} key' : '{0} keys', l.count as number);
       parts.push(
-        `<span class="tp">${l.br![0]}</span><button class="ph" data-k="${esc(l.path)}" title="Expand">… ${what}</button><span class="tp">${l.br![1]}</span>`,
+        `<span class="tp">${l.br![0]}</span><button class="ph" data-k="${esc(l.path)}" title="${t('Expand')}">… ${what}</button><span class="tp">${l.br![1]}</span>`,
       );
       break;
     }

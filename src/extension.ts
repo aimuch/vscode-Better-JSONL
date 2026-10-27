@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { formatDocumentEnabled, isSupportedDocument } from './config';
+import { formatDocumentEnabled, isSupportedDocument, uiLanguage } from './config';
+import { setLang, t } from './shared/i18n';
 import { ViewerEditorProvider, VIEWER_VIEW_TYPE } from './customEditor';
 import { compactLines, expandLines, formatJsonl } from './lineCommands';
 import { PREVIEW_VIEW_TYPE, PreviewManager } from './preview';
@@ -12,6 +13,12 @@ export interface BetterJsonlApi {
 }
 
 export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
+  setLang(uiLanguage());
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('betterJsonl.language')) setLang(uiLanguage());
+    }),
+  );
   const sessions = new Set<ViewerSession>();
   let lastActive: ViewerSession | undefined;
 
@@ -64,7 +71,7 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
       return vscode.workspace.openTextDocument(tab.uri);
     }
     void vscode.window.showWarningMessage(
-      'Better JSONL: open a JSON or JSONL file first. VS Code does not give extensions files larger than 50 MB.',
+      t('Better JSONL: open a JSON or JSONL file first. VS Code does not give extensions files larger than 50 MB.'),
     );
     return undefined;
   };
@@ -77,7 +84,7 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
   const sendToActive = (msg: HostMessage) => {
     const s = activeSession();
     if (s) s.post(msg);
-    else void vscode.window.showInformationMessage('Better JSONL: open a Better JSONL view first.');
+    else void vscode.window.showInformationMessage(t('Better JSONL: open a Better JSONL view first.'));
   };
 
   const reg = (id: string, fn: (...args: any[]) => unknown) =>

@@ -63,6 +63,7 @@ Click the gear at the top right of the view. The panel changes the same settings
 
 - **Theme**: Follow VS Code, Light, Dark, or Follow system (the operating system's light or dark mode).
 - **Word wrap**: Follow editor (`editor.wordWrap`), On, or Off.
+- **Language**: Follow VS Code, English, or 简体中文 (Simplified Chinese). Right-click menus and the VS Code Settings editor always use the VS Code display language; they are translated through `package.nls.zh-cn.json`.
 - Indent, default view, default JSON Lines mode, graph node limit, editor sync, Format Document for JSONL, and the Expand Selected Lines reminder.
 
 ## How to open
@@ -90,6 +91,7 @@ All commands are also in the Command Palette under `Better JSONL: …`.
 |---------|---------|-------------|
 | `betterJsonl.defaultView` | `formatted` | The first view: `formatted`, `grid` or `graph`. |
 | `betterJsonl.theme` | `vscode` | `vscode` (follow VS Code), `light`, `dark`, or `system` (follow the operating system). |
+| `betterJsonl.language` | `auto` | `auto` (follow the VS Code display language), `en`, or `zh-cn`. |
 | `betterJsonl.wordWrap` | `followEditor` | `followEditor` (use `editor.wordWrap`), `on`, or `off`. `Alt+Z` toggles it in the open view. |
 | `betterJsonl.jsonl.expandMode` | `focus` | `focus` or `all`. |
 | `betterJsonl.indent` | `2` | Spaces per indent level in the viewer and the record editor. |

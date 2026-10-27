@@ -135,6 +135,13 @@
 - 面板的每次修改都发消息给宿主，宿主写入 VS Code 用户设置（`ConfigurationTarget.Global`）。所有视图通过配置变更事件同步，所以面板和 `settings.json` 始终一致。宿主只接受白名单里的设置键。
 - 主题：`vscode` 时直接使用 VS Code 注入的 `--vscode-*` 变量；`light` / `dark` 时在 `body[data-theme]` 上用一整套固定配色（VS Code Light Modern / Dark Modern）覆盖这些变量；`system` 时按 `prefers-color-scheme` 选择 light 或 dark，并监听系统切换。VS Code 默认把 Electron 的 `nativeTheme.themeSource` 设为 `system`，所以它反映操作系统；如果用户设置了 `window.systemColorTheme`，则以它为准。
 
+### 6.5 界面语言（中文 / English）
+
+- 设置 `betterJsonl.language`：`auto`（跟随 VS Code 显示语言，zh-cn / zh-sg / zh-hans* 视为简体中文）/ `en` / `zh-cn`。设置面板里的"界面语言"一节写入这个设置，形式参考 Git Map。
+- 网页视图和宿主提示消息共用 `src/shared/i18n.ts`：代码里写英文原文，`t()` 按语言查中文字典，查不到时回退英文。切换语言时，网页视图重建工具栏、视图和设置面板，当前行、选中、视图和换行状态保持不变。
+- 右键菜单的命令名、VS Code 设置编辑器中的说明由 VS Code 自己绘制，只能跟随 VS Code 的显示语言。它们通过 `package.nls.json` / `package.nls.zh-cn.json` 翻译；测试检查两份文件的键完全一致。
+- JSON 解析错误的原文来自 JavaScript 引擎，保持英文；行号、列号部分已翻译。
+
 ## 7. 数据与性能
 
 - 宿主发送全文。Webview 按行切分，**惰性解析**：只解析可见或需要的记录。后台按时间片（每片 8ms）解析全部，更新统计、错误列表、列集合。
@@ -149,6 +156,7 @@
 |------|------|------|
 | `betterJsonl.defaultView` | `formatted` | 打开时的视图 |
 | `betterJsonl.theme` | `vscode` | `vscode`（跟随 VS Code）/ `light` / `dark` / `system`（跟随操作系统） |
+| `betterJsonl.language` | `auto` | `auto`（跟随 VS Code 显示语言）/ `en` / `zh-cn` |
 | `betterJsonl.wordWrap` | `followEditor` | `followEditor`（跟随 `editor.wordWrap`）/ `on` / `off`。`Alt+Z` 在当前视图里临时切换。 |
 | `betterJsonl.jsonl.expandMode` | `focus` | `focus` / `all` |
 | `betterJsonl.indent` | `2` | 视图和单条编辑面板的缩进空格数。原生编辑器里的 `Expand Selected Lines` 不用它，而是用该编辑器自己的 Tab Size 和空格/Tab 设置。 |

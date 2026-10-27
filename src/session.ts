@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isJsonlDocument, readConfig } from './config';
 import { locatePath } from './locate';
+import { t } from './shared/i18n';
 import { errorMessage, minifyJson } from './shared/jsonText';
 import { SETTING_KEYS, type HostMessage, type JsonPath, type RenderReport, type WebviewMessage } from './shared/protocol';
 
@@ -158,7 +159,7 @@ export class ViewerSession implements vscode.Disposable {
           break;
         case 'copy':
           await vscode.env.clipboard.writeText(m.text);
-          vscode.window.setStatusBarMessage('Better JSONL: copied to clipboard', 2000);
+          vscode.window.setStatusBarMessage(t('Better JSONL: copied to clipboard'), 2000);
           break;
         case 'openAsText':
           await this.openAsText();
@@ -224,9 +225,9 @@ export class ViewerSession implements vscode.Disposable {
   private async editLine(line: number, original: string, text: string): Promise<void> {
     const doc = this.doc;
     const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
-    if (!doc) return fail('No document.');
+    if (!doc) return fail(t('No document.'));
     if (line >= doc.lineCount || doc.lineAt(line).text !== original) {
-      return fail(`Line ${line + 1} changed after the edit started. Nothing was written.`);
+      return fail(t('Line {0} changed after the edit started. Nothing was written.', line + 1));
     }
     try {
       JSON.parse(text);
@@ -236,7 +237,7 @@ export class ViewerSession implements vscode.Disposable {
     const edit = new vscode.WorkspaceEdit();
     edit.replace(doc.uri, doc.lineAt(line).range, minifyJson(text));
     const ok = await vscode.workspace.applyEdit(edit);
-    this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: 'VS Code rejected the edit.' });
+    this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.') });
   }
 
   async openAsText(): Promise<void> {
@@ -253,7 +254,7 @@ export class ViewerSession implements vscode.Disposable {
 
   /** Writes one Better JSONL setting to the user settings. Other sessions get it through the config event. */
   private async setSetting(key: string, value: unknown): Promise<void> {
-    if (!(SETTING_KEYS as readonly string[]).includes(key)) throw new Error(`Unknown setting: ${key}`);
+    if (!(SETTING_KEYS as readonly string[]).includes(key)) throw new Error(t('Unknown setting: {0}', key));
     await vscode.workspace.getConfiguration('betterJsonl').update(key, value, vscode.ConfigurationTarget.Global);
   }
 
@@ -262,12 +263,12 @@ export class ViewerSession implements vscode.Disposable {
     const dir = doc && doc.uri.scheme === 'file' ? vscode.Uri.joinPath(doc.uri, '..') : undefined;
     const target = await vscode.window.showSaveDialog({
       defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
-      filters: format === 'svg' ? { 'SVG image': ['svg'] } : { 'PNG image': ['png'] },
+      filters: format === 'svg' ? { [t('SVG image')]: ['svg'] } : { [t('PNG image')]: ['png'] },
     });
     if (!target) return;
     const bytes = format === 'svg' ? Buffer.from(data, 'utf8') : Buffer.from(data.replace(/^data:image\/png;base64,/, ''), 'base64');
     await vscode.workspace.fs.writeFile(target, bytes);
-    vscode.window.setStatusBarMessage(`Better JSONL: saved ${path.basename(target.path)}`, 3000);
+    vscode.window.setStatusBarMessage(t('Better JSONL: saved {0}', path.basename(target.path)), 3000);
   }
 
   private html(webview: vscode.Webview): string {
