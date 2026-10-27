@@ -40,6 +40,8 @@ jobs:
           fi
 
       - name: Extension host E2E (downloads VS Code)
+        env:
+          VSCODE_DOWNLOAD: '1'
         run: npm run test:e2e:host
 
       - name: Package VSIX and UI E2E in a real VS Code window

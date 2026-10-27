@@ -5,7 +5,7 @@ import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runTests } from '@vscode/test-electron';
+import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const work = await mkdtemp(join(tmpdir(), 'better-jsonl-e2e-'));
@@ -14,7 +14,14 @@ await cp(join(root, 'test/fixtures'), fixtures, { recursive: true });
 await mkdir(join(root, 'test-results'), { recursive: true });
 
 const installed = '/Applications/Visual Studio Code.app/Contents/MacOS/Code';
-const vscodeExecutablePath = process.env.VSCODE_PATH ?? (existsSync(installed) ? installed : undefined);
+// VSCODE_DOWNLOAD=1 always downloads a VS Code (CI does this, so runs do not depend on the machine).
+let vscodeExecutablePath = process.env.VSCODE_PATH || (process.env.VSCODE_DOWNLOAD !== '1' && existsSync(installed) ? installed : undefined);
+if (!vscodeExecutablePath) {
+  // CI machines have no VS Code: download one. On macOS, VS Code now names its binary
+  // "Code", while @vscode/test-electron 2.x still returns ".../MacOS/Electron".
+  const downloaded = await downloadAndUnzipVSCode('stable');
+  vscodeExecutablePath = existsSync(downloaded) ? downloaded : downloaded.replace(/\/Electron$/, '/Code');
+}
 
 try {
   await runTests({
