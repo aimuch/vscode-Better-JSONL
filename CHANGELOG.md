@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Grid: filter by column. The funnel button in each header opens a list of the column's values with counts (tick or untick them), a search box (cells that contain the text), sort buttons and Clear filter. Filters on several columns combine; the status bar shows how many rows are left.
 
