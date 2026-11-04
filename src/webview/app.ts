@@ -23,6 +23,12 @@ export interface View {
   hide(): void;
 }
 
+/** Grid column filter: a "contains" text and the cell values that are unticked. */
+export interface ColFilter {
+  text: string;
+  exclude: Set<string>;
+}
+
 export interface UIState {
   view: ViewKind;
   expandMode: ExpandMode;
@@ -33,7 +39,7 @@ export interface UIState {
   anchor: number;
   selected: Set<number>;
   folds: Map<number, Set<string>>;
-  grid: { sort: { col: string; dir: 1 | -1 } | null; widths: Record<string, number>; open: Set<string> };
+  grid: { sort: { col: string; dir: 1 | -1 } | null; widths: Record<string, number>; open: Set<string>; filters: Map<string, ColFilter> };
   graph: { collapsed: Set<string>; selectedNode: string | null; zoom: number };
 }
 
@@ -181,7 +187,7 @@ export class App {
       anchor: 0,
       selected: new Set(),
       folds: new Map(),
-      grid: { sort: null, widths: {}, open: new Set() },
+      grid: { sort: null, widths: {}, open: new Set(), filters: new Map() },
       graph: { collapsed: new Set(), selectedNode: null, zoom: 1 },
     };
     if (this.model.isJsonl && this.model.count) this.state.selected.add(this.state.active);
@@ -594,11 +600,15 @@ export class App {
       if (s.selected.size > 1) parts.push(t('{0} selected', s.selected.size));
     } else parts.push(m.jsonc ? t('JSON with Comments') : 'JSON');
     if (s.view === 'formatted' && m.isJsonl) parts.push(s.expandMode === 'focus' ? t('Focus: selected lines are expanded') : t('All lines expanded'));
+    if (s.view === 'grid') {
+      const f = (this.views.grid as GridView).filterStatus();
+      if (f) parts.push(f);
+    }
     const hint =
       s.view === 'graph'
         ? t('Drag or scroll to pan · {0}+scroll to zoom · click a node to inspect', navigator.platform.includes('Mac') ? '⌘' : 'Ctrl')
         : s.view === 'grid'
-          ? t('Click a header to sort · drag a header edge to resize')
+          ? t('Click a header to sort · the funnel filters a column · drag a header edge to resize')
           : m.isJsonl
             ? t('↑/↓ move · Shift extends · Enter edits · double-click jumps to source')
             : t('Click ▸ to fold · double-click jumps to source');

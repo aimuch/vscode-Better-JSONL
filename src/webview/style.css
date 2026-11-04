@@ -808,8 +808,176 @@ mark {
 }
 
 .gh-l {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.gh.filtered .gh-l {
+  color: var(--vscode-textLink-foreground, var(--accent));
+}
+
+/* Filter button in a header: shown on hover, and always while the column is filtered. */
+.gh-f {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: auto;
+  margin-right: -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.gh:hover .gh-f,
+.gh-f:focus-visible,
+.gh-f.open,
+.gh-f.on {
+  opacity: 1;
+}
+
+.gh-f:hover,
+.gh-f.open {
+  background: var(--vscode-toolbar-hoverBackground, var(--hover));
+  color: var(--fg);
+}
+
+.gh-f.on {
+  background: var(--vscode-inputOption-activeBackground, var(--sel));
+  color: var(--vscode-inputOption-activeForeground, var(--fg));
+  outline: 1px solid var(--vscode-inputOption-activeBorder, transparent);
+}
+
+.gfilter {
+  position: absolute;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 280px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--bg));
+  color: var(--fg);
+  box-shadow: 0 4px 18px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+}
+
+.gfilter[hidden] {
+  display: none;
+}
+
+.gf-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.gf-sort {
+  display: flex;
+  gap: 6px;
+}
+
+.gf-sort .btn {
+  flex: 1 1 0;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 6px;
+}
+
+.gf-search {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: none;
+  height: 26px;
+}
+
+.gf-list {
+  flex: 1 1 auto;
+  min-height: 60px;
+  overflow: auto;
+  padding: 2px 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.gf-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.gf-item:hover {
+  background: var(--hover);
+}
+
+.gf-item input {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--vscode-button-background, var(--accent));
+}
+
+.gf-all {
+  padding-left: 9px;
+  font-weight: 600;
+}
+
+.gf-v {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gf-list .gf-v {
+  font-family: var(--mono);
+}
+
+.gf-n {
+  flex-shrink: 0;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.gf-more {
+  padding: 4px 8px;
+  color: var(--dim);
+  white-space: normal;
+}
+
+.gf-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gf-foot .btn {
+  height: 24px;
+}
+
+.empty-note .gf-clear-all {
+  margin-left: 8px;
+  vertical-align: middle;
 }
 
 .rz {

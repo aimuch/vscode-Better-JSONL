@@ -618,6 +618,63 @@ await scenario('W26', 'Language: Simplified Chinese UI, switch in the settings p
   check.eq('settings panel in English', await text('.settings-head h2'), 'Settings');
 });
 
+await scenario('W27', 'Grid: header filters (value list, search, cascade, clear)', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await tabBtn(page, 'grid').click();
+  let r = await report(page, (x) => x.view === 'grid');
+  check.eq('no filters at first', r.grid.filters, {});
+  const items = () =>
+    page.evaluate(() => [...document.querySelectorAll('.gfilter .gf-list .gf-item')].map((e) => [e.querySelector('.gf-v').textContent, e.querySelector('.gf-n').textContent, e.querySelector('input').checked]));
+  await page.hover('.gh[data-col="level"]');
+  await page.click('.gh[data-col="level"] .gh-f');
+  await page.locator('.gfilter').waitFor({ state: 'visible', timeout: 3000 });
+  check.eq('value list with counts, missing last', await items(), [
+    ['debug', '3', true],
+    ['info', '10', true],
+    ['warn', '3', true],
+    ['(missing)', '4', true],
+  ]);
+  check.ok('search box has focus', await page.evaluate(() => document.activeElement?.matches('.gfilter input[type="search"]')));
+  await page.click('.gfilter .gf-all');
+  r = await report(page, (x) => x.grid.rows === 0);
+  check.eq('untick all hides every row', r.grid.filters.level, { text: '', exclude: 4 });
+  await page.locator('.gfilter .gf-item', { hasText: 'warn' }).click();
+  r = await report(page, (x) => x.grid.rows === 3);
+  check.eq('only warn rows', r.grid.unfiltered, 20);
+  check.ok('select all is indeterminate', await page.evaluate(() => document.querySelector('.gfilter [data-fall]').indeterminate));
+  check.ok('header marked as filtered', await page.locator('.gh[data-col="level"].filtered .gh-f.on').count() === 1);
+  check.ok('status bar shows the filtered count', ((await page.locator('.status').textContent()) || '').includes('3 of 20 rows'));
+  await shot('Level filter: only warn');
+  await page.keyboard.press('Escape');
+  check.ok('Escape closes the popup', await page.locator('.gfilter').isHidden());
+  // A second column: search text, and the value list of the first column follows it.
+  await page.click('.gh[data-col="level"] .gh-f');
+  await page.click('.gfilter .gf-clear');
+  r = await report(page, (x) => x.grid.rows === 20);
+  check.eq('clear filter', r.grid.filters, {});
+  await page.click('.gh[data-col="msg"] .gh-f');
+  await page.fill('.gfilter input[type="search"]', 'get');
+  r = await report(page, (x) => x.grid.rows === 3);
+  check.eq('search is a case-insensitive contains filter', r.grid.filters.msg, { text: 'get', exclude: 0 });
+  check.eq('list narrows to matching values', (await items()).map((x) => x[0]), ['GET /api/cart', 'GET /api/me', 'GET /api/orders']);
+  await page.click('.gfilter [data-fsort="-1"]');
+  await page.waitForTimeout(100);
+  check.ok('sort from the popup closes it', await page.locator('.gfilter').isHidden());
+  check.eq('sorted descending by msg', await page.locator('.grows .grow').first().getAttribute('data-id'), '1');
+  await page.click('.gh[data-col="level"] .gh-f');
+  check.eq('other filters narrow the value list', await items(), [['debug', '3', true]]);
+  await page.click('.gfilter .gf-item:has-text("debug")');
+  r = await report(page, (x) => x.grid.rows === 0);
+  await page.mouse.click(600, 500);
+  check.ok('click outside closes the popup', await page.locator('.gfilter').isHidden());
+  await shot('No rows left: clear all filters');
+  await page.click('[data-clear-filters]');
+  r = await report(page, (x) => x.grid.rows === 20);
+  check.eq('clear all filters', r.grid.filters, {});
+  check.eq('header click still sorts', r.view, 'grid');
+});
+
 await browser.close();
 server.close();
 

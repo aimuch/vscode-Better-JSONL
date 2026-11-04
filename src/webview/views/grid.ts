@@ -1,6 +1,6 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
-import type { App, View } from '../app';
+import type { App, ColFilter, View } from '../app';
 import { childKey, decodeKey, entriesOf, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
 import type { Parsed } from '../model';
@@ -11,6 +11,20 @@ const NESTED_COLS = 50;
 const CELL_CHARS = 300;
 const CELL_CHARS_WRAP = 5000;
 const VALUE_COL = '(value)';
+/** Values listed in a column filter before "… n more". */
+const FILTER_LIST = 500;
+/** Filter key of a missing cell. */
+const MISSING = '\u0000';
+
+interface FilterValue {
+  key: string;
+  v: JVal | undefined;
+  n: number;
+  /** Position in the sorted list. */
+  i: number;
+  /** Lower-case cell text, for the search box. */
+  text: string;
+}
 
 type Mode = 'records' | 'object' | 'scalar';
 
@@ -33,6 +47,13 @@ export class GridView implements View {
   private dragging: { col: string; startX: number; startW: number } | null = null;
   private jsonActive = -1;
   private modelRef: unknown;
+  /** Rows after the search, before the column filters. */
+  private baseIds: number[] = [];
+  /** The open filter popup: its column and the column's values. */
+  private fcol: string | null = null;
+  private fvalues: FilterValue[] = [];
+  private readonly fel: HTMLElement;
+  private ftimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly app: App) {
     this.rowH = app.rh + 6;
@@ -51,6 +72,29 @@ export class GridView implements View {
     this.rowsEl.addEventListener('dblclick', (e) => this.onDblClick(e));
     window.addEventListener('pointermove', (e) => this.onDrag(e));
     window.addEventListener('pointerup', () => (this.dragging = null));
+    this.scroll.addEventListener('scroll', () => this.placeFilter(), { passive: true });
+    this.fel = document.createElement('div');
+    this.fel.className = 'gfilter';
+    this.fel.hidden = true;
+    this.fel.setAttribute('role', 'dialog');
+    this.el.appendChild(this.fel);
+    this.fel.addEventListener('input', (e) => this.onFilterInput(e));
+    this.fel.addEventListener('change', (e) => this.onFilterChange(e));
+    this.fel.addEventListener('click', (e) => this.onFilterClick(e));
+    this.fel.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.closeFilter(true);
+      }
+      e.stopPropagation();
+    });
+    document.addEventListener('pointerdown', (e) => {
+      const t = e.target as HTMLElement;
+      if (this.fcol !== null && !this.fel.contains(t) && !t.closest('[data-f]')) this.closeFilter();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && this.fcol !== null) this.closeFilter(true);
+    });
   }
 
   show(): void {
@@ -58,12 +102,20 @@ export class GridView implements View {
   }
 
   hide(): void {
+    this.closeFilter();
     this.el.hidden = true;
   }
 
   render(): void {
     this.layout();
     this.paint();
+    if (this.fcol !== null) {
+      if (this.cols.includes(this.fcol)) {
+        this.fvalues = this.valuesOf(this.fcol);
+        this.paintFilterList();
+        this.placeFilter();
+      } else this.closeFilter();
+    }
   }
 
   onWrapChanged(): void {
@@ -94,7 +146,17 @@ export class GridView implements View {
   }
 
   fillReport(r: RenderReport): void {
-    r.grid = { rows: this.rowIds.length, columns: [...this.cols], openCells: this.app.state.grid.open.size };
+    const filters: Record<string, { text: string; exclude: number }> = {};
+    for (const [c, f] of this.activeFilters()) filters[c] = { text: f.text, exclude: f.exclude.size };
+    r.grid = { rows: this.rowIds.length, columns: [...this.cols], openCells: this.app.state.grid.open.size, unfiltered: this.baseIds.length, filters };
+  }
+
+  /** Status bar text while column filters are on, e.g. "Filtered: level, ms · 5 of 20 rows". */
+  filterStatus(): string {
+    const f = this.activeFilters();
+    if (!f.length) return '';
+    const names = f.map(([c]) => (c === VALUE_COL ? t('(value)') : this.mode === 'object' ? t(c) : c)).join(', ');
+    return `${t('Filtered: {0}', names)} · ${t('{0} of {1} rows', this.rowIds.length.toLocaleString(), this.baseIds.length.toLocaleString())}`;
   }
 
   // ---------- data ----------
@@ -168,6 +230,9 @@ export class GridView implements View {
       this.cols = [VALUE_COL];
       ids = root === undefined ? [] : [0];
     }
+    this.baseIds = ids;
+    const filters = this.activeFilters();
+    if (filters.length) ids = ids.filter((id) => this.passes(id, filters));
     const sort = app.state.grid.sort;
     if (sort && (sort.col === '#' || this.cols.includes(sort.col))) {
       const keyed = ids.map((id) => [id, sort.col === '#' ? id : this.cell(id, sort.col)] as [number, JVal | number | undefined]);
@@ -197,9 +262,12 @@ export class GridView implements View {
     const w = this.app.state.grid.widths[col];
     if (w) return w;
     if (col === '#') return 64;
-    let max = col.length;
-    for (let i = 0; i < Math.min(40, this.rowIds.length); i++) {
-      const v = this.cell(this.rowIds[i], col);
+    // The header also holds the sort arrow and the filter button.
+    let max = col.length + 5;
+    // Measured on the rows before the column filters, so filtering does not resize the columns.
+    const ids = this.baseIds;
+    for (let i = 0; i < Math.min(40, ids.length); i++) {
+      const v = this.cell(ids[i], col);
       const len = v === undefined ? 0 : isContainer(v) ? summary(v).length + 3 : plainText(v).length;
       if (len > max) max = len;
     }
@@ -213,12 +281,20 @@ export class GridView implements View {
   private paintHead(): void {
     const sort = this.app.state.grid.sort;
     const cols = this.allCols();
+    const filters = this.app.state.grid.filters;
+    const filterable = this.mode !== 'scalar';
     this.applyWidths();
     this.head.innerHTML = cols
       .map((c, i) => {
         const sorted = sort && sort.col === c ? (sort.dir > 0 ? icon('chev-up', 11) : icon('chev-down', 11)) : '';
         const label = c === VALUE_COL ? `<span class="dim">${t('(value)')}</span>` : this.mode === 'object' ? esc(t(c)) : esc(c);
-        return `<div class="gh${c === '#' ? ' num' : ''}" role="columnheader" data-col="${esc(c)}" style="width:var(--w${i})" title="${esc(c)}"><span class="gh-l">${label}</span>${sorted}<span class="rz" data-rz="${esc(c)}"></span></div>`;
+        const f = filters.get(c);
+        const on = !!f && (!!f.text || f.exclude.size > 0);
+        const fbtn =
+          filterable && c !== '#'
+            ? `<button class="gh-f${on ? ' on' : ''}${this.fcol === c ? ' open' : ''}" data-f="${esc(c)}" aria-label="${esc(t('Filter {0}', c === VALUE_COL ? t('(value)') : c))}" aria-pressed="${on}" title="${t('Filter this column')}">${icon('filter', 12)}</button>`
+            : '';
+        return `<div class="gh${c === '#' ? ' num' : ''}${on ? ' filtered' : ''}" role="columnheader" data-col="${esc(c)}" style="width:var(--w${i})" title="${esc(c)}"><span class="gh-l">${label}</span>${sorted}${fbtn}<span class="rz" data-rz="${esc(c)}"></span></div>`;
       })
       .join('');
   }
@@ -229,7 +305,9 @@ export class GridView implements View {
     if (this.el.hidden || !this.app.model) return;
     if (!this.rowIds.length) {
       this.rowsEl.style.transform = '';
-      this.rowsEl.innerHTML = `<div class="empty-note">${this.app.query.text ? t('No row matches the filter.') : t('No rows.')}</div>`;
+      const filtered = this.activeFilters().length > 0;
+      const clear = filtered ? ` <button class="btn gf-clear-all" data-clear-filters>${t('Clear all filters')}</button>` : '';
+      this.rowsEl.innerHTML = `<div class="empty-note">${this.app.query.text || filtered ? t('No row matches the filter.') : t('No rows.')}${clear}</div>`;
       return;
     }
     const vh = this.scroll.clientHeight || 600;
@@ -435,6 +513,13 @@ export class GridView implements View {
   private onHeadClick(e: MouseEvent): void {
     const t = e.target as HTMLElement;
     if (t.closest('[data-rz]')) return;
+    const fb = t.closest('[data-f]') as HTMLElement | null;
+    if (fb) {
+      const col = fb.dataset.f as string;
+      if (this.fcol === col) this.closeFilter();
+      else this.openFilter(col);
+      return;
+    }
     const h = t.closest('[data-col]') as HTMLElement | null;
     if (!h) return;
     const col = h.dataset.col as string;
@@ -448,6 +533,11 @@ export class GridView implements View {
 
   private onClick(e: MouseEvent): void {
     const t = e.target as HTMLElement;
+    if (t.closest('[data-clear-filters]')) {
+      this.app.state.grid.filters.clear();
+      this.refilter();
+      return;
+    }
     const chipEl = t.closest('[data-c]') as HTMLElement | null;
     const rowEl = t.closest('.grow') as HTMLElement | null;
     if (!rowEl) return;
@@ -484,6 +574,243 @@ export class GridView implements View {
     const path = this.recordPath(id, rel);
     this.app.post({ type: 'reveal', line: this.app.model.isJsonl ? id : 0, path });
   }
+
+  // ---------- column filters ----------
+
+  /** Filters that narrow the rows, on columns that exist. `except` leaves one column out. */
+  private activeFilters(except?: string): [string, ColFilter][] {
+    const out: [string, ColFilter][] = [];
+    for (const [c, f] of this.app.state.grid.filters) {
+      if (c !== except && (f.text || f.exclude.size) && this.cols.includes(c)) out.push([c, f]);
+    }
+    return out;
+  }
+
+  private passes(id: number, filters: [string, ColFilter][]): boolean {
+    for (const [c, f] of filters) {
+      const v = this.cell(id, c);
+      if (f.exclude.size && f.exclude.has(valueKey(v))) return false;
+      if (f.text && !cellText(v).toLowerCase().includes(f.text.toLowerCase())) return false;
+    }
+    return true;
+  }
+
+  /** Distinct values of a column, with counts, among the rows the other filters keep. */
+  private valuesOf(col: string): FilterValue[] {
+    const others = this.activeFilters(col);
+    const map = new Map<string, FilterValue>();
+    for (const id of this.baseIds) {
+      if (others.length && !this.passes(id, others)) continue;
+      const v = this.cell(id, col);
+      const key = valueKey(v);
+      const e = map.get(key);
+      if (e) e.n++;
+      else map.set(key, { key, v, n: 1, i: 0, text: cellText(v).toLowerCase() });
+    }
+    const out = [...map.values()].sort((a, b) => {
+      const ma = a.v === undefined;
+      const mb = b.v === undefined;
+      if (ma !== mb) return ma ? 1 : -1;
+      return compare(a.v, b.v) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    });
+    out.forEach((x, i) => (x.i = i));
+    return out;
+  }
+
+  private filterOf(col: string): ColFilter {
+    const all = this.app.state.grid.filters;
+    let f = all.get(col);
+    if (!f) {
+      f = { text: '', exclude: new Set() };
+      all.set(col, f);
+    }
+    return f;
+  }
+
+  /** Values the search box lets through. */
+  private shownValues(): FilterValue[] {
+    const f = this.app.state.grid.filters.get(this.fcol as string);
+    const q = f?.text.toLowerCase() ?? '';
+    return q ? this.fvalues.filter((x) => x.text.includes(q)) : this.fvalues;
+  }
+
+  private openFilter(col: string): void {
+    this.fcol = col;
+    this.fvalues = this.valuesOf(col);
+    const f = this.app.state.grid.filters.get(col);
+    const name = col === VALUE_COL ? t('(value)') : this.mode === 'object' ? t(col) : col;
+    this.fel.setAttribute('aria-label', t('Filter {0}', name));
+    this.fel.innerHTML = `
+      <div class="gf-title" title="${esc(name)}">${icon('filter', 12)}<span>${esc(name)}</span></div>
+      <div class="gf-sort">
+        <button class="btn" data-fsort="1">${icon('chev-up', 11)}${t('Sort ascending')}</button>
+        <button class="btn" data-fsort="-1">${icon('chev-down', 11)}${t('Sort descending')}</button>
+      </div>
+      <label class="search gf-search">${icon('search')}<span class="sr">${t('Search values')}</span><input type="search" placeholder="${t('Search values')}" spellcheck="false" value="${esc(f?.text ?? '')}"></label>
+      <label class="gf-item gf-all"><input type="checkbox" data-fall><span class="gf-v">${t('(Select all)')}</span><span class="gf-n"></span></label>
+      <div class="gf-list" role="group"></div>
+      <div class="gf-foot"><button class="btn gf-clear">${t('Clear filter')}</button><span class="spring"></span><span class="dim gf-count"></span></div>`;
+    this.fel.hidden = false;
+    this.paintFilterList();
+    this.paintHead();
+    this.placeFilter();
+    const input = this.fel.querySelector('input[type="search"]') as HTMLInputElement;
+    input.focus();
+    input.select();
+  }
+
+  closeFilter(focusGrid = false): void {
+    if (this.fcol === null) return;
+    clearTimeout(this.ftimer);
+    const col = this.fcol;
+    this.fcol = null;
+    this.fel.hidden = true;
+    this.fel.innerHTML = '';
+    const f = this.app.state.grid.filters.get(col);
+    if (f && !f.text && !f.exclude.size) this.app.state.grid.filters.delete(col);
+    this.paintHead();
+    if (focusGrid) this.scroll.focus();
+  }
+
+  /** The popup sits under its header and stays inside the view. */
+  private placeFilter(): void {
+    if (this.fcol === null) return;
+    const h = this.head.querySelector(`[data-col="${CSS.escape(this.fcol)}"]`) as HTMLElement | null;
+    if (!h) return;
+    const host = this.el.getBoundingClientRect();
+    const r = h.getBoundingClientRect();
+    const w = this.fel.offsetWidth || 280;
+    const left = Math.max(4, Math.min(r.left - host.left, host.width - w - 4));
+    const top = r.bottom - host.top + 2;
+    this.fel.style.left = `${left}px`;
+    this.fel.style.top = `${top}px`;
+    this.fel.style.maxHeight = `${Math.max(160, Math.min(440, host.height - top - 8))}px`;
+  }
+
+  private paintFilterList(): void {
+    const col = this.fcol;
+    if (col === null) return;
+    const f = this.app.state.grid.filters.get(col);
+    const ex = f?.exclude ?? new Set<string>();
+    const shown = this.shownValues();
+    const list = this.fel.querySelector('.gf-list') as HTMLElement;
+    const html: string[] = [];
+    let total = 0;
+    let ticked = 0;
+    for (const x of shown) {
+      total += x.n;
+      if (!ex.has(x.key)) ticked++;
+    }
+    shown.slice(0, FILTER_LIST).forEach((x) => {
+      html.push(
+        `<label class="gf-item" title="${esc(valueLabel(x.v).slice(0, 1000))}"><input type="checkbox" data-fi="${x.i}"${ex.has(x.key) ? '' : ' checked'}><span class="gf-v ${valueClass(x.v)}">${esc(valueLabel(x.v).slice(0, 200))}</span><span class="gf-n">${x.n.toLocaleString()}</span></label>`,
+      );
+    });
+    if (!shown.length) html.push(`<div class="gf-more">${t('No value contains this text.')}</div>`);
+    else if (shown.length > FILTER_LIST) html.push(`<div class="gf-more">${t('… {0} more values · type to narrow the list', (shown.length - FILTER_LIST).toLocaleString())}</div>`);
+    list.innerHTML = html.join('');
+    const all = this.fel.querySelector('[data-fall]') as HTMLInputElement;
+    all.checked = shown.length > 0 && ticked === shown.length;
+    all.indeterminate = ticked > 0 && ticked < shown.length;
+    all.disabled = !shown.length;
+    (this.fel.querySelector('.gf-all .gf-n') as HTMLElement).textContent = total.toLocaleString();
+    this.paintFilterFoot();
+  }
+
+  private paintFilterFoot(): void {
+    const c = this.fel.querySelector('.gf-count') as HTMLElement | null;
+    if (c) c.textContent = t('{0} of {1} rows', this.rowIds.length.toLocaleString(), this.baseIds.length.toLocaleString());
+  }
+
+  /** Lays the rows out again after a filter change, keeping the popup as it is. */
+  private refilter(): void {
+    this.layout();
+    this.paint();
+    this.paintFilterFoot();
+    this.placeFilter();
+    this.app.paintChrome();
+    this.app.scheduleReport();
+  }
+
+  private onFilterInput(e: Event): void {
+    const input = e.target as HTMLInputElement;
+    if (input.type !== 'search' || this.fcol === null) return;
+    clearTimeout(this.ftimer);
+    this.ftimer = setTimeout(() => {
+      if (this.fcol === null) return;
+      this.filterOf(this.fcol).text = input.value.trim();
+      this.refilter();
+      this.paintFilterList();
+    }, 120);
+  }
+
+  private onFilterChange(e: Event): void {
+    const box = e.target as HTMLInputElement;
+    if (box.type !== 'checkbox' || this.fcol === null) return;
+    const f = this.filterOf(this.fcol);
+    if (box.dataset.fall !== undefined) {
+      for (const x of this.shownValues()) {
+        if (box.checked) f.exclude.delete(x.key);
+        else f.exclude.add(x.key);
+      }
+    } else {
+      const x = this.fvalues[Number(box.dataset.fi)];
+      if (!x) return;
+      if (box.checked) f.exclude.delete(x.key);
+      else f.exclude.add(x.key);
+    }
+    this.refilter();
+    this.paintFilterList();
+  }
+
+  private onFilterClick(e: MouseEvent): void {
+    const b = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
+    if (!b || this.fcol === null) return;
+    if (b.dataset.fsort) {
+      this.app.state.grid.sort = { col: this.fcol, dir: Number(b.dataset.fsort) as 1 | -1 };
+      this.closeFilter(true);
+      this.render();
+      this.app.scheduleReport();
+    } else if (b.classList.contains('gf-clear')) {
+      this.app.state.grid.filters.delete(this.fcol);
+      this.closeFilter(true);
+      this.refilter();
+    }
+  }
+}
+
+/** Key that groups equal cells in a column filter. Strings and numbers never share a key. */
+function valueKey(v: JVal | undefined): string {
+  if (v === undefined) return MISSING;
+  if (v === null) return 'z';
+  if (typeof v === 'boolean') return v ? 'b1' : 'b0';
+  if (typeof v === 'number' || v instanceof RawNum) return 'n' + plainText(v);
+  if (typeof v === 'string') return 's' + v;
+  return 'j' + compact(v);
+}
+
+/** Text a column filter searches: the shown text, or compact JSON for objects and arrays. */
+function cellText(v: JVal | undefined): string {
+  if (v === undefined) return '';
+  return isContainer(v) ? compact(v) : plainText(v);
+}
+
+function valueLabel(v: JVal | undefined): string {
+  if (v === undefined) return t('(missing)');
+  if (v === '') return t('(empty string)');
+  return cellText(v);
+}
+
+function valueClass(v: JVal | undefined): string {
+  if (v === undefined || v === '') return 'dim';
+  return isContainer(v) ? 'tp' : primClass(v);
+}
+
+function compact(v: JVal): string {
+  if (v instanceof RawNum) return v.src;
+  if (Array.isArray(v)) return `[${v.map(compact).join(',')}]`;
+  if (v !== null && typeof v === 'object') return `{${Object.keys(v).map((k) => `${JSON.stringify(k)}:${compact(v[k])}`).join(',')}}`;
+  return JSON.stringify(v);
 }
 
 function chip(v: JVal, key: string, open: boolean): string {

@@ -60,7 +60,8 @@ export interface RenderReport {
   selected: number[];
   stats: { lines: number; valid: number; errors: number; blank: number; parsed: number; jsonc: boolean };
   formatted?: { totalRows: number; expandedRecords: number; renderedRows: number; firstRecord: number };
-  grid?: { rows: number; columns: string[]; openCells: number };
+  /** `unfiltered`: rows before the column filters. `filters`: the active column filters (text, unticked value count). */
+  grid?: { rows: number; columns: string[]; openCells: number; unfiltered: number; filters: Record<string, { text: string; exclude: number }> };
   graph?: { nodes: number; edges: number; truncated: boolean; selectedPath?: string };
   matches: number;
   filterOnly: boolean;

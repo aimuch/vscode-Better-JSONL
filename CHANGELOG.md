@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Grid: filter by column. The funnel button in each header opens a list of the column's values with counts (tick or untick them), a search box (cells that contain the text), sort buttons and Clear filter. Filters on several columns combine; the status bar shows how many rows are left.
+
 ## 0.2.0
 
 - Word wrap in the Formatted and Grid views: `Alt+Z` (`Option+Z`), a toolbar button, and the setting `betterJsonl.wordWrap` (follows `editor.wordWrap` by default). Wrapped pretty lines keep their indent.

@@ -30,6 +30,7 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Nested objects and arrays open as sub-grids under the row, starting under the column you opened. Arrays of objects show as tables.
 - Word wrap (`Alt+Z`) wraps long cell values.
 - Sort by any column. Drag a header edge to resize.
+- Filter by any column: the funnel button in a header lists the column's values with counts. Untick values, or type to keep only cells that contain the text. Filters on several columns combine, and each value list follows the other filters.
 
 ![Grid view](docs/screenshots/grid.png)
 
