@@ -126,6 +126,8 @@ export type HostMessage =
   | { type: 'toggleWrap' }
   /** `line` and `text`: a large file, where the view shows the written line itself. */
   | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string }
+  /** jq module files, by "jq:path" or "json:path": their text, or null when there is none. */
+  | { type: 'modules'; files: Record<string, string | null> }
   | { type: 'exportReady'; id: number; ok: boolean }
   | { type: 'exportDone'; id: number; ok: boolean; message: string }
   | { type: 'notice'; message: string; action?: 'reload' | 'append' };
@@ -136,6 +138,8 @@ export type WebviewMessage =
   | { type: 'docMode'; isJsonl: boolean }
   /** The changes did not fit: send the whole text again. */
   | { type: 'resync' }
+  /** jq import / include: read these module files (paths relative to the document's folder). */
+  | { type: 'readModules'; keys: string[] }
   /** Read the large file from disk again. */
   | { type: 'reload' }
   | { type: 'select'; line: number }

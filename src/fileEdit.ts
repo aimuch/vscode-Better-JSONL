@@ -75,8 +75,9 @@ function nextLineEnd(buf: Buffer, from: number, l: Layout): number {
   return -1;
 }
 
-async function write(stream: NodeJS.WritableStream, data: Uint8Array): Promise<void> {
+async function write(stream: NodeJS.WritableStream, data: Uint8Array, seen?: (d: Uint8Array) => void): Promise<void> {
   if (!data.length) return;
+  seen?.(data);
   if (!stream.write(data)) await new Promise<void>((resolve) => stream.once('drain', resolve));
 }
 
@@ -87,7 +88,23 @@ async function write(stream: NodeJS.WritableStream, data: Uint8Array): Promise<v
  * (compressed again for a .gz file), which then takes its place: a failure leaves the file
  * as it was.
  */
-export async function replaceLine(fsPath: string, line: number, original: string, text: string, opts: { gzip: boolean; encoding: string }): Promise<FileState> {
+/** What replaceLine wrote (before compression): its size, its last bytes, and how its text is encoded. */
+export interface Written {
+  total: number;
+  tail: Buffer;
+  label: string;
+  lf: Buffer;
+}
+
+const WRITTEN_TAIL = 16 * 1024;
+
+export async function replaceLine(
+  fsPath: string,
+  line: number,
+  original: string,
+  text: string,
+  opts: { gzip: boolean; encoding: string },
+): Promise<FileState & { written: Written }> {
   const mode = (await fs.promises.stat(fsPath)).mode & 0o777;
   const tmp = path.join(path.dirname(fsPath), `.${path.basename(fsPath)}.${randomBytes(4).toString('hex')}.tmp`);
   const raw = fs.createReadStream(fsPath, { highWaterMark: 1024 * 1024 });
@@ -102,8 +119,16 @@ export async function replaceLine(fsPath: string, line: number, original: string
   });
   // Awaited below; a failure before that is handled in catch.
   closed.catch(() => undefined);
+  let total = 0;
+  let tail: Buffer = Buffer.alloc(0);
+  // The end of what is written, for the caller (a compressed file followed by the view).
+  const seen = (d: Uint8Array) => {
+    total += d.length;
+    const b = Buffer.from(d.buffer, d.byteOffset, d.byteLength);
+    tail = b.length >= WRITTEN_TAIL ? Buffer.from(b.subarray(b.length - WRITTEN_TAIL)) : Buffer.concat([tail, b]).subarray(-WRITTEN_TAIL);
+  };
+  let l: Layout | undefined;
   try {
-    let l: Layout | undefined;
     let index = 0;
     let target: Buffer[] | null = line === 0 ? [] : null;
     let done = false;
@@ -119,13 +144,13 @@ export async function replaceLine(fsPath: string, line: number, original: string
       const cr = old.length >= lay.unit && old.subarray(old.length - lay.unit).equals(lay.cr);
       if (cr) old = old.subarray(0, old.length - lay.unit);
       if (new TextDecoder(lay.label).decode(old) !== original) throw new LineConflict(`line ${line + 1} changed on disk`);
-      await write(sink, Buffer.concat([bom, encodeText(text, lay.label), cr ? lay.cr : Buffer.alloc(0), hasLf ? lay.lf : Buffer.alloc(0)]));
+      await write(sink, Buffer.concat([bom, encodeText(text, lay.label), cr ? lay.cr : Buffer.alloc(0), hasLf ? lay.lf : Buffer.alloc(0)]), seen);
       target = null;
       done = true;
     };
     for await (const piece of source as AsyncIterable<Buffer>) {
       if (done) {
-        await write(sink, piece);
+        await write(sink, piece, seen);
         continue;
       }
       let buf = carry.length ? Buffer.concat([carry, piece]) : piece;
@@ -145,19 +170,19 @@ export async function replaceLine(fsPath: string, line: number, original: string
         const end = nextLineEnd(buf, at, l);
         const stop = end < 0 ? buf.length : end;
         if (target) target.push(Buffer.from(buf.subarray(at, stop)));
-        else await write(sink, buf.subarray(at, stop));
+        else await write(sink, buf.subarray(at, stop), seen);
         if (end < 0) break;
         if (target) await finish(true);
-        else await write(sink, l.lf);
+        else await write(sink, l.lf, seen);
         at = end + l.unit;
         index++;
         if (index === line) target = [];
       }
-      if (done && at < buf.length) await write(sink, buf.subarray(at));
+      if (done && at < buf.length) await write(sink, buf.subarray(at), seen);
     }
     if (!done && carry.length) {
       if (target) target.push(carry);
-      else await write(sink, carry);
+      else await write(sink, carry, seen);
     }
     if (!l) l = layoutOf(carry, opts.encoding);
     if (target) await finish(false);
@@ -176,5 +201,6 @@ export async function replaceLine(fsPath: string, line: number, original: string
     await fs.promises.rm(tmp, { force: true });
     throw e;
   }
-  return fileState(fsPath);
+  const lay = l ?? layoutOf(Buffer.alloc(0), opts.encoding);
+  return { ...(await fileState(fsPath)), written: { total, tail, label: lay.label, lf: lay.lf } };
 }

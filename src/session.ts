@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { isJsonlDocument, isJsonlPath, readConfig, syncSelectionEnabled } from './config';
 import { EncodeError } from './encoding';
+import type { Written } from './fileEdit';
 import { compare, encodingFor, fileState, innerName, LineConflict, readUtf8, replaceLine, type FileState } from './largeFile';
 import { locatePath, valueSpan } from './locate';
 import { t } from './shared/i18n';
@@ -40,6 +41,38 @@ interface Large {
 
 /** Bytes kept from the end of what the view has. */
 const TAIL = 4096;
+
+/**
+ * The last TAIL bytes of the view's text (UTF-8) after replaceLine wrote a file: the bytes it
+ * wrote, decoded from a line start (a character boundary in every encoding read here).
+ * Undefined when that cannot be known; the next change then reads the file again.
+ */
+function viewTail(w: Written): Buffer | undefined {
+  // UTF-8 is passed to the view as it is.
+  if (w.label === 'utf-8') return Buffer.from(w.tail.subarray(Math.max(0, w.tail.length - TAIL)));
+  const whole = w.total <= w.tail.length;
+  let from = 0;
+  if (!whole) {
+    const unit = w.lf.length;
+    from = -1;
+    for (let i = (w.total - w.tail.length) % unit === 0 ? 0 : 1; i + unit <= w.tail.length; i += unit) {
+      if (w.tail.subarray(i, i + unit).equals(w.lf)) {
+        from = i + unit;
+        break;
+      }
+    }
+    if (from < 0) return undefined;
+  }
+  let text: string;
+  try {
+    text = new TextDecoder(w.label).decode(w.tail.subarray(from));
+  } catch {
+    return undefined;
+  }
+  const utf8 = Buffer.from(text, 'utf8');
+  if (!whole && utf8.length < TAIL) return undefined;
+  return Buffer.from(utf8.subarray(Math.max(0, utf8.length - TAIL)));
+}
 
 function tailOf(prev: Buffer, data: Uint8Array): Buffer {
   const d = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
@@ -126,6 +159,8 @@ export class ViewerSession implements vscode.Disposable {
   readonly received: WebviewMessage[] = [];
   /** The document messages this session sent ("init", "update", "edit"), in order. Only kept in the E2E tests. */
   readonly sentKinds: string[] = [];
+  /** The jq module files sent last. Only kept in the E2E tests. */
+  lastModules: Record<string, string | null> | undefined;
 
   constructor(
     readonly panel: vscode.WebviewPanel,
@@ -217,7 +252,8 @@ export class ViewerSession implements vscode.Disposable {
 
   post(msg: HostMessage): void {
     if (this.disposed || !this.ready) return;
-    if (this.env.testMode && (msg.type === 'init' || msg.type === 'update' || msg.type === 'edit')) {
+    if (this.env.testMode && (msg.type === 'init' || msg.type === 'update' || msg.type === 'edit' || msg.type === 'modules')) {
+      if (msg.type === 'modules') this.lastModules = msg.files;
       this.sentKinds.push(msg.type);
       if (this.sentKinds.length > 500) this.sentKinds.splice(0, 250);
     }
@@ -652,6 +688,9 @@ export class ViewerSession implements vscode.Disposable {
         case 'diff':
           await this.env.showDiff(m.left, m.right);
           break;
+        case 'readModules':
+          this.post({ type: 'modules', files: await this.readModules(m.keys) });
+          break;
         case 'copy':
           await vscode.env.clipboard.writeText(m.text);
           vscode.window.setStatusBarMessage(t('Better JSONL: copied to clipboard'), 2000);
@@ -682,6 +721,34 @@ export class ViewerSession implements vscode.Disposable {
     } catch (e) {
       void vscode.window.showErrorMessage(`Better JSONL: ${errorMessage(e)}`);
     }
+  }
+
+  /**
+   * jq modules: "jq:path" is path.jq (or path/name.jq), "json:path" is path.json, both relative
+   * to the folder of the document (or of the workspace for an untitled one). Null when not found.
+   */
+  private async readModules(keys: string[]): Promise<Record<string, string | null>> {
+    const out: Record<string, string | null> = {};
+    const doc = this.uri;
+    const folder = doc && doc.scheme !== 'untitled' ? vscode.Uri.joinPath(doc, '..') : vscode.workspace.workspaceFolders?.[0]?.uri;
+    for (const key of keys.slice(0, 50)) {
+      const [kind, ...rest] = key.split(':');
+      const name = rest.join(':');
+      const ext = kind === 'json' ? '.json' : '.jq';
+      const base = path.isAbsolute(name) ? vscode.Uri.file(name) : folder ? vscode.Uri.joinPath(folder, name) : undefined;
+      out[key] = null;
+      if (!base) continue;
+      const candidates = name.endsWith(ext) ? [base] : [base.with({ path: base.path + ext }), vscode.Uri.joinPath(base, path.posix.basename(base.path) + ext)];
+      for (const c of candidates) {
+        try {
+          out[key] = Buffer.from(await vscode.workspace.fs.readFile(c)).toString('utf8');
+          break;
+        } catch {
+          // Not there: the next place.
+        }
+      }
+    }
+    return out;
   }
 
   /** Reads a large file from disk again. */
@@ -765,11 +832,12 @@ export class ViewerSession implements vscode.Disposable {
     if (this.readOnly) return fail(t('This file is read-only here: it is not on this computer.'));
     if (!large.state || (await compare(uri.fsPath, large.state)) !== 'same') return fail(t('The file changed on disk. Reload it, then edit again.'));
     try {
-      large.state = await replaceLine(uri.fsPath, line, original, text, { gzip: large.gzip, encoding: large.encoding });
-      large.bytes = large.state.size;
-      // The text the view has changed in the middle: a compressed file is read again when it changes next.
-      if (large.gzip) large.decodedTail = undefined;
-      else if (large.decoded !== undefined) large.decoded += Buffer.byteLength(text, 'utf8') - Buffer.byteLength(original, 'utf8');
+      const done = await replaceLine(uri.fsPath, line, original, text, { gzip: large.gzip, encoding: large.encoding });
+      large.state = { size: done.size, mtimeMs: done.mtimeMs, tail: done.tail };
+      large.bytes = done.size;
+      if (large.decoded !== undefined) large.decoded += Buffer.byteLength(text, 'utf8') - Buffer.byteLength(original, 'utf8');
+      // A compressed file is followed by the text the view has: its end comes from what was written.
+      if (large.gzip) large.decodedTail = viewTail(done.written);
     } catch (e) {
       return fail(e instanceof LineConflict ? t('Line {0} changed after the edit started. Nothing was written.', line + 1) : e instanceof EncodeError ? t('Nothing was written: {0}.', errorMessage(e)) : errorMessage(e));
     }

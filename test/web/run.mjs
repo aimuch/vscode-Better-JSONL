@@ -1307,6 +1307,36 @@ await scenario('W49', 'Expand all on a file over 50 MB asks first; Cancel keeps 
   check.eq('asked once per file', r.formatted.expandedRecords, 3);
 });
 
+await scenario('W50', 'jq modules come from the host; input and inputs run once over the whole file', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await page.fill('.search input', 'import "lib" as l; select(.ms | l::slow)');
+  await page.waitForFunction(() => window.harness.posted('readModules').length === 1);
+  check.eq('the module is asked for', (await posted(page, 'readModules'))[0], { type: 'readModules', keys: ['jq:lib'] });
+  await send(page, { type: 'modules', files: { 'jq:lib': 'def slow: . != null and . > 100;' } });
+  let r = await report(page, (x) => x.matches === 1);
+  check.eq('then the query runs', r.matches, 1);
+  await page.fill('.search input', 'include "none"; .');
+  await page.waitForFunction(() => window.harness.posted('readModules').length === 2);
+  await send(page, { type: 'modules', files: { 'jq:none': null } });
+  r = await report(page, (x) => x.notes.some((n) => n.includes('module not found')));
+  check.ok('a module that is not there says so', true);
+  await page.fill('.search input', '[inputs | .ms // 0] | add');
+  r = await report(page, (x) => x.notes.includes('Result: 1907'));
+  check.ok('an aggregate over every record shows in the status bar', r.notes.includes('Result: 1907'), r.notes);
+  // As in jq, .level on a record that is an array is an error: `?` skips it.
+  await page.fill('.search input', 'inputs | select(.level? == "warn")');
+  r = await report(page, (x) => x.matches === 3);
+  check.eq('records from inputs are matches', r.matches, 3);
+  await shot('inputs: the records that match');
+  await page.fill('.search input', '.user.name as $n | "\\($n)!" == "Ada!"');
+  r = await report(page, (x) => x.matches === 4 && !x.notes.length);
+  check.eq('string interpolation in a filter', r.matches, 4);
+  await page.fill('.search input', '.tags as [$a] ?// $a | $a == "db"');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('?// destructuring', r.matches, 1);
+});
+
 await scenario('W36', 'The background scan and search do not wait for timers (a window in the background slows timers down)', [], async ({ page, check }) => {
   await openBlank(page);
   // Every timer takes at least 3 seconds, as in a window the system put to sleep.

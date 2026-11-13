@@ -654,6 +654,11 @@ describe('Better JSONL · extension host', () => {
       await s.handle({ type: 'editLine', line: 1, original: '{"n":2}', text: '{"n":20}', exact: true });
       await waitFor(() => zlib.gunzipSync(fs.readFileSync(utf8.fsPath)).toString('utf8').includes('{"n":20}'), 'the compressed file written');
       assert.strictEqual(zlib.gunzipSync(fs.readFileSync(utf8.fsPath)).toString('utf8'), '{"n":"名字"}\n{"n":20}\n{"n":3}\n{"n":4}\n');
+      // After an edit, new lines at the end still come in without reading the file again.
+      await settle(500);
+      fs.appendFileSync(utf8.fsPath, zlib.gzipSync(Buffer.from('{"n":5}\n')));
+      r = await s.waitForReport((x) => x.stats.lines === 5 && parsed(x), 20000);
+      assert.deepStrictEqual([r.stats.valid, s.sentKinds.filter((k) => k === 'init').length], [5, inits]);
       // The file written again from the start: read again.
       fs.writeFileSync(utf8.fsPath, zlib.gzipSync(Buffer.from('{"other":1}\n')));
       r = await s.waitForReport((x) => x.stats.lines === 1 && !x.loading && parsed(x), 20000);
@@ -708,6 +713,25 @@ describe('Better JSONL · extension host', () => {
       }, 'a diff editor');
       assert.strictEqual(tab.original.scheme, 'better-jsonl-diff');
       assert.strictEqual((await vscode.workspace.openTextDocument(tab.modified)).getText(), '{\n  "a": 2\n}\n');
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H32 jq modules are read next to the document', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'lib', 'util'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'lib', 'util', 'util.jq'), 'def double: . * 2;');
+      fs.writeFileSync(path.join(dir, 'common.jq'), 'def one: 1;');
+      fs.writeFileSync(path.join(dir, 'conf.json'), '{"limit": 10}');
+      fs.writeFileSync(path.join(dir, 'd.jsonl'), '{"a":1}\n');
+      const file = vscode.Uri.file(path.join(dir, 'd.jsonl'));
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
+      const s = await waitFor(() => (api.preview()?.resource?.fsPath === file.fsPath ? api.preview() : undefined), 'preview');
+      await s.waitForReport((r) => parsed(r) && r.stats.lines === 1);
+      await s.handle({ type: 'readModules', keys: ['jq:lib/util', 'jq:common', 'json:conf', 'jq:nope'] });
+      assert.deepStrictEqual(s.lastModules, { 'jq:lib/util': 'def double: . * 2;', 'jq:common': 'def one: 1;', 'json:conf': '{"limit": 10}', 'jq:nope': null });
     } finally {
       removeDir(dir);
     }

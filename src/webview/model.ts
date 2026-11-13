@@ -719,6 +719,8 @@ export interface Query {
   program?: Program;
   /** The text looks like a query but is not a valid one: it is searched as text, and this says why. */
   error?: string;
+  /** jq modules to read before the query can run ("jq:path" / "json:path"). */
+  needs?: string[];
 }
 
 /** Plain text search: no path query, no JSONPath or jq. */
@@ -728,7 +730,7 @@ export function isTextQuery(q: Query): boolean {
 
 const PATH_QUERY = /^\s*(\$?[A-Za-z_$\[][^\s:=!<>]*)\s*(!=|=|:|>|<)\s*(.*)$/;
 
-export function parseQuery(raw: string, model: DocModel): Query {
+export function parseQuery(raw: string, model: DocModel, modules?: Map<string, string | null>): Query {
   const q: Query = { raw, text: raw.trim().toLowerCase() };
   const m = PATH_QUERY.exec(raw);
   if (m) {
@@ -741,9 +743,10 @@ export function parseQuery(raw: string, model: DocModel): Query {
     }
   }
   if (!q.path && q.text) {
-    const c = compileQuery(raw);
+    const c = compileQuery(raw, modules);
     q.program = c.program;
     q.error = c.error;
+    q.needs = c.needs;
   }
   return q;
 }

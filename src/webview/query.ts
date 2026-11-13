@@ -1,6 +1,7 @@
 // Queries in the search box: JSONPath (RFC 9535) and a subset of jq.
 // Both read parsed values. Results keep their place in the document when they have one,
 // so the Formatted view can go to them.
+import { splitJsonValues } from '../shared/jsonText';
 import { isContainer, parseJson, RawNum, type JObj, type JVal } from './json';
 
 /** The place of a value: a chain from the value up to the root (null). */
@@ -14,6 +15,10 @@ export interface Out {
 
 export interface Program {
   readonly kind: 'jq' | 'jsonpath';
+  /** jq that reads `input` / `inputs`: it runs once (with null as input) over the whole file, as `jq -n`. */
+  readonly usesInputs?: boolean;
+  /** Runs with `inputs` as the stream that input / inputs read. */
+  runWith?(root: JVal, inputs: Iterable<Out>): { outs: Out[]; capped: boolean };
   /** JSON Lines: true when the record matches. Errors count as "no match". */
   matches(record: JVal): boolean;
   /** One document: every result. Throws a QueryError for an error at run time. */
@@ -491,7 +496,9 @@ export function compileJsonPath(src: string): Program {
 
 // ---------- jq ----------
 
-type Tok = { t: 'num' | 'str' | 'id' | 'field' | 'op' | 'var' | 'eof'; v: string | number; pos: number };
+/** A part of a string with `\(…)`: literal text, or the source of an expression. */
+type StrPart = string | { src: string; pos: number };
+type Tok = { t: 'num' | 'str' | 'istr' | 'fmt' | 'id' | 'field' | 'op' | 'var' | 'eof'; v: string | number; pos: number; parts?: StrPart[] };
 
 /** Variables and functions a filter can see (lexical scope: a linked list from the innermost). */
 interface Env {
@@ -507,7 +514,26 @@ type F = (inp: Out, env: Env) => Out[];
 const EMPTY_ENV: Env = { vars: { name: 'ENV', v: {}, up: null }, funcs: null };
 
 const KEYWORDS = new Set(['and', 'or', 'if', 'then', 'elif', 'else', 'end', 'as', 'reduce', 'foreach', 'def', 'try', 'catch', 'label', 'break']);
-const UNSUPPORTED = new Set(['import', 'include']);
+const UNSUPPORTED = new Set<string>();
+
+/** What a parser and its sub-parsers share. */
+interface ParseContext {
+  /** Module files read for import / include, by "jq:path" or "json:path" (null: not found). */
+  modules: Map<string, string | null>;
+  /** Modules the query needs that are not read yet. */
+  needs: Set<string>;
+  usesInputs: boolean;
+}
+
+/** The query imports modules that are not read yet: the caller reads them and compiles again. */
+export class NeedModules extends Error {
+  constructor(readonly keys: string[]) {
+    super('modules');
+  }
+}
+
+/** The stream `input` and `inputs` read, while a query runs. */
+let currentInputs: Iterator<Out> | null = null;
 const ASSIGN = ['=', '|=', '+=', '-=', '*=', '/=', '%=', '//='];
 
 /** error(value): `try … catch` gets the value. */
@@ -545,22 +571,34 @@ function lex(s: string): Tok[] {
     }
     const pos = i;
     if (c === '"') {
+      // A string; `\(expr)` in it is an interpolation (its source is parsed later, in scope).
+      const parts: StrPart[] = [];
+      let lit = '"';
       let j = i + 1;
+      const literal = () => {
+        try {
+          return JSON.parse(lit + '"') as string;
+        } catch {
+          return fail('the string is not valid');
+        }
+      };
       while (j < s.length && s[j] !== '"') {
-        if (s[j] === '\\') {
-          if (s[j + 1] === '(') {
-            i = j;
-            fail('string interpolation is not supported');
-          }
+        if (s[j] === '\\' && s[j + 1] === '(') {
+          parts.push(literal());
+          lit = '"';
+          const end = closeParen(s, j + 2);
+          if (end < 0) fail('the interpolation \\( has no end');
+          parts.push({ src: s.slice(j + 2, end), pos: j + 2 });
+          j = end + 1;
+        } else if (s[j] === '\\') {
+          lit += s.slice(j, j + 2);
           j += 2;
-        } else j++;
+        } else lit += s[j++];
       }
       if (j >= s.length) fail('the string has no end');
-      try {
-        out.push({ t: 'str', v: JSON.parse(s.slice(i, j + 1)) as string, pos });
-      } catch {
-        fail('the string is not valid');
-      }
+      parts.push(literal());
+      if (parts.length === 1) out.push({ t: 'str', v: parts[0] as string, pos });
+      else out.push({ t: 'istr', v: '', parts, pos });
       i = j + 1;
       continue;
     }
@@ -586,24 +624,30 @@ function lex(s: string): Tok[] {
       i += n[0].length;
       continue;
     }
-    const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i));
+    // Names may be module-qualified: mod::name.
+    const id = /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*/.exec(s.slice(i));
     if (id) {
       out.push({ t: 'id', v: id[0], pos });
       i += id[0].length;
       continue;
     }
     if (c === '$') {
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(s.slice(i));
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)/.exec(s.slice(i));
       if (!m) return fail('a variable name is expected');
       if (m[1] === '__loc__') return fail('$__loc__ is not supported');
       out.push({ t: 'var', v: m[1], pos });
       i += m[0].length;
       continue;
     }
-    if (c === '@') fail('format strings (@base64, @csv, …) are not supported');
+    if (c === '@') {
+      const m = /^@([A-Za-z0-9_]+)/.exec(s.slice(i));
+      if (!m) return fail('a format name is expected after @');
+      out.push({ t: 'fmt', v: m[1], pos });
+      i += m[0].length;
+      continue;
+    }
     const three = s.slice(i, i + 3);
-    if (three === '?//') fail('?// is not supported');
-    if (three === '//=') {
+    if (three === '//=' || three === '?//') {
       out.push({ t: 'op', v: three, pos });
       i += 3;
       continue;
@@ -623,6 +667,122 @@ function lex(s: string): Tok[] {
   }
   out.push({ t: 'eof', v: '', pos: s.length });
   return out;
+}
+
+/** The index of the ')' that closes a '(' opened just before `from` (strings in between are skipped), or -1. */
+function closeParen(s: string, from: number): number {
+  let depth = 1;
+  for (let k = from; k < s.length; k++) {
+    const c = s[k];
+    if (c === '"') {
+      const e = skipString(s, k);
+      if (e < 0) return -1;
+      k = e - 1;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return k;
+  }
+  return -1;
+}
+
+/** The index after the string that starts at `from` (it may hold interpolations), or -1. */
+function skipString(s: string, from: number): number {
+  for (let k = from + 1; k < s.length; k++) {
+    if (s[k] === '\\') {
+      if (s[k + 1] === '(') {
+        const e = closeParen(s, k + 2);
+        if (e < 0) return -1;
+        k = e;
+      } else k++;
+    } else if (s[k] === '"') return k + 1;
+  }
+  return -1;
+}
+
+// ---------- formats: @text, @json, @csv, @tsv, @html, @uri, @sh, @base64, @base64d, @base32, @base32d ----------
+
+const FORMATS = new Set(['text', 'json', 'csv', 'tsv', 'html', 'uri', 'sh', 'base64', 'base64d', 'base32', 'base32d']);
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function bytesToBinary(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return out;
+}
+
+export function formatValue(name: string, v: JVal): string {
+  const text = typeof v === 'string' ? v : compactJson(v);
+  const scalar = (x: JVal, what: string): string => {
+    if (x === null) return '';
+    if (typeof x === 'string') return x;
+    if (isContainer(x)) return jqFail(`${typeName(x)} is not valid in a ${what} row`);
+    return compactJson(x);
+  };
+  switch (name) {
+    case 'text':
+      return text;
+    case 'json':
+      return compactJson(v);
+    case 'html':
+      return text.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&#39;', '"': '&quot;' })[c] as string);
+    case 'uri':
+      return Array.from(new TextEncoder().encode(text))
+        .map((b) => (/[A-Za-z0-9\-_.~]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`))
+        .join('');
+    case 'csv':
+      if (!Array.isArray(v)) return jqFail(`${typeName(v)} cannot be csv-formatted, only an array can be`);
+      return v.map((x) => (typeof x === 'string' ? `"${x.replace(/"/g, '""')}"` : scalar(x, 'csv'))).join(',');
+    case 'tsv':
+      if (!Array.isArray(v)) return jqFail(`${typeName(v)} cannot be tsv-formatted, only an array can be`);
+      return v.map((x) => scalar(x, 'tsv').replace(/[\\\t\n\r]/g, (c) => ({ '\\': '\\\\', '\t': '\\t', '\n': '\\n', '\r': '\\r' })[c] as string)).join('\t');
+    case 'sh': {
+      const one = (x: JVal) => (typeof x === 'string' ? `'${x.replace(/'/g, "'\\''")}'` : isContainer(x) ? jqFail(`${typeName(x)} cannot be escaped for shell`) : compactJson(x));
+      return Array.isArray(v) ? v.map(one).join(' ') : one(v);
+    }
+    case 'base64':
+      return btoa(bytesToBinary(new TextEncoder().encode(text)));
+    case 'base64d': {
+      let bin: string;
+      try {
+        bin = atob(text.replace(/=+$/, ''));
+      } catch {
+        return jqFail(`${compactJson(v)} is not valid base64 data`);
+      }
+      return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+    }
+    case 'base32': {
+      const bytes = new TextEncoder().encode(text);
+      let out = '';
+      let bits = 0;
+      let acc = 0;
+      for (const b of bytes) {
+        acc = (acc << 8) | b;
+        bits += 8;
+        while (bits >= 5) {
+          out += B32[(acc >>> (bits - 5)) & 31];
+          bits -= 5;
+        }
+      }
+      if (bits) out += B32[(acc << (5 - bits)) & 31];
+      return out + '='.repeat((8 - (out.length % 8)) % 8);
+    }
+    case 'base32d': {
+      const bytes: number[] = [];
+      let bits = 0;
+      let acc = 0;
+      for (const c of text.replace(/=+$/, '')) {
+        const k = B32.indexOf(c.toUpperCase());
+        if (k < 0) return jqFail(`${compactJson(v)} is not valid base32 data`);
+        acc = ((acc << 5) | k) & 0xffff;
+        bits += 5;
+        if (bits >= 8) {
+          bytes.push((acc >>> (bits - 8)) & 255);
+          bits -= 8;
+        }
+      }
+      return new TextDecoder().decode(Uint8Array.from(bytes));
+    }
+  }
+  return jqFail(`${name} is not a valid format`);
 }
 
 const jqFail = (msg: string): never => {
@@ -829,8 +989,10 @@ type Pattern = (v: JVal, vars: VarScope) => VarScope;
 class JqParser {
   i = 0;
   /** Names the query defines, innermost last: functions ("name/arity") and variables. */
-  private funcs: string[] = [];
-  private vars: string[] = ['ENV'];
+  funcs: string[] = [];
+  vars: string[] = ['ENV'];
+  /** Modules (import / include) and whether the query reads input / inputs. Shared with sub-parsers. */
+  ctx: ParseContext = { modules: new Map(), needs: new Set(), usesInputs: false };
 
   constructor(private readonly toks: Tok[]) {}
 
@@ -914,6 +1076,117 @@ class JqParser {
 
   /** def name: body;  def name(f; $x): body;  — then the rest of the pipe sees it. */
   private def(): F {
+    const { key, params, body } = this.defItem();
+    const rest = this.scoped([], [key], () => this.pipe());
+    return (inp, env) => {
+      const scope: { key: string; fn: FuncDef; up: FuncScope } = { key, fn: { closure: () => [], env }, up: env.funcs };
+      const inner: Env = { vars: env.vars, funcs: scope };
+      scope.fn = { params, body, env: inner };
+      return rest(inp, inner);
+    };
+  }
+
+  /** The definitions of a module: `def …;` to the end. Each one sees the ones before it and itself. */
+  defList(): { keys: string[]; install: (env: Env) => Env } {
+    const items: { key: string; params: string[]; body: F }[] = [];
+    while (this.is('id', 'def')) {
+      const d = this.defItem();
+      items.push(d);
+      this.funcs.push(d.key);
+    }
+    if (!this.is('eof')) this.fail('a module holds only definitions (def …;)');
+    return {
+      keys: items.map((d) => d.key),
+      install: (env) =>
+        items.reduce((e, d) => {
+          const scope: { key: string; fn: FuncDef; up: FuncScope } = { key: d.key, fn: { closure: () => [], env: e }, up: e.funcs };
+          const inner: Env = { vars: e.vars, funcs: scope };
+          scope.fn = { params: d.params, body: d.body, env: inner };
+          return inner;
+        }, env),
+    };
+  }
+
+  /**
+   * import "path" as name;  import "path" as $data;  include "path";  (and module {…};)
+   * Module files come from the context; missing ones are noted in ctx.needs.
+   */
+  directives(): ((env: Env) => Env)[] {
+    const installs: ((env: Env) => Env)[] = [];
+    for (;;) {
+      if (this.is('id', 'module')) {
+        this.i++;
+        this.object();
+        this.expect(';');
+        continue;
+      }
+      const kind = this.is('id', 'import') ? 'import' : this.is('id', 'include') ? 'include' : null;
+      if (!kind) return installs;
+      this.i++;
+      if (!this.is('str')) this.fail('a module path ("…") is expected');
+      const path = this.peek().v as string;
+      this.i++;
+      let alias: string | null = null;
+      let data = false;
+      if (kind === 'import') {
+        this.keyword('as');
+        if (this.is('var')) data = true;
+        else if (!this.is('id')) this.fail('a module name is expected');
+        alias = this.peek().v as string;
+        this.i++;
+      }
+      if (this.op('{')) this.object();
+      this.expect(';');
+      const key = `${data ? 'json' : 'jq'}:${path}`;
+      if (!this.ctx.modules.has(key)) {
+        this.ctx.needs.add(key);
+        continue;
+      }
+      const text = this.ctx.modules.get(key);
+      if (text === null || text === undefined) this.fail(`module not found: ${path}`);
+      if (data) {
+        // Data: every JSON value in the file, as an array (as jq does).
+        let value: JVal;
+        try {
+          value = splitJsonValues(text).map((sp) => parseJson(text.slice(sp.start, sp.end)));
+        } catch (e) {
+          this.fail(`${path} is not valid JSON: ${(e as Error).message}`);
+        }
+        const name = alias as string;
+        this.vars.push(name, `${name}::${name}`);
+        installs.push((env) => ({ vars: { name: `${name}::${name}`, v: value, up: { name, v: value, up: env.vars } }, funcs: env.funcs }));
+        continue;
+      }
+      const sub = new JqParser(lex(text));
+      sub.ctx = this.ctx;
+      let defs: { keys: string[]; install: (env: Env) => Env };
+      let subInstalls: ((env: Env) => Env)[];
+      try {
+        subInstalls = sub.directives();
+        if (this.ctx.needs.size) continue;
+        defs = sub.defList();
+      } catch (e) {
+        if (e instanceof QueryError) this.fail(`in module ${path}: ${e.message}`);
+        throw e;
+      }
+      const load = (env: Env) => defs.install(subInstalls.reduce((e, f) => f(e), env));
+      if (kind === 'include') {
+        this.funcs.push(...defs.keys);
+        installs.push(load);
+      } else {
+        const prefix = alias as string;
+        this.funcs.push(...defs.keys.map((k) => `${prefix}::${k}`));
+        installs.push((env) => {
+          const inner = load(env);
+          let funcs = env.funcs;
+          for (const k of defs.keys) funcs = { key: `${prefix}::${k}`, fn: lookupFunc(inner, k), up: funcs };
+          return { vars: env.vars, funcs };
+        });
+      }
+    }
+  }
+
+  private defItem(): { key: string; params: string[]; body: F } {
     this.i++;
     if (!this.is('id')) this.fail('a function name is expected');
     const name = this.peek().v as string;
@@ -937,13 +1210,7 @@ class JqParser {
     const paramVars = params.filter((p) => p.startsWith('$')).map((p) => p.slice(1));
     const body = this.scoped(paramVars, [key, ...paramFuncs], () => this.pipe());
     this.expect(';');
-    const rest = this.scoped([], [key], () => this.pipe());
-    return (inp, env) => {
-      const scope: { key: string; fn: FuncDef; up: FuncScope } = { key, fn: { closure: () => [], env }, up: env.funcs };
-      const inner: Env = { vars: env.vars, funcs: scope };
-      scope.fn = { params, body, env: inner };
-      return rest(inp, inner);
-    };
+    return { key, params, body };
   }
 
   private comma(): F {
@@ -1107,13 +1374,36 @@ class JqParser {
       } else if (allowAs && this.is('id', 'as')) {
         this.i++;
         const names: string[] = [];
-        const pattern = this.pattern(names);
+        const patterns = this.patterns(names);
         this.expect('|');
         const body = this.scoped(names, [], () => this.pipe());
         const source = f;
-        return (inp, env) => source(inp, env).flatMap((o) => body(inp, { vars: pattern(o.v, env.vars), funcs: env.funcs }));
+        if (patterns.length === 1) return (inp, env) => source(inp, env).flatMap((o) => body(inp, { vars: patterns[0](o.v, env.vars), funcs: env.funcs }));
+        // `?//`: every variable of every pattern exists (null when its pattern did not set it). An error
+        // in a pattern or in the body moves on to the next pattern; the last one's error stays.
+        const unset = (vars: VarScope) => names.reduce<VarScope>((acc, name) => ({ name, v: null, up: acc }), vars);
+        return (inp, env) =>
+          source(inp, env).flatMap((o) => {
+            for (let k = 0; ; k++) {
+              try {
+                return body(inp, { vars: patterns[k](o.v, unset(env.vars)), funcs: env.funcs });
+              } catch (e) {
+                if (k === patterns.length - 1 || e instanceof LimitError || e instanceof BreakSignal || !(e instanceof QueryError)) throw e;
+              }
+            }
+          });
       } else return f;
     }
+  }
+
+  /** One pattern, or several joined by `?//` (destructuring alternatives). */
+  private patterns(names: string[]): Pattern[] {
+    const out = [this.pattern(names)];
+    while (this.op('?//')) {
+      this.i++;
+      out.push(this.pattern(names));
+    }
+    return out;
   }
 
   /** $x, [$a, $b], {a: $x, $b, "c": [$d]} */
@@ -1213,6 +1503,27 @@ class JqParser {
       this.i++;
       return () => [val(k.v)];
     }
+    if (k.t === 'istr') {
+      this.i++;
+      return this.interpolate(k.parts as StrPart[], 'text');
+    }
+    if (k.t === 'fmt') {
+      this.i++;
+      const name = k.v as string;
+      if (!FORMATS.has(name)) this.fail(`@${name} is not a valid format`);
+      // @fmt "…\(x)…": the format is applied to each interpolated value.
+      if (this.is('str')) {
+        const text = this.peek().v as string;
+        this.i++;
+        return () => [val(text)];
+      }
+      if (this.is('istr')) {
+        const parts = this.peek().parts as StrPart[];
+        this.i++;
+        return this.interpolate(parts, name);
+      }
+      return (inp) => [val(formatValue(name, inp.v))];
+    }
     if (k.t === 'field') {
       this.i++;
       return field(k.v as string);
@@ -1277,6 +1588,8 @@ class JqParser {
         };
       }
       if (UNSUPPORTED.has(name)) this.fail(`${name} is not supported`);
+      if (name === 'import' || name === 'include' || name === 'module') this.fail(`${name} must come first in the query`);
+      if (name === 'input' || name === 'inputs') this.ctx.usesInputs = true;
       if (KEYWORDS.has(name)) this.fail(`unexpected '${name}'`);
       this.i++;
       const args: F[] = [];
@@ -1297,13 +1610,59 @@ class JqParser {
     this.fail(k.t === 'eof' ? 'the query ends too soon' : `unexpected '${k.v}'`);
   }
 
+  /** "a \(x) b": every combination of the outputs of the expressions (the first varies fastest). */
+  private interpolate(parts: StrPart[], format: string): F {
+    const pieces = parts.map((p) => (typeof p === 'string' ? p : this.sub(p.src, p.pos)));
+    return (inp, env) => {
+      let acc = [''];
+      for (const piece of pieces) {
+        if (typeof piece === 'string') acc = acc.map((a) => a + piece);
+        else {
+          const outs = piece(inp, env);
+          acc = outs.flatMap((o) => acc.map((a) => a + formatValue(format, o.v)));
+        }
+      }
+      return acc.map((x) => val(x));
+    };
+  }
+
+  /** Parses the source of an interpolation with the names in scope here. */
+  private sub(src: string, pos: number): F {
+    const p = new JqParser(lex(src));
+    p.vars = [...this.vars];
+    p.funcs = [...this.funcs];
+    p.ctx = this.ctx;
+    let f: F;
+    try {
+      f = p.pipe();
+      if (!p.is('eof')) p.fail(`unexpected '${p.peek().v}'`);
+    } catch (e) {
+      throw new QueryError(`${(e as Error).message.replace(/\(column (\d+)\)$/, (_m, c: string) => `(column ${pos + Number(c)})`)}`);
+    }
+    return f;
+  }
+
   /** reduce SOURCE as $x (INIT; UPDATE)  ·  foreach SOURCE as $x (INIT; UPDATE; EXTRACT) */
   private fold(kind: 'reduce' | 'foreach'): F {
     this.i++;
     const source = this.postfix(false);
     this.keyword('as');
     const names: string[] = [];
-    const pattern = this.pattern(names);
+    const alts = this.patterns(names);
+    // `?//` here: the first pattern that matches without an error.
+    const pattern: Pattern =
+      alts.length === 1
+        ? alts[0]
+        : (v, vars) => {
+            const base = names.reduce<VarScope>((acc, name) => ({ name, v: null, up: acc }), vars);
+            for (let k = 0; ; k++) {
+              try {
+                return alts[k](v, base);
+              } catch (e) {
+                if (k === alts.length - 1 || !(e instanceof QueryError)) throw e;
+              }
+            }
+          };
     this.expect('(');
     const init = this.pipe();
     this.expect(';');
@@ -1751,6 +2110,25 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
         }
         return out;
       };
+    case 'input':
+      want(0);
+      return () => {
+        const n = currentInputs?.next();
+        if (!n || n.done) return jqFail('No more inputs');
+        spend();
+        return [n.value];
+      };
+    case 'inputs':
+      want(0);
+      return () => {
+        const out: Out[] = [];
+        for (;;) {
+          const n = currentInputs?.next();
+          if (!n || n.done) return out;
+          spend();
+          out.push(n.value);
+        }
+      };
     case 'error':
       want(n === 0 ? 0 : 1);
       return (inp, env) => {
@@ -1779,46 +2157,63 @@ function regex(re: JVal, flags: JVal): RegExp {
   return r;
 }
 
-export function compileJq(src: string): Program {
+export function compileJq(src: string, modules: Map<string, string | null> = new Map()): Program {
   const p = new JqParser(lex(src));
-  const f = p.pipe();
+  p.ctx.modules = modules;
+  const installs = p.directives();
+  if (p.ctx.needs.size) throw new NeedModules([...p.ctx.needs]);
+  const body = p.pipe();
   if (!p.is('eof')) p.fail(`unexpected '${p.peek().v}'`);
+  const f: F = installs.length ? (inp, env) => body(inp, installs.reduce((e, ins) => ins(e), env)) : body;
+  const exec = (root: JVal, inputs: Iterator<Out> | null, limit: number) => {
+    budget = limit;
+    currentInputs = inputs;
+    try {
+      return f({ v: root, p: null }, EMPTY_ENV);
+    } finally {
+      currentInputs = null;
+    }
+  };
+  const capped = (run: () => Out[]) => {
+    try {
+      return { outs: run(), capped: false };
+    } catch (e) {
+      if (e instanceof LimitError) return { outs: [], capped: true };
+      throw e;
+    }
+  };
   return {
     kind: 'jq',
+    usesInputs: p.ctx.usesInputs,
     matches(record) {
-      budget = MAX_RECORD;
       try {
-        return f({ v: record, p: null }, EMPTY_ENV).some((o) => truthy(o.v));
+        return exec(record, null, MAX_RECORD).some((o) => truthy(o.v));
       } catch {
         return false;
       }
     },
-    run(root) {
-      budget = MAX_OUT;
-      try {
-        return { outs: f({ v: root, p: null }, EMPTY_ENV), capped: false };
-      } catch (e) {
-        if (e instanceof LimitError) return { outs: [], capped: true };
-        throw e;
-      }
-    },
+    run: (root) => capped(() => exec(root, null, MAX_OUT)),
+    runWith: (root, inputs) => capped(() => exec(root, inputs[Symbol.iterator](), MAX_OUT)),
   };
 }
 
 /** A search that starts with `.` (or one of these functions) is a jq filter. */
-const JQ_START = /^(?:\.|(?:select|map|has|any|all|test|to_entries|paths|recurse|keys|length|type)\s*\(|if\s)/;
+const JQ_START =
+  /^(?:\.|(?:select|map|has|any|all|test|to_entries|paths|recurse|keys|length|type)\s*\(|(?:if|def|reduce|foreach|import|include|label)\s|try\s|\[\s*inputs\b|inputs?\s*\||@(?:text|json|csv|tsv|html|uri|sh|base64d?|base32d?)\b)/;
 
 /**
  * Reads the search text as a query when it looks like one: `$…` is JSONPath, `.…` is jq.
- * Returns an error message when it looks like a query but is not a valid one.
+ * Returns an error message when it looks like a query but is not a valid one, and the module
+ * files to read first (`needs`) when a jq query imports some that `modules` does not have.
  */
-export function compileQuery(raw: string): { program?: Program; error?: string } {
+export function compileQuery(raw: string, modules?: Map<string, string | null>): { program?: Program; error?: string; needs?: string[] } {
   const s = raw.trim();
   const jsonPath = s.startsWith('$');
   if (!jsonPath && !JQ_START.test(s)) return {};
   try {
-    return { program: jsonPath ? compileJsonPath(s) : compileJq(s) };
+    return { program: jsonPath ? compileJsonPath(s) : compileJq(s, modules) };
   } catch (e) {
+    if (e instanceof NeedModules) return { needs: e.keys };
     return { error: `${jsonPath ? 'JSONPath' : 'jq'}: ${(e as Error).message}` };
   }
 }

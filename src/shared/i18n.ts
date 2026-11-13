@@ -230,6 +230,7 @@ const ZH: Record<string, string> = {
   'It switches to the JSON or JSONL editor that becomes active.': '切换到当前活动的 JSON 或 JSONL 编辑器。',
   'The query stopped: too many results': '查询已停止：结果太多',
   'Result: {0}': '结果：{0}',
+  'jq: reading modules {0}…': 'jq：正在读取模块 {0}…',
   Reload: '重新加载',
   'Better JSONL opens compressed files named .json.gz, .jsonl.gz or .ndjson.gz.': 'Better JSONL 只打开名为 .json.gz、.jsonl.gz 或 .ndjson.gz 的压缩文件。',
   'New lines were added to the file.': '文件末尾添加了新行。',

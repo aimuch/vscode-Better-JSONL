@@ -8,7 +8,7 @@ import { indexItems, ItemStore } from './items';
 import { diffValues, type Difference } from './diff';
 import { csvRow } from './exporter';
 import { childKey, esc, formatBytes, isContainer, isObj, pathToString, type JVal } from './json';
-import { compactJson, pathOf } from './query';
+import { compactJson, pathOf, type Out, type Program } from './query';
 import { ByteStore, DocModel, dropLastEmpty, KEEP_ALL_BYTES, lowerBound, matchesRecord, parseQuery, patchLines, TreeSearch, tryParse, type Query } from './model';
 import { icon } from './icons';
 import { SettingsPanel } from './settings';
@@ -157,6 +157,9 @@ export class App {
   treeIndex = -1;
   /** A JSONPath or jq query: what the status bar says about it (an error, or results that have no place). */
   private queryNotes: string[] = [];
+  /** jq module files read through the host (import / include), and the ones asked for. */
+  private readonly jqModules = new Map<string, string | null>();
+  private readonly modulesAsked = new Set<string>();
   /** Grows when `matches` or `treeMatches` change. Views use it to keep derived lists. */
   matchesVersion = 0;
   /** A sliced search over a large file is running. */
@@ -271,6 +274,10 @@ export class App {
         break;
       case 'append':
         this.onAppend(m.version, m.data);
+        break;
+      case 'modules':
+        for (const [k, v] of Object.entries(m.files)) this.jqModules.set(k, v);
+        if (this.model && this.views) this.startSearch(() => this.repaint());
         break;
       case 'exportReady':
         this.onExportReady(m.id, m.ok);
@@ -536,6 +543,41 @@ export class App {
     this.postMode();
     // Follow mode: lines were added at the end.
     if (s.follow && model.isJsonl && n > before) this.jumpToEnd();
+  }
+
+  private runOverInputs(program: Program, finish: (out: number[], tree?: { matches: string[]; capped: boolean }) => void): void {
+    const m = this.model;
+    const recordsOf = function* (): Generator<Out> {
+      if (!m.isJsonl) {
+        const root = m.value(0);
+        if (root !== undefined) yield { v: root, p: null };
+        return;
+      }
+      for (let i = 0; i < m.count; i++) {
+        const v = m.scanValue(i);
+        if (v !== undefined) yield { v, p: { up: null, k: i } };
+      }
+    };
+    const notes: string[] = [];
+    const records = new Set<number>();
+    const places = new Set<string>();
+    try {
+      const run = (program.runWith as NonNullable<Program['runWith']>)(null, { [Symbol.iterator]: recordsOf });
+      const loose: string[] = [];
+      for (const o of run.outs) {
+        const path = o.p === undefined ? undefined : pathOf(o.p);
+        if (path === undefined || (m.isJsonl && !path.length)) {
+          if (loose.length < 3) loose.push(compactJson(o.v).slice(0, 80));
+        } else if (m.isJsonl) records.add(path[0] as number);
+        else places.add(path.reduce<string>((k, seg) => childKey(k, seg), ''));
+      }
+      if (run.capped) notes.push(t('The query stopped: too many results'));
+      if (loose.length) notes.push(t('Result: {0}', loose.join(', ')));
+    } catch (e) {
+      notes.push(`jq: ${errorMessage(e)}`);
+    }
+    finish([...records].sort((a, b) => a - b), m.isJsonl ? undefined : { matches: [...places], capped: false });
+    this.queryNotes = notes;
   }
 
   /** Tells the host what the document is shown as, so both sides read line numbers the same way. */
@@ -1127,6 +1169,9 @@ export class App {
 
   private setQuery(q: string): void {
     this.state.query = q;
+    // A new query reads its jq modules again (they may have changed).
+    this.jqModules.clear();
+    this.modulesAsked.clear();
     this.startSearch(() => {
       this.activeView.render();
       if (this.matches.length && this.model.isJsonl && !this.matchSet.has(this.state.active)) this.activeView.stepMatch(1);
@@ -1143,10 +1188,10 @@ export class App {
   private startSearch(done: () => void): void {
     this.stopSearch?.();
     const m = this.model;
-    this.query = parseQuery(this.state.query, m);
+    this.query = parseQuery(this.state.query, m, this.jqModules);
     const q = this.query;
     const finish = (out: number[], tree?: { matches: string[]; capped: boolean }) => {
-      this.queryNotes = q.error ? [q.error] : [];
+      this.queryNotes = q.error ? [q.error] : q.needs ? [t('jq: reading modules {0}…', q.needs.map((k) => k.replace(/^\w+:/, '')).join(', '))] : [];
       this.matches = out;
       this.matchSet = new Set(out);
       this.treeMatches = tree ? tree.matches : [];
@@ -1167,8 +1212,22 @@ export class App {
       this.searching = !sync;
       this.searchPct = 0;
     };
+    if (q.needs) {
+      // The modules come from the host; the search runs again when they are here.
+      const ask = q.needs.filter((k) => !this.modulesAsked.has(k));
+      ask.forEach((k) => this.modulesAsked.add(k));
+      if (ask.length) this.post({ type: 'readModules', keys: ask });
+      finish([]);
+      return;
+    }
     if (!q.text) {
       finish([]);
+      return;
+    }
+    if (q.program?.usesInputs) {
+      // input / inputs: the query runs once over the whole file, as jq -n. Results that are
+      // records (or inside them) are the matches; computed results go to the status bar.
+      this.runOverInputs(q.program, finish);
       return;
     }
     if (!m.isJsonl) {
@@ -1433,7 +1492,7 @@ export class App {
       }
       if (done) {
         // A path query needs the column names: read the query again now that all are known.
-        const again = parseQuery(this.state.query, model);
+        const again = parseQuery(this.state.query, model, this.jqModules);
         if (!!again.path !== !!this.query.path || !!again.program !== !!this.query.program) this.startSearch(() => this.repaint());
         this.stateChanged();
         return;

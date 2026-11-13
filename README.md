@@ -81,7 +81,14 @@ Type plain text, a path query, or a jq or JSONPath query:
 | `.ms as $t \| select($t > 100)`, `reduce .items[] as $i (0; . + $i.n)`, `def big: .ms > 100; select(big)` | jq variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `reduce`, `foreach`, `def` (with filter and `$value` parameters, recursion), `try … catch`, `label` / `break`, and assignment (`=`, `\|=`, `+=`, `//=`, …) on a copy of the value |
 | `$..user[?@.name == "Ada"]` | **JSONPath** (RFC 9535, a search that starts with `$`): filters, `..`, `*`, slices, unions, `length()`, `count()`, `match()`, `search()`. On JSON Lines, `$[?…]` tests each record |
 
-The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why. Not in this jq: string interpolation, format strings (`@csv`), `?//`, `import` and `input`.
+The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why.
+
+More jq:
+
+- String interpolation (`"\(.user.name) took \(.ms) ms"`) and format strings: `@text`, `@json`, `@csv`, `@tsv`, `@html`, `@uri`, `@sh`, `@base64`, `@base64d`, `@base32`, `@base32d` (also `@csv "…\(x)…"`).
+- Destructuring alternatives: `. as [$a] ?// {a: $a} | …`.
+- Modules: `import "lib/util" as u;`, `include "common";` and `import "conf" as $conf;` (data). Paths are relative to the folder of the file: `lib/util.jq` (or `lib/util/util.jq`), `conf.json`.
+- `input` and `inputs`: the query runs once over the whole file, as `jq -n`. `[inputs | .ms] | add` shows the total in the status bar; `inputs | select(.level == "warn")` marks those records as matches.
 
 In the Formatted view, the filter button shows only the matching lines.
 
@@ -172,8 +179,8 @@ The VSIX and the E2E report are uploaded as build artifacts.
 To publish a release, set `version` in `package.json`, commit, then push a matching tag:
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 The workflow checks that the tag matches the version, runs the tests (also the host tests on VS Code 1.85, the oldest version `package.json` allows), and attaches the tested VSIX to a new GitHub Release.

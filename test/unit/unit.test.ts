@@ -15,7 +15,7 @@ import { indexItems, ItemStore } from '../../src/webview/items';
 import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
 import { diffValues } from '../../src/webview/diff';
 import { csvField, csvRow } from '../../src/webview/exporter';
-import { compactJson, compileJq, compileJsonPath, compileQuery, pathOf } from '../../src/webview/query';
+import { compactJson, compileJq, compileJsonPath, compileQuery, formatValue, pathOf } from '../../src/webview/query';
 import { ByteStore, DocModel, K_ERROR, K_UNKNOWN, K_VALUE, lowerBound, patchLines, stepIn, TreeSearch } from '../../src/webview/model';
 import { buildLines, countLines, lineText } from '../../src/webview/views/lines';
 import { childKey, decodeKey, parseJson, RawNum, type JVal } from '../../src/webview/json';
@@ -451,7 +451,7 @@ test('jq: errors, the ? operator, and record matching', () => {
   assert.deepEqual(jq('[.store.book[].title.x?]'), ['[]']);
   assert.throws(() => compileJq('.a |'), /ends too soon/);
   assert.throws(() => compileJq('$x'), /\$x is not defined/);
-  assert.throws(() => compileJq('import "a" as a; .'), /not supported/);
+  assert.deepEqual(compileQuery('import "a" as a; .').needs, ['jq:a'], 'a module is read first');
   assert.throws(() => compileJq('nosuch(1)'), /unknown function nosuch\/1/);
   const p = compileJq('.level == "warn" and .ms > 100');
   assert.deepEqual([p.matches({ level: 'warn', ms: 200 }), p.matches({ level: 'warn', ms: 50 }), p.matches('text')], [true, false, false]);
@@ -701,4 +701,60 @@ test('indexItems: the items of a huge array are records, for any cuts between pi
   const m = new DocModel(new ItemStore(storeOf('[{"x":1},\n{"x":2,"y":[1]},\n"z"]', r, 4), indexItems(storeOf('[{"x":1},\n{"x":2,"y":[1]},\n"z"]', r, 4)) as NonNullable<ReturnType<typeof indexItems>>), true);
   m.parseSome(1000);
   assert.deepEqual([m.count, m.valid, m.columns, m.hasNonObject, m.items?.count, m.fileLine(2)], [3, 3, ['x', 'y'], true, 3, 2]);
+});
+
+test('jq: string interpolation, @formats, ?// alternatives', () => {
+  const one = (src: string, doc: JVal = DOC) => jq(src, doc);
+  assert.deepEqual(one('"\\(.store.bicycle.color) bike for \\(.store.bicycle.price)"'), ['"red bike for 399"']);
+  assert.deepEqual(one('"a\\(1, 2)b\\(3, 4)"'), ['"a1b3"', '"a2b3"', '"a1b4"', '"a2b4"'], 'every combination, the first varies fastest');
+  assert.deepEqual(one('"x \\("nested \\(1 + 1)") y"'), ['"x nested 2 y"']);
+  assert.deepEqual(one('.store.bicycle as $b | "\\($b.color)!"'), ['"red!"'], 'variables in scope');
+  assert.deepEqual(one('def f: 7; "\\(f)"'), ['"7"'], 'functions in scope');
+  assert.deepEqual(one('"\\({a: [1]})"'), ['"{\\"a\\":[1]}"'], 'non-strings as compact JSON');
+  assert.deepEqual(one('[1, "a,b", "say \\"hi\\"", null, true] | @csv'), ['"1,\\"a,b\\",\\"say \\"\\"hi\\"\\"\\",,true"']);
+  assert.deepEqual(one('["a\\tb", "c"] | @tsv'), ['"a\\\\tb\\tc"']);
+  assert.deepEqual(one('"<a href=\'x\'>&" | @html'), ['"&lt;a href=&#39;x&#39;&gt;&amp;"']);
+  assert.deepEqual(one('"a b/é" | @uri'), ['"a%20b%2F%C3%A9"']);
+  assert.deepEqual(one('["it\'s", 1] | @sh'), [JSON.stringify("'it'\\''s' 1")]);
+  assert.deepEqual(one('"名字 ü" | @base64 | ., @base64d'), [JSON.stringify(Buffer.from('名字 ü').toString('base64')), '"名字 ü"']);
+  assert.deepEqual(one('"foobar" | @base32 | ., @base32d'), ['"MZXW6YTBOI======"', '"foobar"']);
+  assert.deepEqual(one('{a: 1} | @json'), ['"{\\"a\\":1}"']);
+  assert.deepEqual(one('.store.bicycle | @html "<b>\\(.color)</b> & \\("<i>")"'), ['"<b>red</b> & &lt;i&gt;"'], 'a format string applies to the interpolated values only');
+  assert.throws(() => compileJq('@nope'), /not a valid format/);
+  // ?// : the next pattern when one fails; every variable exists (null when not set).
+  assert.deepEqual(one('[[1, 2], {"a": 3}] | .[] as [$x, $y] ?// {a: $x} | [$x, $y]'), ['[1,2]', '[3,null]']);
+  assert.deepEqual(one('{"a": [5]} | . as {a: [$x]} ?// {a: $x} | $x'), ['5']);
+  assert.deepEqual(one('{"a": "s"} | . as {a: [$x]} ?// {a: $x} | $x'), ['"s"']);
+  assert.deepEqual(one('[reduce ([1], {"v": 2}) as [$n] ?// {v: $n} (0; . + $n)]'), ['[3]']);
+  assert.equal(formatValue('text', 'x'), 'x');
+});
+
+test('jq: import and include read module files; input and inputs read the stream', () => {
+  // A query that imports a module it does not have asks for it first.
+  assert.deepEqual(compileQuery('import "lib/util" as u; include "common"; .a | u::double').needs, ['jq:lib/util', 'jq:common']);
+  assert.deepEqual(compileQuery('import "conf" as $conf; .').needs, ['json:conf']);
+  const modules = new Map<string, string | null>([
+    ['jq:lib/util', 'def double: . * 2; def quad: double | double; def addk($k): . + $k;'],
+    ['jq:common', 'include "deep"; def inc: . + one;'],
+    ['jq:deep', 'def one: 1;'],
+    ['json:conf', '{"limit": 10}\n{"limit": 20}'],
+    ['jq:missing', null],
+  ]);
+  const run = (src: string, doc: JVal) => (compileQuery(src, modules).program as NonNullable<ReturnType<typeof compileQuery>['program']>).run(doc).outs.map((o) => compactJson(o.v));
+  assert.deepEqual(run('import "lib/util" as u; .a | u::quad, u::addk(5)', { a: 3 }), ['12', '8']);
+  assert.deepEqual(run('include "common"; .a | inc', { a: 3 }), ['4'], 'a module can include another one');
+  assert.deepEqual(run('import "conf" as $conf; [$conf[].limit, $conf::conf[0].limit]', null), ['[10,20,10]']);
+  assert.throws(() => compileJq('import "lib/util" as u; .a | double', modules), /unknown function double/, 'an imported module stays behind its prefix');
+  assert.match(compileQuery('include "missing"; .', modules).error ?? '', /module not found: missing/);
+  assert.match(compileQuery('.a | import "x" as y; .', modules).error ?? '', /import must come first/);
+  // input / inputs: the query runs once over the stream (as jq -n).
+  const p = compileJq('[inputs | .n] | add');
+  assert.equal(p.usesInputs, true);
+  const stream = [{ n: 1 }, { n: 2 }, { n: 3 }].map((v, i) => ({ v: v as JVal, p: { up: null, k: i } }));
+  assert.deepEqual(p.runWith?.(null, stream).outs.map((o) => o.v), [6]);
+  const pick = compileJq('inputs | select(.n > 1)').runWith?.(null, stream).outs ?? [];
+  assert.deepEqual(pick.map((o) => pathOf(o.p ?? null)), [[1], [2]], 'records keep their place: they can be matches');
+  assert.deepEqual(compileJq('input, input | .n').runWith?.(null, stream).outs.map((o) => o.v), [1, 2]);
+  assert.throws(() => compileJq('input').runWith?.(null, []), /No more inputs/);
+  assert.equal(compileJq('.a').usesInputs, false);
 });

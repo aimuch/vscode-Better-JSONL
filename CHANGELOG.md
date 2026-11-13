@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - **jq**: variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `def` with filter and `$value` parameters (and recursion), `reduce`, `foreach`, `try … catch`, `label` / `break`, and assignment (`=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`), plus `del`, `getpath`, `setpath`, `delpaths`, `with_entries`, `paths(f)` and `leaf_paths`.
 - **Compressed files and other encodings can be edited** record by record: the line is written in the file's encoding (UTF-16, gbk, shift_jis, windows-1252, …) and a compressed file is compressed again.
 - **Follow mode for compressed files**: the file is decompressed again and only the new part is added to the view.
 - **One JSON value above about 512 MB**: an array (or an object that is mostly one array) is read item by item; its items are records, and only their byte ranges stay in memory. 600 MB with 4.4 million items opens in about 9 seconds with about 1 GB of memory.
 - **Expand all** on a file over 50 MB asks first (it parses every line), instead of being off.
+- **More jq**: string interpolation, format strings (`@csv`, `@tsv`, `@json`, `@html`, `@uri`, `@sh`, `@base64`, `@base64d`, `@base32`, `@base32d`), `?//` destructuring alternatives, `import` / `include` (module files next to the document, read through the host), and `input` / `inputs` (the query runs once over the whole file; records it gives back are matches, other results show in the status bar).
+- Fixed: after a record of a compressed file was edited, follow mode read the whole file again on the next change.
 
 ## 0.5.0
 
