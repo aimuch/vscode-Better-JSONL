@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { isSupportedDocument, LARGE_FILE_BYTES, previewFollowsActiveEditor } from './config';
+import { isGzipPath } from './largeFile';
 import { ViewerSession, type SessionEnv, type Target } from './session';
 
 export const PREVIEW_VIEW_TYPE = 'betterJsonl.preview';
@@ -9,6 +10,7 @@ export const PREVIEW_VIEW_TYPE = 'betterJsonl.preview';
  * cannot open as text) is a large file: Better JSONL reads it from disk itself.
  */
 export async function resolveTarget(uri: vscode.Uri): Promise<Target> {
+  if (isGzipPath(uri.path)) return { uri, bytes: (await vscode.workspace.fs.stat(uri)).size, gzip: true };
   const key = uri.toString();
   const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === key && !d.isClosed);
   if (open) return { doc: open };

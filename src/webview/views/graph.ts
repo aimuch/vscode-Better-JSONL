@@ -3,6 +3,7 @@ import type { JsonPath, RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
 import { childKey, entriesHead, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
+import { isTextQuery } from '../model';
 
 const HEADER_H = 26;
 const ROW_H = 22;
@@ -67,6 +68,10 @@ export class GraphView implements View {
   private drag: { x: number; y: number; tx: number; ty: number; moved: boolean } | null = null;
   private measureCtx: CanvasRenderingContext2D | null = null;
   private font = '12px monospace';
+  /** The overview in a corner: every node, and the part of the graph the view shows. */
+  private readonly mini: HTMLCanvasElement;
+  private miniDrag = false;
+  private miniMap = { x: 0, y: 0, scale: 1, ox: 0, oy: 0 };
   /** Ends the window listeners when the view is replaced. */
   private readonly gone = new AbortController();
 
@@ -81,6 +86,7 @@ export class GraphView implements View {
           <button class="btn" data-export="svg">${icon('download')}SVG</button>
           <button class="btn" data-export="png">${icon('download')}PNG</button>
         </div>
+        <canvas class="gmini" hidden aria-label="${t('Overview: click or drag to move the view')}"></canvas>
         <div class="zoombar" role="group" aria-label="${t('Zoom')}">
           <button class="icon-btn" data-z="out" aria-label="${t('Zoom out')}">${icon('minus')}</button>
           <span class="zlabel">100%</span>
@@ -94,6 +100,16 @@ export class GraphView implements View {
     this.vp = this.el.querySelector('.vp') as SVGGElement;
     this.inspector = this.el.querySelector('.inspector') as HTMLElement;
     this.note = this.el.querySelector('.gnote') as HTMLElement;
+    this.mini = this.el.querySelector('.gmini') as HTMLCanvasElement;
+    this.mini.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      this.mini.setPointerCapture(e.pointerId);
+      this.miniDrag = true;
+      this.miniGo(e);
+    });
+    this.mini.addEventListener('pointermove', (e) => this.miniDrag && this.miniGo(e));
+    this.mini.addEventListener('pointerup', () => (this.miniDrag = false));
     this.canvasEl.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     this.svg.addEventListener('pointerdown', (e) => this.onDown(e));
     this.canvasEl.addEventListener('keydown', (e) => this.onKey(e));
@@ -344,7 +360,7 @@ export class GraphView implements View {
   }
 
   private markSearch(): void {
-    const q = this.app.query.text;
+    const q = isTextQuery(this.app.query) ? this.app.query.text : '';
     this.matchNodes = [];
     for (const n of this.nodes) {
       n.hit = false;
@@ -360,7 +376,7 @@ export class GraphView implements View {
 
   private paint(): void {
     const sel = this.app.state.graph.selectedNode;
-    const q = this.app.query.text;
+    const q = isTextQuery(this.app.query) ? this.app.query.text : '';
     const edges: string[] = [];
     const nodes: string[] = [];
     for (const n of this.nodes) {
@@ -408,6 +424,60 @@ export class GraphView implements View {
   private applyTransform(): void {
     this.vp.setAttribute('transform', `translate(${this.tx},${this.ty}) scale(${this.k})`);
     (this.el.querySelector('.zlabel') as HTMLElement).textContent = `${Math.round(this.k * 100)}%`;
+    this.paintMini();
+  }
+
+  /** Draws the overview. It shows only when part of the graph is outside the view. */
+  private paintMini(): void {
+    const c = this.mini;
+    const vw = this.canvasEl.clientWidth;
+    const vh = this.canvasEl.clientHeight;
+    const b = this.bounds();
+    const sx = b.x * this.k + this.tx;
+    const sy = b.y * this.k + this.ty;
+    const inside = sx >= -1 && sy >= -1 && sx + b.w * this.k <= vw + 1 && sy + b.h * this.k <= vh + 1;
+    c.hidden = this.nodes.length < 2 || !vw || inside;
+    if (c.hidden) return;
+    const W = 180;
+    const H = 120;
+    const dpr = window.devicePixelRatio || 1;
+    if (c.width !== W * dpr) {
+      c.width = W * dpr;
+      c.height = H * dpr;
+    }
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    const scale = Math.min((W - 8) / b.w, (H - 8) / b.h);
+    const ox = (W - b.w * scale) / 2;
+    const oy = (H - b.h * scale) / 2;
+    this.miniMap = { x: b.x, y: b.y, scale, ox, oy };
+    const css = getComputedStyle(document.body);
+    const color = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const sel = this.app.state.graph.selectedNode;
+    const dim = color('--dim', '#888');
+    const accent = color('--accent', '#0078d4');
+    for (const n of this.nodes) {
+      ctx.fillStyle = n.key === sel || n.hit ? accent : dim;
+      ctx.globalAlpha = n.key === sel || n.hit ? 0.9 : 0.45;
+      ctx.fillRect(ox + (n.x - b.x) * scale, oy + (n.y - b.y) * scale, Math.max(1, n.w * scale), Math.max(1, n.h * scale));
+    }
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(ox + (-this.tx / this.k - b.x) * scale, oy + (-this.ty / this.k - b.y) * scale, (vw / this.k) * scale, (vh / this.k) * scale);
+  }
+
+  /** A click or drag in the overview puts that point in the middle of the view. */
+  private miniGo(e: PointerEvent): void {
+    const r = this.mini.getBoundingClientRect();
+    const m = this.miniMap;
+    const gx = m.x + (e.clientX - r.left - m.ox) / m.scale;
+    const gy = m.y + (e.clientY - r.top - m.oy) / m.scale;
+    this.tx = this.canvasEl.clientWidth / 2 - gx * this.k;
+    this.ty = this.canvasEl.clientHeight / 2 - gy * this.k;
+    this.applyTransform();
   }
 
   private bounds(): { x: number; y: number; w: number; h: number } {

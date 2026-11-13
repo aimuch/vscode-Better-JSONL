@@ -23,6 +23,9 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Edit one record in a pretty-printed editor. It is saved back as one compact line.
 - Double-click any line to jump to that member in the source.
 - **Word wrap**: press `Alt+Z` (`Option+Z` on macOS) in the view, or use the wrap button in the toolbar. Wrapped parts of a pretty line keep its indent.
+- **Follow** (the arrow button, JSON Lines): the view stays at the last line while lines are added, like `tail -f`.
+- **Compare**: select two lines, then press the compare button. A panel lists the differences field by field (added, removed, changed); **Open in the diff editor** shows the two records side by side in VS Code.
+- **Export** (the download button): the lines on screen (all lines, or the search result) or the selected lines, as JSON Lines (the raw lines) or CSV (one column per key, UTF-8 with a byte order mark).
 
 ### Grid view
 
@@ -31,6 +34,9 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Word wrap (`Alt+Z`) wraps long cell values.
 - Sort by any column. Drag a header edge to resize.
 - Filter by any column: the funnel button in a header lists the column's values with counts. Untick values, or type to keep only cells that contain the text. Filters on several columns combine, and each value list follows the other filters.
+- Column statistics at the top of the filter popup: the types and their counts, the number of distinct values, min / max / mean of the numbers, and the shortest and longest text.
+- **Edit a cell**: double-click a value (text, number, true / false / null). `Enter` writes it, `Esc` cancels. Only that value changes in the file: the rest of the line or document stays as it is. A text cell stays text; in another cell type a JSON value (`"…"` makes text).
+- Export the rows on screen (after search, filters and sort) as JSON Lines or CSV.
 
 ![Grid view](docs/screenshots/grid.png)
 
@@ -41,22 +47,26 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Click a node to see its JSONPath and value. Reveal it in the editor, or copy it.
 - Select several JSONL lines to compare them in one graph.
 - Export as SVG or PNG.
+- An overview in the corner shows the whole graph when it does not fit; click or drag in it to move the view.
 
 ![Graph view](docs/screenshots/graph.png)
 
-### Large files (above 50 MB)
+### Large and compressed files
 
-VS Code does not give extensions the text of a file above 50 MB. Better JSONL reads such a file from disk itself and shows it **read-only**, in its own panel:
+VS Code does not give extensions the text of a file above 50 MB, and has no text view for compressed files. Better JSONL reads these files from disk itself, in their own panel:
 
 - A JSON Lines file shows while it loads: the first rows are there at once, and you can scroll, select and search as the rest arrives. A 300 MB file with 3.4 million lines takes about 8 seconds to load and scan on a recent laptop.
-- Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress.
-- One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded.
-- What is different: no record editing and no cursor sync; **Expand all** is off above 50 MB; sorting and column filters in the Grid need 200 000 rows or fewer (search first to narrow the rows). **Source** opens the file in VS Code at that line.
-- When the file changes on disk, a **Reload** button appears. The file is read as UTF-8.
+- Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress. In the Grid, sorting and column filters first read the columns they need (the status bar shows the progress).
+- **Edit a record** of a large UTF-8 JSON Lines file (the record editor or a grid cell): the line is replaced on disk. The edit is refused when the file or the line changed since it was read.
+- **Follow**: when a file only grows at its end (a log), the new lines are added to the view without reading the file again. Without follow mode, a **Load new lines** button appears. Other changes show a **Reload** button.
+- **Compressed files**: `.jsonl.gz`, `.ndjson.gz` and `.json.gz` open in Better JSONL when you open them in VS Code. They are read-only.
+- **Encodings**: a UTF-16 byte order mark is read, and so is the `files.encoding` setting (for example `gbk`, `shiftjis`, `windows1252`). Files that are not UTF-8 are read-only.
+- One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded. A value above about 512 MB (too long for one JavaScript string) is parsed from the bytes; it needs enough memory for the parsed value.
+- What is different: no cursor sync; **Expand all** is off above 50 MB. **Source** opens the file in VS Code at that line.
 
 ### Search and filter
 
-Type plain text, or a path query:
+Type plain text, a path query, or a jq or JSONPath query:
 
 | Query | Meaning |
 |-------|---------|
@@ -65,10 +75,15 @@ Type plain text, or a path query:
 | `user.name:ada` | `user.name` contains `ada` |
 | `ms>100` | Numeric compare (`>` or `<`) |
 | `level!=info` | Not equal |
+| `.level == "warn" and .ms > 100` | **jq** (a search that starts with `.`): records for which the filter gives something other than `false` or `null` |
+| `select(.tags \| index("x"))` … `.user.name \| test("^a"; "i")` | jq functions: `select`, `map`, `has`, `length`, `keys`, `type`, `test`, `contains`, `startswith`, `endswith`, `any`, `all`, `sort_by`, `group_by`, `unique`, `min`, `max`, `add`, `to_entries`, `paths`, `path`, `if … then … else … end`, `//`, `?` and more |
+| `$..user[?@.name == "Ada"]` | **JSONPath** (RFC 9535, a search that starts with `$`): filters, `..`, `*`, slices, unions, `length()`, `count()`, `match()`, `search()`. On JSON Lines, `$[?…]` tests each record |
+
+The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why. jq here has no variables (`as $x`), `reduce` or assignment.
 
 In the Formatted view, the filter button shows only the matching lines.
 
-In one JSON document (not JSON Lines), the search reads the whole value, so it also finds text inside folded nodes. The counter shows the matches (`1,000+` when there are more), and `Enter` / `Shift+Enter` go to the next or previous one. Only the nodes on the way to that match are opened.
+In one JSON document (not JSON Lines), jq and JSONPath results are places in the document: `Enter` goes to each one. A result that is computed (for example `.rows | length`) shows in the status bar. Plain text search also reads the whole value, so it also finds text inside folded nodes. The counter shows the matches (`1,000+` when there are more), and `Enter` / `Shift+Enter` go to the next or previous one. Only the nodes on the way to that match are opened.
 
 ### Keyboard
 
@@ -125,7 +140,7 @@ Both commands are in the right-click menu and the Command Palette for JSON and J
 
 ## Limits
 
-- Files above 50 MB are read-only (see "Large files"). One JSON value above about 512 MB cannot be shown.
+- Files above 50 MB can be edited record by record when they are UTF-8 JSON Lines; other large and compressed files are read-only (see "Large and compressed files").
 - A limit that hides data (300 grid columns, 10 lines in one graph, 2 000 selected lines) is named in the status bar when it applies.
 - `.json` files with comments or trailing commas are parsed as JSON with Comments.
 - A `.json` file with one JSON value per line is shown as JSON Lines.
@@ -136,6 +151,7 @@ Both commands are in the right-click menu and the Command Palette for JSON and J
 npm install
 npm run build        # dist/extension.js, dist/webview.js, dist/webview.css
 npm run test:unit    # unit and property tests (node --test)
+npm test             # unit tests, then all E2E tests
 npm run test:e2e     # VS Code host tests + packaged-VSIX UI checks + webview tests in Chrome → test-results/report.html
 npm run package      # dist-vsix/better-jsonl-<version>.vsix
 npm run screenshots  # docs/screenshots/*.png, from the real webview in Chrome
@@ -154,11 +170,13 @@ The VSIX and the E2E report are uploaded as build artifacts.
 To publish a release, set `version` in `package.json`, commit, then push a matching tag:
 
 ```bash
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-The workflow checks that the tag matches the version, runs the tests, and attaches the tested VSIX to a new GitHub Release.
+The workflow checks that the tag matches the version, runs the tests (also the host tests on VS Code 1.85, the oldest version `package.json` allows), and attaches the tested VSIX to a new GitHub Release.
+
+It also publishes to the Visual Studio Marketplace when the repository has a `VSCE_PAT` secret, and to Open VSX when it has an `OVSX_PAT` secret. Without them these steps are skipped. The `publisher` in `package.json` must be a publisher that the token can publish for.
 
 ## License
 

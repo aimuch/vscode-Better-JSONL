@@ -1045,6 +1045,225 @@ await scenario('W40', 'Keyboard: fold arrows, toolbar buttons, grid headers and 
   check.eq('Right unfolds it', r.graph.nodes, nodes);
 });
 
+await scenario('W41', 'Search with jq and JSONPath: JSON Lines records, results in one document, errors', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  const count = () => page.locator('.search .count').innerText();
+  await page.fill('.search input', '.level == "warn"');
+  let r = await report(page, (x) => x.matches === 3);
+  check.ok('jq matches records, and says it is jq', (await count()).startsWith('jq · '), await count());
+  await page.fill('.search input', 'select(.ms > 100) | .user.name');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('select and a pipe', r.matches, 1);
+  await page.fill('.search input', '$[?@.ms > 10]');
+  r = await report(page, (x) => x.matches === 3);
+  check.ok('JSONPath filter on each record', (await count()).startsWith('JSONPath · '), await count());
+  await page.fill('.search input', '$..roles[?@ == "admin"]');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('JSONPath descendants', r.matches, 1);
+  await page.fill('.search input', '.level ==');
+  r = await report(page, (x) => x.notes.some((n) => n.startsWith('jq: ')));
+  check.ok('an invalid query is searched as text and says why', r.notes.some((n) => n.startsWith('jq: ')), r.notes);
+  await shot('jq error in the status bar');
+  // One JSON document: results are places in it.
+  await open(page, 'doc.json', { text: JSON.stringify({ rows: [{ id: 1, tags: ['x'] }, { id: 2, tags: [] }], meta: { n: 2 } }, null, 2) });
+  await page.fill('.search input', '.rows[] | select(.id == 2) | .tags');
+  r = await report(page, (x) => x.matches === 1);
+  await page.press('.search input', 'Enter');
+  await page.waitForFunction(() => document.querySelector('.formatted .row.hit')?.textContent.includes('"tags": []'));
+  check.eq('Enter goes to the result', await count(), 'jq · 1 / 1');
+  await page.fill('.search input', '.rows | length');
+  r = await report(page, (x) => x.notes.includes('Result: 2'));
+  check.ok('a computed value shows in the status bar', r.notes.includes('Result: 2'), r.notes);
+  await page.fill('.search input', '$..id');
+  r = await report(page, (x) => x.matches === 2);
+  check.eq('JSONPath in one document', r.matches, 2);
+});
+
+await scenario('W42', 'Follow mode: new lines at the end show at once (a large file, and a text document)', [], async ({ page, check }) => {
+  await openBlank(page);
+  const version = await page.evaluate(() => window.harness.loadLarge('big.jsonl', new TextEncoder().encode('{"id":1}\n{"id":2}\n{"id":3'), { readOnly: false }));
+  let r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
+  check.eq('three lines; the last one has no line end yet and is cut off', [r.stats.lines, r.stats.valid, r.stats.errors], [3, 2, 1]);
+  await page.click('.follow-btn');
+  r = await report(page, (x) => x.active === 2);
+  check.eq('follow on: the host is told, the last line is the current one', [(await posted(page, 'follow')).at(-1), r.active], [{ type: 'follow', on: true }, 2]);
+  check.eq('following does not move the editor cursor', (await posted(page, 'select')).length, 0);
+  await send(page, { type: 'append', version, data: new TextEncoder().encode(',"more":true}\n{"id":4}\n{"id":5}\n') });
+  r = await report(page, (x) => x.stats.lines === 5 && x.stats.parsed >= 5);
+  check.eq('the open last line goes on; new lines follow; the view stays at the end', [r.stats.valid, r.active, r.activeText], [5, 4, '{"id":5}']);
+  check.ok('the line that went on is read again', (await page.evaluate(() => window.harness.lastReport().stats.errors)) === 0);
+  await send(page, { type: 'notice', message: 'New lines were added to the file.', action: 'append' });
+  await page.click('.banner .banner-act');
+  check.eq('without follow: a button loads the new lines', (await posted(page, 'loadAppended')).length, 1);
+  // A text document: an edit that adds a line at the end.
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await page.click('.follow-btn');
+  r = await report(page, (x) => x.active === 20);
+  const text = await page.evaluate(async () => (await (await fetch('/test/fixtures/events.jsonl')).text()));
+  await send(page, { type: 'update', text: text + '{"id":9999}\n', version: 2 });
+  r = await report(page, (x) => x.version === 2 && x.active === 21);
+  check.eq('a text document in follow mode goes to the new last line', r.activeText, '{"id":9999}');
+});
+
+await scenario('W43', 'Export: rows as CSV or JSON Lines, sent in pieces when the host is ready', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await page.click('.export-btn');
+  const items = await page.$$eval('.export-menu .menu-item', (els) => els.map((e) => e.dataset.export));
+  check.eq('menu: all rows, and the selected line', items, ['rows:jsonl', 'rows:csv', 'selected:jsonl', 'selected:csv']);
+  await shot('Export menu');
+  await page.click('[data-export="rows:csv"]');
+  const start = (await posted(page, 'exportStart')).at(-1);
+  check.eq('the host is asked where to save (20 lines with text; the blank line is left out)', [start.format, start.rows, start.name], ['csv', 20, 'events-rows']);
+  await send(page, { type: 'exportReady', id: start.id, ok: true });
+  await page.waitForFunction(() => window.harness.posted('exportData').length === 1);
+  const piece = (await posted(page, 'exportData'))[0];
+  const lines = piece.data.split('\n');
+  check.eq('a CSV header with a byte order mark', lines[0].slice(0, 20), '﻿(value),id,ts,level');
+  check.ok('nested values are compact JSON, quoted', lines[3].includes('"{""id"":""u_17"",""name"":""Ada"",""roles"":[""admin"",""ops""]}"'), lines[3]);
+  check.eq('a header and 20 rows (an invalid line keeps its text in the first column)', lines.length, 1 + 20 + 1);
+  await send(page, { type: 'exportReady', id: start.id, ok: true });
+  await page.waitForFunction(() => window.harness.posted('exportData').length === 2);
+  check.eq('then the last, empty piece', (await posted(page, 'exportData'))[1], { type: 'exportData', id: start.id, data: '', done: true });
+  // Search narrows the rows; JSON Lines are the raw lines.
+  await page.fill('.search input', 'level=warn');
+  await report(page, (x) => x.matches === 3);
+  await page.click('.export-btn');
+  await page.click('[data-export="rows:jsonl"]');
+  const s2 = (await posted(page, 'exportStart')).at(-1);
+  await send(page, { type: 'exportReady', id: s2.id, ok: true });
+  await page.waitForFunction((id) => window.harness.posted('exportData').some((m) => m.id === id), s2.id);
+  const jl = (await posted(page, 'exportData')).find((m) => m.id === s2.id).data;
+  check.eq('three raw lines', jl.trim().split('\n').length, 3);
+  check.ok('lines exactly as in the file', jl.includes('"trace":9007199254740993'), jl.slice(0, 120));
+});
+await scenario('W44', 'Grid: column statistics in the filter popup; a large file sorts and filters after reading its columns', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl', { config: { defaultView: 'grid' } });
+  await complete(page);
+  await page.hover('.gh[data-col="ms"]');
+  await page.click('.gh[data-col="ms"] .gh-f');
+  const stats = await page.locator('.gf-stats').innerText();
+  check.ok('types, distinct values, min, max, mean', /number \d+/.test(stats) && /\(missing\) \d+/.test(stats) && /distinct/.test(stats) && /min 8 · max 1,?840/.test(stats), stats);
+  await shot('Column statistics');
+  await page.keyboard.press('Escape');
+  // 250 000 lines of a large file: records are not all kept, so the column is read first.
+  await openBlank(page);
+  await page.evaluate(() => {
+    const rows = [];
+    for (let i = 0; i < 250000; i++) rows.push(`{"id":${i},"v":${(i * 7919) % 1000}}`);
+    return window.harness.loadLarge('big.jsonl', new TextEncoder().encode(rows.join('\n') + '\n'), { chunk: 1 << 20, config: { defaultView: 'grid' } });
+  });
+  await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines && x.view === 'grid', 30000);
+  await page.click('.gh[data-col="v"]');
+  await page.click('.gh[data-col="v"]');
+  let r = await report(page, (x) => x.notes.length === 0 && x.grid.rows === 250000, 30000);
+  await page.waitForTimeout(100);
+  check.eq('sorted descending: the first row has v = 999 (record 321)', await page.locator('.grows .grow').first().getAttribute('data-id'), '321');
+  await page.click('.gh[data-col="v"] .gh-f');
+  await page.waitForFunction(() => document.querySelectorAll('.gf-list .gf-item').length > 0, null, { timeout: 30000 });
+  check.ok('the value list of a 250 000-row column', (await page.locator('.gf-stats').innerText()).includes('1,000 distinct'));
+  await page.fill('.gf-search input', '999');
+  r = await report(page, (x) => x.grid.rows === 250, 30000);
+  check.eq('a text filter on the column', r.grid.rows, 250);
+});
+
+await scenario('W45', 'Grid: edit a cell (JSON Lines: the line with only that value changed; a JSON document: the value at its path)', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl', { config: { defaultView: 'grid' } });
+  await complete(page);
+  const line0 = await page.evaluate(async () => (await (await fetch('/test/fixtures/events.jsonl')).text()).split('\n')[0]);
+  await page.locator('.grow[data-id="0"] .gc').filter({ hasText: 'login ok' }).dblclick();
+  const input = page.locator('.gedit');
+  check.eq('the editor holds the text of the string', await input.inputValue(), 'login ok');
+  await shot('Editing a cell');
+  await input.fill('signed in "now"');
+  await input.press('Enter');
+  const sent = (await posted(page, 'editLine')).at(-1);
+  check.eq('the line is sent with only that value changed', sent, { type: 'editLine', line: 0, original: line0, text: line0.replace('"login ok"', '"signed in \\"now\\""'), exact: true });
+  await send(page, { type: 'editResult', ok: false, message: 'Line 1 changed after the edit started. Nothing was written.' });
+  await page.waitForFunction(() => document.querySelector('.banner:not([hidden])')?.textContent.includes('changed after'));
+  check.ok('a refused edit shows in the banner', true);
+  // A number cell takes JSON; text that is not JSON is refused there.
+  await page.locator('.grow[data-id="1"] .gc.tn').filter({ hasText: '42' }).dblclick();
+  await input.fill('forty');
+  await input.press('Enter');
+  check.eq('not JSON in a number cell: marked, not sent', [await input.getAttribute('class'), (await posted(page, 'editLine')).length], ['gedit bad', 1]);
+  await input.fill('43');
+  await input.press('Enter');
+  check.ok('a number is written as a number', (await posted(page, 'editLine')).at(-1).text.includes('"ms":43'));
+  // One JSON document: the value at its path.
+  await open(page, 'doc.json', { text: '{"a": 1, "b": "x", "c": {"d": true}}', config: { defaultView: 'grid' } });
+  await page.locator('.grow[data-id="1"] .gc').nth(1).dblclick();
+  await input.fill('y');
+  await input.press('Enter');
+  check.eq('a JSON document sends the path and its version', (await posted(page, 'editValue')).at(-1), { type: 'editValue', path: ['b'], version: 1, text: '"y"' });
+  await page.locator('.grow[data-id="2"] .vchip').dblclick();
+  check.eq('objects are not edited in a cell', await page.locator('.gedit').count(), 0);
+});
+
+await scenario('W46', 'Compare two lines: the differences, field by field, and the diff editor', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  check.ok('no compare button for one line', await page.locator('.compare-btn').isHidden());
+  await send(page, { type: 'selection', lines: [2, 3], active: 3 });
+  await report(page, (x) => x.selected.length === 2);
+  await page.click('.compare-btn');
+  const panel = page.locator('.comparepanel');
+  await panel.waitFor({ state: 'visible' });
+  const rows = await panel.locator('tr').allInnerTexts();
+  check.ok('changed, removed and added members', rows.some((t) => t.startsWith('$.id')) && rows.some((t) => t.startsWith('$.trace')) && rows.some((t) => t.startsWith('$.job')), rows);
+  check.ok('the count of differences', /\d+ differences/.test(await panel.locator('.ep-head').innerText()));
+  await shot('Comparing lines 3 and 4');
+  await panel.locator('.cmp-diff').click();
+  const diff = (await posted(page, 'diff')).at(-1);
+  check.eq('the diff editor gets both records, pretty-printed', [diff.left.title, diff.right.title, diff.left.text.startsWith('{\n  "id": 1003')], ['events.jsonl line 3', 'events.jsonl line 4', true]);
+  await page.keyboard.press('Escape');
+  check.ok('Esc closes the panel', await panel.isHidden());
+});
+
+await scenario('W47', 'Graph overview: shows when the graph is larger than the view; a click moves the view', [], async ({ page, check, shot }) => {
+  const wide = {};
+  for (let i = 0; i < 40; i++) wide['k' + i] = { a: { b: { c: i } } };
+  await open(page, 'w.jsonl', { text: JSON.stringify(wide) + '\n', config: { defaultView: 'graph' } });
+  await report(page, (x) => x.view === 'graph' && x.graph && x.graph.nodes > 100);
+  await page.click('[data-z="in"]');
+  await page.click('[data-z="in"]');
+  const mini = page.locator('.gmini');
+  check.ok('the overview shows when part of the graph is outside the view', await mini.isVisible());
+  const before = await page.locator('.gsvg .vp').getAttribute('transform');
+  const box = await mini.boundingBox();
+  await page.mouse.click(box.x + box.width - 10, box.y + box.height - 10);
+  check.ok('a click in the overview moves the view', (await page.locator('.gsvg .vp').getAttribute('transform')) !== before);
+  await shot('Graph overview');
+  await page.click('[data-z="fit"]');
+  check.ok('hidden when the whole graph is in view', await mini.isHidden());
+});
+
+await scenario('W48', 'One JSON value read from bytes (as for a file over 512 MB); a compressed file is read-only', [], async ({ page, check }) => {
+  await page.addInitScript(() => (window.__betterJsonlByteJsonAt = 1000));
+  await openBlank(page);
+  const doc = { rows: Array.from({ length: 2000 }, (_, i) => ({ id: i, name: 'n' + i + 'é😀' })), big: 12345678901234567890 };
+  const text = JSON.stringify(doc).replace('"big":12345678901234567000', '"big":12345678901234567890');
+  await page.evaluate((t) => window.harness.loadLarge('doc.json', new TextEncoder().encode(t), { chunk: 777 }), text);
+  let r = await report(page, (x) => x.large && x.fileName === 'doc.json' && x.formatted, 20000);
+  check.eq('parsed from the bytes: one value', [r.isJsonl, r.stats.valid, r.formatted.totalRows], [false, 1, 2000 * 4 + 5]);
+  await page.fill('.search input', '.big');
+  r = await report(page, (x) => x.matches === 1);
+  await page.press('.search input', 'Enter');
+  await page.waitForFunction(() => document.querySelector('.formatted .row.hit')?.textContent.includes('12345678901234567890'));
+  check.ok('a big integer keeps its text', true);
+  await openBlank(page);
+  await page.evaluate(() => window.harness.loadLarge('bad.json', new TextEncoder().encode('{"a": [1, 2,, 3]}' + ' '.repeat(2000))));
+  await page.waitForFunction(() => document.querySelector('.boot')?.textContent.includes('not valid JSON'));
+  check.ok('an error says where', (await page.locator('.boot').innerText()).includes('byte 13'), await page.locator('.boot').innerText());
+  await openBlank(page);
+  await page.evaluate(() => window.harness.loadLarge('logs.jsonl.gz', new TextEncoder().encode('{"a":1}\n{"a":2}\n')));
+  r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
+  check.eq('a .jsonl.gz file is JSON Lines', [r.isJsonl, r.stats.valid], [true, 2]);
+  check.eq('read-only: no Edit, no Open as Text', [await page.locator('.a-edit').count(), await page.locator('.open-text').isHidden()], [0, true]);
+});
+
 await scenario('W36', 'The background scan and search do not wait for timers (a window in the background slows timers down)', [], async ({ page, check }) => {
   await openBlank(page);
   // Every timer takes at least 3 seconds, as in a window the system put to sleep.

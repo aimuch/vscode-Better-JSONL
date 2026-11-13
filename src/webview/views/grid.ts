@@ -1,6 +1,6 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
-import type { App, ColFilter, View } from '../app';
+import { defer, type App, type ColFilter, type View } from '../app';
 import { childKey, decodeKey, entriesHead, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
 import type { Parsed } from '../model';
@@ -24,8 +24,29 @@ const OKEY = ESC + 'k';
 const OVAL = ESC + 'o';
 const colId = (key: string): string => (key.startsWith(ESC) ? ESC + key : key);
 const keyOf = (id: string): string => (id.startsWith(ESC) ? id.slice(1) : id);
-/** When parsed records are not all kept in memory, sorting and column filters work on this many rows at most. */
+/**
+ * JSON Lines whose records are not all kept in memory (large files): above this many rows,
+ * sorting and column filters first read the values of the columns they need, in the background.
+ */
 const HEAVY_ROWS = 200_000;
+
+/**
+ * An object or array in a column read for sorting or filtering: its size and compact text
+ * (cut at 2 000 characters), not the value itself, so a column of a large file stays small.
+ */
+class Shape {
+  constructor(
+    readonly arr: boolean,
+    readonly size: number,
+    readonly text: string,
+  ) {}
+}
+
+type Cell = JVal | Shape | undefined;
+
+function shapeOf(v: JVal | undefined): Cell {
+  return v !== undefined && isContainer(v) ? new Shape(Array.isArray(v), sizeOf(v), compact(v).slice(0, 2000)) : v;
+}
 /** Values listed in a column filter before "… n more". */
 const FILTER_LIST = 500;
 /** Filter key of a missing cell. */
@@ -33,7 +54,7 @@ const MISSING = '\u0000';
 
 interface FilterValue {
   key: string;
-  v: JVal | undefined;
+  v: Cell;
   n: number;
   /** Position in the sorted list. */
   i: number;
@@ -75,8 +96,15 @@ export class GridView implements View {
   private colsCut = false;
   /** Column widths that come from the content, by column id. */
   private readonly autoWidths = new Map<string, number>();
-  /** Sorting and column filters are off: too many rows for a file whose records are not all in memory. */
-  private heavyOff = false;
+  /** Many rows of a large JSON Lines file: sort and filters use the column values read in the background. */
+  private heavy = false;
+  /** Large files: whole columns read for sort and filters, by column id (index = record number). */
+  private readonly colCache = new Map<string, Cell[]>();
+  private colModel: unknown;
+  private colJob: { cols: string[]; stop: () => void } | undefined;
+  private colPct = 0;
+  /** The cell editor (an input over the cell), while a value is edited. */
+  private editor: HTMLInputElement | null = null;
   /** The open filter popup: its column and the column's values. */
   private fcol: string | null = null;
   private fvalues: FilterValue[] = [];
@@ -114,7 +142,14 @@ export class GridView implements View {
     this.rowsEl.addEventListener('dblclick', (e) => this.onDblClick(e));
     window.addEventListener('pointermove', (e) => this.onDrag(e), { signal });
     window.addEventListener('pointerup', () => (this.dragging = null), { signal });
-    this.scroll.addEventListener('scroll', () => this.placeFilter(), { passive: true });
+    this.scroll.addEventListener(
+      'scroll',
+      () => {
+        this.placeFilter();
+        this.cancelEdit();
+      },
+      { passive: true },
+    );
     this.fel = document.createElement('div');
     this.fel.className = 'gfilter';
     this.fel.hidden = true;
@@ -149,6 +184,7 @@ export class GridView implements View {
 
   dispose(): void {
     clearTimeout(this.ftimer);
+    this.colJob?.stop();
     this.resizes.disconnect();
     this.gone.abort();
   }
@@ -159,6 +195,7 @@ export class GridView implements View {
 
   hide(): void {
     this.closeFilter();
+    this.cancelEdit();
     this.el.hidden = true;
   }
 
@@ -181,12 +218,67 @@ export class GridView implements View {
   notes(): string[] {
     const out: string[] = [];
     if (this.colsCut) out.push(t('Showing the first {0} columns', MAX_COLUMNS));
-    if (this.heavyOff && (this.app.state.grid.sort || this.activeFilters().length)) out.push(this.heavyNote());
+    if (this.colJob) out.push(t('Reading column values for sort and filters… {0}%', this.colPct));
     return out;
   }
 
-  private heavyNote(): string {
-    return t('Sorting and column filters need {0} rows or fewer in a file this large. Search to narrow the rows.', HEAVY_ROWS.toLocaleString());
+  /** A cell for sorting and filtering: from the column read in the background when there is one. */
+  private val(id: number, col: string): Cell {
+    if (this.heavy) {
+      const c = this.colCache.get(col);
+      if (c) return c[id];
+    }
+    return this.cell(id, col);
+  }
+
+  /**
+   * Large files: reads the values of `cols` for every record, in time slices. The grid lays
+   * out again when they are there.
+   */
+  private readColumns(cols: string[]): void {
+    const m = this.app.model;
+    if (this.colJob && this.colJob.cols.join('\u0002') === cols.join('\u0002')) return;
+    this.colJob?.stop();
+    const n = m.count;
+    const arrays = cols.map(() => new Array<Cell>(n));
+    const keys = cols.map((c) => (c === VALUE_COL ? null : keyOf(c)));
+    let i = 0;
+    let stop = () => undefined as void;
+    const job = { cols, stop: () => stop() };
+    this.colJob = job;
+    this.colPct = 0;
+    const step = () => {
+      if (this.colJob !== job || this.app.model !== m) return;
+      const end = performance.now() + 12;
+      for (; i < n; i++) {
+        const v = m.scanValue(i);
+        for (let k = 0; k < cols.length; k++) {
+          const key = keys[k];
+          const cell = v === undefined ? undefined : key === null ? (isObj(v) ? undefined : v) : isObj(v) && Object.prototype.hasOwnProperty.call(v, key) ? v[key] : undefined;
+          arrays[k][i] = shapeOf(cell);
+        }
+        if ((i & 255) === 255 && performance.now() > end) {
+          i++;
+          break;
+        }
+      }
+      if (i < n) {
+        const pct = Math.floor((i / n) * 100);
+        if (pct !== this.colPct) {
+          this.colPct = pct;
+          this.app.paintChrome();
+        }
+        stop = defer(step);
+        return;
+      }
+      cols.forEach((c, k) => this.colCache.set(c, arrays[k]));
+      this.colJob = undefined;
+      this.rowSig = '';
+      this.render();
+      this.app.paintChrome();
+      this.app.stateChanged();
+    };
+    stop = defer(step);
   }
 
   /** The text a column shows in its header. */
@@ -213,7 +305,20 @@ export class GridView implements View {
         if (top < st || top + this.rowH > st + vh) this.scroll.scrollTop = Math.max(0, top - vh / 3);
       }
     }
-    this.paint();
+    // The rows stay: only their marks change. (New rows would end a double-click that started on the old ones.)
+    this.markRows();
+  }
+
+  /** The current and selected rows on screen get their marks. A scroll paints the rows anyway. */
+  private markRows(): void {
+    const s = this.app.state;
+    const jsonl = this.app.model.isJsonl;
+    for (const el of Array.from(this.rowsEl.children) as HTMLElement[]) {
+      if (!el.classList.contains('grow')) continue;
+      const id = Number(el.dataset.id);
+      el.classList.toggle('act', jsonl ? s.active === id : this.jsonActive === id);
+      el.classList.toggle('sel', jsonl && s.selected.has(id));
+    }
   }
 
   stepMatch(dir: 1 | -1): void {
@@ -298,6 +403,8 @@ export class GridView implements View {
     const baseSig = `${m.count}|${app.matchesVersion}|${q}`;
     if (baseSig !== this.baseSig) {
       this.baseSig = baseSig;
+      // One JSON document with a JSONPath or jq query: a row matches when a result is inside it.
+      const hits = !m.isJsonl && app.query.program ? new Set(app.treeMatches.map((k) => decodeKey(k)[0])) : null;
       this.rowSig = '';
       this.autoWidths.clear();
       const ids: number[] = [];
@@ -318,12 +425,12 @@ export class GridView implements View {
         this.arrayColsCut = keys.size > MAX_COLUMNS;
         if (nonObj || !this.arrayCols.length) this.arrayCols.push(VALUE_COL);
         for (let i = 0; i < root.length; i++) {
-          if (!q || JSON.stringify(root[i] instanceof RawNum ? (root[i] as RawNum).src : root[i]).toLowerCase().includes(q)) ids.push(i);
+          if (hits ? hits.has(i) : !q || JSON.stringify(root[i] instanceof RawNum ? (root[i] as RawNum).src : root[i]).toLowerCase().includes(q)) ids.push(i);
         }
       } else if (root !== undefined && isObj(root)) {
         this.objKeys = Object.keys(root);
         for (let i = 0; i < this.objKeys.length; i++) {
-          if (!q || (this.objKeys[i] + ' ' + JSON.stringify(root[this.objKeys[i]])).toLowerCase().includes(q)) ids.push(i);
+          if (hits ? hits.has(this.objKeys[i]) : !q || (this.objKeys[i] + ' ' + JSON.stringify(root[this.objKeys[i]])).toLowerCase().includes(q)) ids.push(i);
         }
       } else if (root !== undefined) ids.push(0);
       this.baseIds = ids;
@@ -333,25 +440,46 @@ export class GridView implements View {
       this.colsCut = this.arrayColsCut;
     }
     // 3. Column filters and the sort. Both read a cell of every row, so the result is kept.
-    this.heavyOff = !m.keepsAll && this.baseIds.length > HEAVY_ROWS;
-    const filters = this.heavyOff ? [] : this.activeFilters();
+    if (this.colModel !== m) {
+      this.colModel = m;
+      this.colCache.clear();
+      this.colJob?.stop();
+      this.colJob = undefined;
+    }
+    this.heavy = m.isJsonl && !m.keepsAll && this.baseIds.length > HEAVY_ROWS;
+    let filters = this.activeFilters();
     const g = app.state.grid.sort;
-    const sort = !this.heavyOff && g && (g.col === NUM || this.cols.includes(g.col)) ? g : null;
+    let sort = g && (g.col === NUM || this.cols.includes(g.col)) ? g : null;
+    if (this.heavy) {
+      // The columns are read first; until then the rows show in file order.
+      const need = new Set<string>(filters.map(([c]) => c));
+      if (sort && sort.col !== NUM) need.add(sort.col);
+      if (this.fcol !== null) need.add(this.fcol);
+      const missing = [...need].filter((c) => !this.colCache.has(c));
+      if (missing.length) {
+        this.readColumns([...need]);
+        filters = [];
+        sort = null;
+      }
+    }
     const rowSig = JSON.stringify([sort, filters.map(([c, f]) => [c, f.text, [...f.exclude]])]);
     if (rowSig !== this.rowSig) {
       this.rowSig = rowSig;
       let ids = this.baseIds;
       if (filters.length) ids = ids.filter((id) => this.passes(id, filters));
       if (sort) {
-        const keyed = ids.map((id) => [id, sort.col === NUM ? id : this.cell(id, sort.col)] as [number, JVal | number | undefined]);
-        keyed.sort((a, b) => {
+        const s = sort;
+        const keys = s.col === NUM ? null : ids.map((id) => this.val(id, s.col));
+        const order = ids.map((_, k) => k);
+        order.sort((a, b) => {
+          if (!keys) return s.dir * (ids[a] - ids[b]);
           // Missing values stay at the bottom in both directions.
-          const ma = a[1] === undefined;
-          const mb = b[1] === undefined;
+          const ma = keys[a] === undefined;
+          const mb = keys[b] === undefined;
           if (ma !== mb) return ma ? 1 : -1;
-          return sort.dir * compare(a[1] as JVal | undefined, b[1] as JVal | undefined) || a[0] - b[0];
+          return s.dir * compare(keys[a], keys[b]) || ids[a] - ids[b];
         });
-        ids = keyed.map((k) => k[0]);
+        ids = order.map((k) => ids[k]);
       }
       this.rowIds = ids;
     }
@@ -636,10 +764,6 @@ export class GridView implements View {
     const t = e.target as HTMLElement;
     if (t.closest('[data-rz]')) return;
     const fb = t.closest('[data-f]') as HTMLElement | null;
-    if ((fb || t.closest('[data-col]')) && this.heavyOff) {
-      this.app.showBanner(this.heavyNote());
-      return;
-    }
     if (fb) {
       const col = fb.dataset.f as string;
       if (this.fcol === col) this.closeFilter();
@@ -684,7 +808,7 @@ export class GridView implements View {
       this.app.selectRecord(id, how);
     } else {
       this.jsonActive = id;
-      this.paint();
+      this.markRows();
     }
   }
 
@@ -696,9 +820,98 @@ export class GridView implements View {
     const cellEl = t.closest('.gc') as HTMLElement | null;
     const idx = cellEl ? Array.from(cellEl.parentElement!.children).indexOf(cellEl) : -1;
     const col = idx >= 0 ? this.allCols()[idx] : undefined;
+    // A value cell opens the cell editor; the # cell and the others go to the source.
+    if (cellEl && col && this.startEdit(id, col, cellEl)) return;
     const rel = col && col !== NUM ? this.cellPath(id, col) : '';
     const path = this.recordPath(id, rel);
     this.app.post({ type: 'reveal', line: this.app.model.isJsonl ? id : 0, path });
+  }
+
+  // ---------- cell editing ----------
+
+  /**
+   * Opens the cell editor on a value cell. A string cell stays a string; another cell takes a
+   * JSON value (type "text" in quotes to make it a string). Enter writes it, Esc cancels.
+   * Returns false when the cell cannot be edited.
+   */
+  private startEdit(id: number, col: string, cellEl: HTMLElement): boolean {
+    const app = this.app;
+    if (!app.canEditCells || col === NUM || col === OKEY || this.record(id).kind !== 'value') return false;
+    const v = this.cell(id, col);
+    if (v === undefined || isContainer(v)) return false;
+    this.cancelEdit();
+    const host = this.el.getBoundingClientRect();
+    const r = cellEl.getBoundingClientRect();
+    const input = document.createElement('input');
+    input.className = 'gedit';
+    input.spellcheck = false;
+    input.value = typeof v === 'string' ? v : v instanceof RawNum ? v.src : String(v);
+    input.setAttribute('aria-label', t('Edit the value of {0}', this.label(col)));
+    input.style.cssText = `left:${r.left - host.left}px;top:${r.top - host.top}px;width:${Math.max(r.width, 120)}px;height:${r.height}px`;
+    const isString = typeof v === 'string';
+    const original = isString ? JSON.stringify(v) : input.value;
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.cancelEdit();
+        this.scroll.focus();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        let text = isString ? JSON.stringify(input.value) : input.value.trim();
+        try {
+          JSON.parse(text);
+        } catch {
+          // Not JSON: a cell that was not a string takes it as JSON only.
+          input.classList.add('bad');
+          input.title = t('Not a JSON value. Put text in quotes to make it a string.');
+          return;
+        }
+        if (text === original) {
+          this.cancelEdit();
+          return;
+        }
+        if (!isString && /^-?\d/.test(text)) text = text.replace(/\s+/g, '');
+        const rel = decodeKey(this.cellPath(id, col));
+        this.cancelEdit();
+        app.editCell(id, app.model.isJsonl ? rel : this.recordPath(id, this.cellPath(id, col)), text);
+      }
+    });
+    input.addEventListener('blur', () => this.cancelEdit());
+    this.el.appendChild(input);
+    this.editor = input;
+    input.focus();
+    input.select();
+    return true;
+  }
+
+  private cancelEdit(): void {
+    const ed = this.editor;
+    if (!ed) return;
+    this.editor = null;
+    ed.remove();
+  }
+
+  // ---------- export ----------
+
+  /** The rows on screen (after search, filters and sort), for an export. */
+  exportSource(): { ids: number[]; header: string[]; line(id: number): string; cells(id: number): string[] } {
+    this.layout();
+    const m = this.app.model;
+    const cols = this.cols;
+    const root = this.rootValue();
+    const header = cols.map((c) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : keyOf(c)));
+    return {
+      ids: [...this.rowIds],
+      header,
+      line: (id) => {
+        if (m.isJsonl) return m.line(id);
+        if (this.mode === 'object') return compact({ key: this.objKeys[id], value: (root as JObj)[this.objKeys[id]] });
+        const p = this.record(id);
+        return p.kind === 'value' ? compact(p.value) : '';
+      },
+      cells: (id) => cols.map((c) => cellText(this.cell(id, c))),
+    };
   }
 
   // ---------- column filters ----------
@@ -714,7 +927,7 @@ export class GridView implements View {
 
   private passes(id: number, filters: [string, ColFilter][]): boolean {
     for (const [c, f] of filters) {
-      const v = this.cell(id, c);
+      const v = this.val(id, c);
       if (f.exclude.size && f.exclude.has(valueKey(v))) return false;
       if (f.text && !cellText(v).toLowerCase().includes(f.text.toLowerCase())) return false;
     }
@@ -724,10 +937,12 @@ export class GridView implements View {
   /** Distinct values of a column, with counts, among the rows the other filters keep. */
   private valuesOf(col: string): FilterValue[] {
     const others = this.activeFilters(col);
+    // Large files: the list waits for the columns read in the background (the grid paints it then).
+    if (this.heavy && [col, ...others.map(([c]) => c)].some((c) => !this.colCache.has(c))) return [];
     const map = new Map<string, FilterValue>();
     for (const id of this.baseIds) {
       if (others.length && !this.passes(id, others)) continue;
-      const v = this.cell(id, col);
+      const v = this.val(id, col);
       const key = valueKey(v);
       const e = map.get(key);
       if (e) e.n++;
@@ -768,6 +983,7 @@ export class GridView implements View {
     this.fel.setAttribute('aria-label', t('Filter {0}', name));
     this.fel.innerHTML = `
       <div class="gf-title" title="${esc(name)}">${icon('filter', 12)}<span>${esc(name)}</span></div>
+      <div class="gf-stats dim">${statsHtml(this.fvalues)}</div>
       <div class="gf-sort">
         <button class="btn" data-fsort="1">${icon('chev-up', 11)}${t('Sort ascending')}</button>
         <button class="btn" data-fsort="-1">${icon('chev-down', 11)}${t('Sort descending')}</button>
@@ -906,8 +1122,9 @@ export class GridView implements View {
 }
 
 /** Key that groups equal cells in a column filter. Strings and numbers never share a key. */
-function valueKey(v: JVal | undefined): string {
+function valueKey(v: Cell): string {
   if (v === undefined) return MISSING;
+  if (v instanceof Shape) return 'j' + v.text;
   if (v === null) return 'z';
   if (typeof v === 'boolean') return v ? 'b1' : 'b0';
   if (typeof v === 'number' || v instanceof RawNum) return 'n' + plainText(v);
@@ -916,19 +1133,67 @@ function valueKey(v: JVal | undefined): string {
 }
 
 /** Text a column filter searches: the shown text, or compact JSON for objects and arrays. */
-function cellText(v: JVal | undefined): string {
+function cellText(v: Cell): string {
   if (v === undefined) return '';
+  if (v instanceof Shape) return v.text;
   return isContainer(v) ? compact(v) : plainText(v);
 }
 
-function valueLabel(v: JVal | undefined): string {
+/** The type of a cell, for the column statistics. */
+function cellType(v: Cell): string {
+  if (v === undefined) return 'missing';
+  if (v instanceof Shape) return v.arr ? 'array' : 'object';
+  return kindOf(v);
+}
+
+/**
+ * Column statistics from the distinct values and their counts: the types, the number of
+ * distinct values, and min, max and mean of the numbers.
+ */
+function statsHtml(values: FilterValue[]): string {
+  const types = new Map<string, number>();
+  let nums = 0;
+  let sum = 0;
+  let min = Infinity;
+  let max = -Infinity;
+  let shortest = Infinity;
+  let longest = 0;
+  for (const x of values) {
+    const type = cellType(x.v);
+    types.set(type, (types.get(type) ?? 0) + x.n);
+    if (type === 'number') {
+      const n = Number(x.v instanceof RawNum ? x.v.src : x.v);
+      nums += x.n;
+      sum += n * x.n;
+      if (n < min) min = n;
+      if (n > max) max = n;
+    } else if (type === 'string') {
+      const len = (x.v as string).length;
+      if (len < shortest) shortest = len;
+      if (len > longest) longest = len;
+    }
+  }
+  const order = ['number', 'string', 'boolean', 'null', 'object', 'array', 'missing'];
+  const typeText = [...types]
+    .sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+    .map(([type, n]) => `${t(type === 'missing' ? '(missing)' : type)} ${n.toLocaleString()}`)
+    .join(' · ');
+  const lines = [typeText, t('{0} distinct', values.length.toLocaleString())];
+  const fmt = (n: number) => (Number.isInteger(n) ? n.toLocaleString() : n.toLocaleString(undefined, { maximumFractionDigits: 4 }));
+  if (nums) lines.push(t('min {0} · max {1} · mean {2}', fmt(min), fmt(max), fmt(sum / nums)));
+  if (Number.isFinite(shortest)) lines.push(t('length {0}–{1}', shortest.toLocaleString(), longest.toLocaleString()));
+  return lines.map((l) => `<div>${esc(l)}</div>`).join('');
+}
+
+function valueLabel(v: Cell): string {
   if (v === undefined) return t('(missing)');
   if (v === '') return t('(empty string)');
   return cellText(v);
 }
 
-function valueClass(v: JVal | undefined): string {
+function valueClass(v: Cell): string {
   if (v === undefined || v === '') return 'dim';
+  if (v instanceof Shape) return 'tp';
   return isContainer(v) ? 'tp' : primClass(v);
 }
 
@@ -945,22 +1210,23 @@ function chip(v: JVal, key: string, open: boolean): string {
   return `<button class="vchip${open ? ' open' : ''}" data-c="${esc(key)}" title="${t(open ? 'Collapse' : 'Expand')} ${t(kindOf(v))}">${icon(open ? 'chev-down' : 'chev-right', 10)}${summary(v as JObj)}</button>`;
 }
 
-function rank(v: JVal | undefined): number {
+function rank(v: Cell): number {
   if (v === undefined) return 6;
   if (v === null) return 5;
+  if (v instanceof Shape) return 3;
   if (typeof v === 'number' || v instanceof RawNum) return 0;
   if (typeof v === 'string') return 1;
   if (typeof v === 'boolean') return 2;
   return 3;
 }
 
-function compare(a: JVal | undefined, b: JVal | undefined): number {
+function compare(a: Cell, b: Cell): number {
   const ra = rank(a);
   const rb = rank(b);
   if (ra !== rb) return ra - rb;
   if (ra === 0) return Number(a instanceof RawNum ? a.src : a) - Number(b instanceof RawNum ? b.src : b);
   if (ra === 1) return (a as string).localeCompare(b as string);
   if (ra === 2) return Number(a) - Number(b);
-  if (ra === 3) return sizeOf(a as JObj) - sizeOf(b as JObj);
+  if (ra === 3) return (a instanceof Shape ? a.size : sizeOf(a as JObj)) - (b instanceof Shape ? b.size : sizeOf(b as JObj));
   return 0;
 }

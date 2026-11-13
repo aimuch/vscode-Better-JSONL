@@ -87,13 +87,38 @@ jobs:
           path: test-results/
           if-no-files-found: ignore
 
+  # package.json says VS Code 1.85 or newer: the host tests run on that version too.
+  oldest-vscode:
+    name: Extension host on VS Code 1.85
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Extension host E2E on VS Code 1.85.2
+        env:
+          VSCODE_DOWNLOAD: '1'
+          VSCODE_VERSION: '1.85.2'
+        run: xvfb-run -a npm run test:e2e:host
+
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, oldest-vscode]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Publishing to the marketplaces runs only when the repository has these secrets.
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -108,3 +133,11 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Better JSONL $GITHUB_REF_NAME" \
             --generate-notes
+
+      - name: Publish to the Visual Studio Marketplace
+        if: env.VSCE_PAT != ''
+        run: npx --yes @vscode/vsce@3 publish --packagePath dist-vsix/*.vsix
+
+      - name: Publish to Open VSX
+        if: env.OVSX_PAT != ''
+        run: npx --yes ovsx@0 publish dist-vsix/*.vsix -p "$OVSX_PAT"

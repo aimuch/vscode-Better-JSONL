@@ -116,11 +116,12 @@
     },
     /** A large file: "init" without text, then the UTF-8 bytes in "chunk" messages (as the host sends them). */
     async loadLarge(file, bytes, opts = {}) {
-      const isJsonl = /\.(jsonl|ndjson)$/.test(file);
+      const isJsonl = /\.(jsonl|ndjson)(\.gz)?$/.test(file);
       const version = (window.__gen = (window.__gen || 100) + 1);
+      const gzip = /\.gz$/.test(file);
       window.harness.send({
         type: 'init',
-        doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview', large: { bytes: bytes.length }, readOnly: true },
+        doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview', large: { bytes: bytes.length, gzip }, readOnly: opts.readOnly ?? true },
         text: '',
         version,
         config: window.harness.config(opts.config),

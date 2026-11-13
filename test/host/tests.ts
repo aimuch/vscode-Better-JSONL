@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import * as zlib from 'zlib';
 import type { BetterJsonlApi } from '../../src/extension';
 import type { ViewerSession } from '../../src/session';
 import { minifyJson, prettyJson } from '../../src/shared/jsonText';
@@ -474,11 +475,26 @@ describe('Better JSONL · extension host', () => {
       // "Open Preview" again shows the same panel; it does not read the file a second time.
       await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
       assert.strictEqual(api.sessions().filter((x) => x.isLarge).length, 1);
-      // Reload after the file grew.
-      fs.appendFileSync(file.fsPath, '{"id":"last"}\n');
-      await s.handle({ type: 'reload' });
-      r = await s.waitForReport((x) => x.stats.lines === lines + 1 && !x.loading && parsed(x), 120000);
-      assert.strictEqual(r.stats.valid, lines + 1);
+      // Edit a record: the file is written again, the view shows the new line.
+      const first = fs.readFileSync(file.fsPath, 'utf8').slice(0, 200).split('\n')[0];
+      await s.handle({ type: 'editLine', line: 0, original: first, text: '{"id":0,"edited":"名字"}', exact: true });
+      r = await s.waitForReport((x) => x.active === 0 && x.activeText === '{"id":0,"edited":"名字"}' && parsed(x), 60000);
+      assert.strictEqual(fs.readFileSync(file.fsPath, 'utf8').slice(0, 40).split('\n')[0], '{"id":0,"edited":"名字"}');
+      assert.strictEqual(r.stats.valid, lines);
+      // An edit from an old text is refused.
+      await s.handle({ type: 'editLine', line: 1, original: '{"stale":1}', text: '{"x":1}', exact: true });
+      assert.ok(!fs.readFileSync(file.fsPath, 'utf8').slice(0, 400).includes('{"x":1}'));
+      // Follow mode: lines added at the end come in without reading the file again.
+      // (The view sends this when its follow button is pressed; the view part is tested in W42.)
+      await s.handle({ type: 'follow', on: true });
+      fs.appendFileSync(file.fsPath, '{"id":"last"}\n{"id":"after last"}\n');
+      r = await s.waitForReport((x) => x.stats.lines === lines + 2 && parsed(x), 60000);
+      assert.strictEqual(r.stats.valid, lines + 2);
+      assert.strictEqual(s.sentKinds.filter((k) => k === 'init').length, 1, 'no new init: only the new bytes were sent');
+      // A change that is not at the end: follow mode reads the file again.
+      fs.writeFileSync(file.fsPath, '{"id":"short"}\n');
+      r = await s.waitForReport((x) => x.stats.lines === 1 && !x.loading && parsed(x), 60000);
+      assert.strictEqual(r.activeText, '{"id":"short"}');
       // The full view of a large file is the same kind of panel (the custom editor needs a text document).
       await vscode.commands.executeCommand('betterJsonl.openInViewer', file);
       assert.strictEqual(api.sessions().filter((x) => x.isLarge).length, 1);
@@ -593,8 +609,10 @@ describe('Better JSONL · extension host', () => {
     assert.strictEqual(r.stats.lines, 3);
     assert.strictEqual(sent(), 'edit,edit,edit,edit', 'four updates, each one a list of changes');
     assert.strictEqual(s.received.filter((m) => m.type === 'resync').length, 0, 'the view never asked for the whole text');
-    // Undo everything: the view is back at the file.
-    while (doc.isDirty) await vscode.commands.executeCommand('undo');
+    // Back to the file on disk (one edit that replaces the whole text): the view follows.
+    await vscode.window.showTextDocument(doc, { viewColumn: editor.viewColumn });
+    await vscode.commands.executeCommand('workbench.action.files.revert');
+    await waitFor(() => !doc.isDirty, 'document reverted');
     assert.strictEqual(doc.getText(), before);
     r = await inView(2);
     assert.deepStrictEqual([r.stats.lines, r.stats.valid], [3, 3]);
@@ -604,6 +622,85 @@ describe('Better JSONL · extension host', () => {
     await inView(1);
     assert.strictEqual(sent(), 'update');
     await vscode.commands.executeCommand('undo');
+  });
+
+  it('H30 compressed files (.jsonl.gz, .json.gz) open read-only; UTF-16 and other encodings are read as text', async function () {
+    this.timeout(60000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    const files = vscode.workspace.getConfiguration('files');
+    try {
+      const write = (name: string, bytes: Buffer) => {
+        fs.writeFileSync(path.join(dir, name), zlib.gzipSync(bytes));
+        return vscode.Uri.file(path.join(dir, name));
+      };
+      const utf8 = write('a.jsonl.gz', Buffer.from('{"n":"名字"}\n{"n":2}\n{"n":3}\n', 'utf8'));
+      const utf16 = write('b.jsonl.gz', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"n":"ünï 😀"}\r\n{"n":2}\r\n', 'utf16le')]));
+      const latin1 = write('c.json.gz', Buffer.from('{"city":"Montréal"}', 'latin1'));
+      const open = async (uri: vscode.Uri) => {
+        // VS Code has no text view for these files: Better JSONL is their editor.
+        await vscode.commands.executeCommand('vscode.open', uri);
+        const s = await waitFor(() => api.sessions().find((x) => x.isLarge && x.resource?.fsPath === uri.fsPath), `a view of ${path.basename(uri.fsPath)}`, 20000);
+        return { s, r: await s.waitForReport((x) => x.large && !x.loading && parsed(x), 30000) };
+      };
+      let { s, r } = await open(utf8);
+      assert.deepStrictEqual([r.isJsonl, r.stats.lines, r.stats.valid, r.activeText], [true, 3, 3, '{"n":"名字"}']);
+      const before = fs.readFileSync(utf8.fsPath);
+      await s.handle({ type: 'editLine', line: 1, original: '{"n":2}', text: '{"n":20}', exact: true });
+      await settle(300);
+      assert.ok(fs.readFileSync(utf8.fsPath).equals(before), 'a compressed file is not written');
+      ({ r } = await open(utf16));
+      assert.deepStrictEqual([r.stats.valid, r.activeText], [2, '{"n":"ünï 😀"}'], 'a UTF-16 byte order mark is read');
+      await files.update('encoding', 'iso88591', vscode.ConfigurationTarget.Global);
+      ({ s, r } = await open(latin1));
+      assert.deepStrictEqual([r.isJsonl, r.stats.valid], [false, 1]);
+      await s.handle({ type: 'reveal', line: 0, path: [] });
+      // The view's search sees the decoded text.
+      assert.ok((await s.waitForReport((x) => x.stats.valid === 1)).stats.valid === 1);
+      // A .gz file that is not JSON is not opened.
+      const other = vscode.Uri.file(path.join(dir, 'd.txt.gz'));
+      fs.writeFileSync(other.fsPath, zlib.gzipSync(Buffer.from('x')));
+      const n = api.sessions().length;
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', other);
+      await settle(300);
+      assert.strictEqual(api.sessions().length, n);
+    } finally {
+      await files.update('encoding', undefined, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      removeDir(dir);
+    }
+  });
+
+  it('H31 export writes the pieces the view sends; a value of a JSON document is edited in place; two records open in the diff editor', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    try {
+      let s = await customEditorFor('events.jsonl');
+      s.testExportTarget = vscode.Uri.file(path.join(dir, 'out.csv'));
+      await s.handle({ type: 'exportStart', id: 7, format: 'csv', name: 'events-rows', rows: 2 });
+      await s.handle({ type: 'exportData', id: 7, data: '\ufeffid,name\n1,Ada\n', done: false });
+      await s.handle({ type: 'exportData', id: 7, data: '2,"Lin, L."\n', done: true });
+      assert.strictEqual(fs.readFileSync(path.join(dir, 'out.csv'), 'utf8'), '\ufeffid,name\n1,Ada\n2,"Lin, L."\n');
+      // One JSON document: only the span of the value changes.
+      s = await customEditorFor('sample.json');
+      const doc = s.document as vscode.TextDocument;
+      const text = doc.getText();
+      await s.handle({ type: 'editValue', path: ['maintainers', 1, 'name'], version: doc.version, text: '"Lin Q"' });
+      await waitFor(() => doc.getText().includes('"Lin Q"'), 'value written');
+      assert.strictEqual(doc.getText(), text.replace('"name": "Lin"', '"name": "Lin Q"'), 'the rest of the file stays as it is');
+      await s.handle({ type: 'editValue', path: ['version'], version: doc.version - 1, text: '"9"' });
+      await settle(200);
+      assert.ok(!doc.getText().includes('"9"'), 'an edit from an older version is refused');
+      await vscode.commands.executeCommand('undo');
+      // Two records in the diff editor.
+      await s.handle({ type: 'diff', left: { title: 'events.jsonl line 3', text: '{\n  "a": 1\n}\n' }, right: { title: 'events.jsonl line 4', text: '{\n  "a": 2\n}\n' } });
+      const tab = await waitFor(() => {
+        const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        return input instanceof vscode.TabInputTextDiff ? input : undefined;
+      }, 'a diff editor');
+      assert.strictEqual(tab.original.scheme, 'better-jsonl-diff');
+      assert.strictEqual((await vscode.workspace.openTextDocument(tab.modified)).getText(), '{\n  "a": 2\n}\n');
+    } finally {
+      removeDir(dir);
+    }
   });
 
   it('H15 the preview follows the active JSON editor', async () => {

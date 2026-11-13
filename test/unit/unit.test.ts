@@ -4,7 +4,11 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { compactText, minifyJson, prettyJson, splitJsonValues } from '../../src/shared/jsonText';
-import { locatePath } from '../../src/locate';
+import { locatePath, valueSpan } from '../../src/locate';
+import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
+import { diffValues } from '../../src/webview/diff';
+import { csvField, csvRow } from '../../src/webview/exporter';
+import { compactJson, compileJq, compileJsonPath, compileQuery, pathOf } from '../../src/webview/query';
 import { ByteStore, DocModel, K_ERROR, K_UNKNOWN, K_VALUE, lowerBound, patchLines, stepIn, TreeSearch } from '../../src/webview/model';
 import { buildLines, countLines, lineText } from '../../src/webview/views/lines';
 import { childKey, decodeKey, parseJson, RawNum, type JVal } from '../../src/webview/json';
@@ -357,4 +361,198 @@ test('DocModel from records gives the same document as from the text', () => {
   assert.deepEqual(b.editorLines(), lines);
   // A carriage return alone ends a line, as in the text editor.
   assert.equal(new DocModel('{"a":1}\r{"b":2}', true).count, 2);
+});
+
+const DOC = parseJson(`{"store":{"book":[
+  {"category":"reference","author":"Nigel Rees","title":"Sayings of the Century","price":8.95},
+  {"category":"fiction","author":"Evelyn Waugh","title":"Sword of Honour","price":12.99},
+  {"category":"fiction","author":"Herman Melville","title":"Moby Dick","isbn":"0-553-21311-3","price":8.99},
+  {"category":"fiction","author":"J. R. R. Tolkien","title":"The Lord of the Rings","isbn":"0-395-19395-8","price":22.99}],
+  "bicycle":{"color":"red","price":399}},"big":12345678901234567890,"a.b":{"c d":[1,2,3]}}`);
+
+const values = (src: string, doc: JVal = DOC) => compileJsonPath(src).run(doc).outs.map((o) => compactJson(o.v));
+const paths = (src: string, doc: JVal = DOC) => compileJsonPath(src).run(doc).outs.map((o) => JSON.stringify(pathOf(o.p ?? null)));
+const jq = (src: string, doc: JVal = DOC) => compileJq(src).run(doc).outs.map((o) => compactJson(o.v));
+
+test('JSONPath (RFC 9535): names, wildcards, descendants, indexes, slices, unions', () => {
+  assert.deepEqual(values('$.store.book[*].author'), ['"Nigel Rees"', '"Evelyn Waugh"', '"Herman Melville"', '"J. R. R. Tolkien"']);
+  assert.deepEqual(values('$..author').length, 4);
+  assert.deepEqual(values('$.store.*').length, 2);
+  assert.deepEqual(values('$..price'), ['8.95', '12.99', '8.99', '22.99', '399']);
+  assert.deepEqual(values('$..book[2].title'), ['"Moby Dick"']);
+  assert.deepEqual(values('$..book[-1].title'), ['"The Lord of the Rings"']);
+  assert.deepEqual(values('$..book[0,1].price'), ['8.95', '12.99']);
+  assert.deepEqual(values('$..book[:2].price'), ['8.95', '12.99']);
+  assert.deepEqual(values('$..book[::-2].price'), ['22.99', '12.99']);
+  assert.deepEqual(values("$['a.b']['c d'][1:]"), ['2', '3']);
+  assert.deepEqual(values('$.big'), ['12345678901234567890'], 'a big integer keeps its text');
+  assert.deepEqual(paths('$..book[?@.isbn].title'), ['["store","book",2,"title"]', '["store","book",3,"title"]']);
+});
+
+test('JSONPath filters: comparisons, logic, functions, the legacy ?( ) form', () => {
+  assert.deepEqual(values('$..book[?@.price < 10].title'), ['"Sayings of the Century"', '"Moby Dick"']);
+  assert.deepEqual(values('$..book[?(@.price < 10 && @.category == "fiction")].title'), ['"Moby Dick"']);
+  assert.deepEqual(values("$..book[?@.category != 'fiction' || @.price > 20].title"), ['"Sayings of the Century"', '"The Lord of the Rings"']);
+  assert.deepEqual(values('$..book[?!@.isbn].price'), ['8.95', '12.99']);
+  assert.deepEqual(values('$..book[?length(@.title) > 15].price'), ['8.95', '22.99']);
+  assert.deepEqual(values("$..book[?match(@.author, 'J.*')].price"), ['22.99']);
+  assert.deepEqual(values("$..book[?search(@.title, 'of')].price"), ['8.95', '12.99', '22.99']);
+  assert.deepEqual(paths('$.store[?count(@.*) > 2]'), ['["store","book"]'], 'book has 4 members, bicycle 2');
+  assert.deepEqual(values('$..book[?@.price == $.store.book[0].price].title'), ['"Sayings of the Century"']);
+  // A JSON Lines record is the root; "$[?…]" tests the record itself.
+  const p = compileJsonPath('$[?@.level == "warn"]');
+  assert.equal(p.matches({ level: 'warn' }), true);
+  assert.equal(p.matches({ level: 'info' }), false);
+  assert.equal(compileJsonPath('$.user.name').matches({ user: { name: null } }), true, 'existence, even of null');
+  assert.throws(() => compileJsonPath('$..book[?@.price <]'), /column/);
+  assert.throws(() => compileJsonPath('$.a b'), /unexpected/);
+});
+
+test('jq: paths, pipes, select, comparisons, arithmetic, builtins', () => {
+  assert.deepEqual(jq('.store.book[] | select(.price > 10) | .title'), ['"Sword of Honour"', '"The Lord of the Rings"']);
+  assert.deepEqual(jq('.store.book | map(.price) | add'), ['53.92']);
+  assert.deepEqual(jq('[.store.book[].category] | unique'), ['["fiction","reference"]']);
+  assert.deepEqual(jq('.store.book | length'), ['4']);
+  assert.deepEqual(jq('.store.bicycle | keys'), ['["color","price"]']);
+  assert.deepEqual(jq('.store.book[0] | has("isbn"), has("title")'), ['false', 'true']);
+  assert.deepEqual(jq('.store.book[] | select(.author | test("^j"; "i")) | .price'), ['22.99']);
+  assert.deepEqual(jq('.store.book[1:3] | map(.title)'), ['["Sword of Honour","Moby Dick"]']);
+  assert.deepEqual(jq('.store.book[-1].title | ascii_downcase'), ['"the lord of the rings"']);
+  assert.deepEqual(jq('.missing.deeper'), ['null'], '.a on null is null');
+  assert.deepEqual(jq('.missing // "default"'), ['"default"']);
+  assert.deepEqual(jq('if .big then "yes" else "no" end'), ['"yes"']);
+  assert.deepEqual(jq('.big'), ['12345678901234567890']);
+  assert.deepEqual(jq('[..|numbers] | length'), ['9']);
+  assert.deepEqual(jq('{t: .store.bicycle.color, p: .store.bicycle.price}'), ['{"t":"red","p":399}']);
+  assert.deepEqual(jq('.store.book | sort_by(.price) | first.title'), ['"Sayings of the Century"']);
+  assert.deepEqual(jq('[.store.book[] | .price] | min, max'), ['8.95', '22.99']);
+  assert.deepEqual(jq('"a,b" / ","'), ['["a","b"]']);
+  assert.deepEqual(jq('[paths] | length'), [String(jq('[..] | length').map(Number)[0] - 1)]);
+  assert.deepEqual(jq('path(.store.book[0].title)'), ['["store","book",0,"title"]']);
+  assert.deepEqual(jq('.store.book[0] | to_entries[0]'), ['{"key":"category","value":"reference"}']);
+  assert.deepEqual(jq('.store.book[] | .title | select(contains("of"))'), ['"Sayings of the Century"', '"Sword of Honour"', '"The Lord of the Rings"']);
+  assert.deepEqual(jq('[limit(2; .store.book[])] | length'), ['2']);
+  assert.deepEqual(jq('[range(3)]'), ['[0,1,2]']);
+  // Results keep their place in the document.
+  const outs = compileJq('.store.book[] | select(.price > 20)').run(DOC).outs;
+  assert.deepEqual(outs.map((o) => pathOf(o.p ?? null)), [['store', 'book', 3]]);
+  assert.equal(compileJq('.price > 10').run({ price: 12 }).outs[0].p, undefined, 'a computed value has no place');
+});
+
+test('jq: errors, the ? operator, and record matching', () => {
+  assert.throws(() => compileJq('.store.book[0].title.x').run(DOC), /cannot index string/);
+  assert.deepEqual(jq('[.store.book[].title.x?]'), ['[]']);
+  assert.throws(() => compileJq('.a |'), /ends too soon/);
+  assert.throws(() => compileJq('.a as $x | $x'), /not supported/);
+  assert.throws(() => compileJq('.a |= 1'), /assignment/);
+  assert.throws(() => compileJq('nosuch(1)'), /unknown function nosuch\/1/);
+  const p = compileJq('.level == "warn" and .ms > 100');
+  assert.deepEqual([p.matches({ level: 'warn', ms: 200 }), p.matches({ level: 'warn', ms: 50 }), p.matches('text')], [true, false, false]);
+  assert.equal(compileJq('select(.user.name | startswith("A"))').matches({ user: { name: 'Ada' } }), true);
+  assert.throws(() => compileJq('.tags | index("x")'), /unknown function index\/1/, 'an unknown function is an error before the search runs');
+});
+
+test('compileQuery: what is a query, and what is text', () => {
+  assert.equal(compileQuery('timeout').program, undefined);
+  assert.equal(compileQuery('length of stay').program, undefined, 'a word that is also a function is text');
+  assert.equal(compileQuery('.level == "warn"').program?.kind, 'jq');
+  assert.equal(compileQuery('select(.a)').program?.kind, 'jq');
+  assert.equal(compileQuery('$..name').program?.kind, 'jsonpath');
+  assert.match(compileQuery('.a ==').error ?? '', /^jq: /);
+  assert.match(compileQuery('$[?').error ?? '', /^JSONPath: /);
+});
+
+/** The bytes of `text`, cut at random places (also inside multi-byte characters and escapes). */
+function pieces(text: string, r: () => number, max: number): Uint8Array[] {
+  const bytes = encode(text);
+  const out: Uint8Array[] = [];
+  for (let p = 0; p < bytes.length; ) {
+    const n = 1 + Math.floor(r() * max);
+    out.push(bytes.slice(p, p + n));
+    p += n;
+  }
+  return out;
+}
+
+test('parseJsonBytes gives what JSON.parse gives, for any cuts between pieces', () => {
+  const r = rng(2024);
+  for (let i = 0; i < 2000; i++) {
+    const text = randomJson(r);
+    const want = parseJson(text);
+    for (const max of [1, 3, 64, 100000]) assert.deepEqual(parseJsonBytes(pieces(text, r, max)), want, `${JSON.stringify(text)} in pieces of up to ${max}`);
+  }
+  // Long strings, escapes and non-ASCII across pieces; a byte order mark; a key named __proto__.
+  const long = JSON.stringify({ s: 'é😀名'.repeat(500) + '\\n"x"', ['__proto__']: { a: 1 } });
+  const got = parseJsonBytes([new Uint8Array([0xef, 0xbb, 0xbf]), ...pieces(long, r, 7)]) as { s: string; __proto__: unknown };
+  assert.equal(got.s, JSON.parse(long).s);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(got, '__proto__')?.value, { a: 1 });
+  assert.equal(Object.getPrototypeOf(got), Object.prototype);
+  // Deep nesting does not overflow the call stack.
+  const deep = '['.repeat(100000) + ']'.repeat(100000);
+  let v = parseJsonBytes([encode(deep)]) as unknown[];
+  for (let d = 1; d < 100000; d++) v = v[0] as unknown[];
+  assert.deepEqual(v, []);
+  for (const bad of ['{"a":}', '[1,]', '{"a" 1}', 'tru', '"open', '01', '[1] x', '']) {
+    assert.throws(() => parseJsonBytes([encode(bad)]), ByteJsonError, bad);
+  }
+});
+
+test('diffValues: added, removed and changed members, in document order', () => {
+  const a = { id: 1, user: { name: 'Ada', roles: ['a', 'b'] }, gone: true, big: parseJson('12345678901234567890') as JVal };
+  const b = { id: 2, user: { name: 'Ada', roles: ['a'], age: 3 }, big: parseJson('12345678901234567890') as JVal, tags: [] };
+  const { rows, more } = diffValues(a, b);
+  assert.equal(more, false);
+  assert.deepEqual(
+    rows.map((d) => [d.kind, d.path.join('.')]),
+    [
+      ['changed', 'id'],
+      ['removed', 'user.roles.1'],
+      ['added', 'user.age'],
+      ['removed', 'gone'],
+      ['added', 'tags'],
+    ],
+  );
+  assert.deepEqual(diffValues({ a: [1] }, { a: { 0: 1 } }).rows.map((d) => d.kind), ['changed'], 'array to object is one change');
+  assert.deepEqual(diffValues(a, a).rows, []);
+  assert.equal(diffValues(Array.from({ length: 50 }, (_, i) => i), [], 10).more, true);
+});
+
+test('CSV fields are quoted only when they must be', () => {
+  assert.equal(csvRow(['a', 'b c', '', 'x,y', 'say "hi"', 'two\nlines', ' pad', '名字']), 'a,b c,,"x,y","say ""hi""","two\nlines"," pad",名字');
+  assert.equal(csvField('plain'), 'plain');
+});
+
+test('valueSpan: the value only, without its key; the last of two equal keys', () => {
+  const line = '{"a":1,"u":{"n":"Ada","n":"Lin"},"t":[1, 2]}';
+  const at = (path: (string | number)[]) => {
+    const s = valueSpan(line, path);
+    return s && line.slice(s.offset, s.offset + s.length);
+  };
+  assert.deepEqual([at(['a']), at(['u', 'n']), at(['t', 1]), at(['x'])], ['1', '"Lin"', '2', undefined]);
+});
+
+test('a large file: an edited line, and bytes added at the end', () => {
+  const r = rng(8);
+  const text = '{"a":1}\n{"bad"\n{"c":3';
+  const store = new ByteStore();
+  for (const p of pieces(text, r, 4)) store.append(p, false);
+  store.append(new Uint8Array(0), true);
+  const m = new DocModel(store, true);
+  m.parseSome(1000);
+  assert.deepEqual([m.count, m.valid, m.errors, store.openEnd], [3, 1, 2, true]);
+  // The invalid line is fixed (as the host wrote it on disk).
+  m.replaceLine(1, '{"b":2,"名":"ü"}');
+  m.parseSome(1000);
+  assert.deepEqual([m.valid, m.errors, m.line(1), m.bytes], [2, 1, '{"b":2,"名":"ü"}', text.length + encode('{"b":2,"名":"ü"}').length - '{"bad"'.length]);
+  // The last line had no line end: new bytes go on with it, then new lines follow.
+  m.append(encode(',"d":4}\n{"e":5}\n'));
+  m.parseSome(1000);
+  assert.deepEqual([m.count, m.valid, m.errors, m.line(2), m.line(3)], [4, 4, 0, '{"c":3,"d":4}', '{"e":5}']);
+  assert.deepEqual(m.columns, ['a', 'b', '名', 'c', 'd', 'e']);
+});
+
+test('DocModel.fromValue: one JSON value parsed from bytes', () => {
+  const m = DocModel.fromValue({ rows: [1, 2] }, 1234);
+  assert.deepEqual([m.isJsonl, m.count, m.valid, m.blank, m.bytes, m.complete], [false, 1, 1, 0, 1234, true]);
+  assert.deepEqual(m.value(0), { rows: [1, 2] });
 });

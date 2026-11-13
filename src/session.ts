@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { isJsonlDocument, isJsonlPath, readConfig, syncSelectionEnabled } from './config';
-import { locatePath } from './locate';
+import { compare, encodingFor, fileState, innerName, LineConflict, readUtf8, replaceLine, type FileState } from './largeFile';
+import { locatePath, valueSpan } from './locate';
 import { t } from './shared/i18n';
 import { errorMessage, minifyJson } from './shared/jsonText';
 import { SETTING_KEYS, type HostMessage, type JsonPath, type RenderReport, type SettingKey, type TextChange, type WebviewMessage } from './shared/protocol';
@@ -14,15 +15,24 @@ type Waiter = { pred: (r: RenderReport) => boolean; resolve: (r: RenderReport) =
 export interface SessionEnv {
   extensionUri: vscode.Uri;
   extensionId: string;
+  /** Opens two texts in the VS Code diff editor. */
+  showDiff(left: { title: string; text: string }, right: { title: string; text: string }): Promise<void>;
   /** True in the E2E tests: the session keeps the messages and render reports the tests read. */
   testMode: boolean;
 }
 
 /** What a view shows: a text document, or a file too large for VS Code to give to an extension. */
-export type Target = { doc: vscode.TextDocument } | { uri: vscode.Uri; bytes: number };
+export type Target = { doc: vscode.TextDocument } | { uri: vscode.Uri; bytes: number; gzip?: boolean };
 
-/** A large file goes to the webview in pieces of this size. */
-const CHUNK = 4 * 1024 * 1024;
+/** A file that VS Code does not give to extensions (too large, or compressed): read from disk. */
+interface Large {
+  bytes: number;
+  gzip: boolean;
+  encoding: string;
+  /** Size, time and last bytes of the file when it was read: a file that only grew can be followed. */
+  state?: FileState;
+  follow: boolean;
+}
 const MAX_SYNC_LINES = 2000;
 /** More changes or more new text than this between two updates: the whole text is sent instead. */
 const MAX_EDITS = 500;
@@ -58,7 +68,13 @@ export class ViewerSession implements vscode.Disposable {
   private uri: vscode.Uri | undefined;
   private doc: vscode.TextDocument | undefined;
   /** Set when the file is streamed from disk (read-only). */
-  private large: { bytes: number } | undefined;
+  private large: Large | undefined;
+  private appending = false;
+  private appendAgain = false;
+  /** Exports in progress, by id: where the text goes. */
+  private readonly exports = new Map<number, { write(data: string): Promise<void>; finish(): Promise<void>; uri: vscode.Uri; rows: number }>();
+  /** The E2E tests set this: the export goes there, with no save dialog. */
+  testExportTarget: vscode.Uri | undefined;
   /** What the webview shows the document as. The webview decides (a .json file can hold JSON Lines). */
   private jsonl = false;
   private ready = false;
@@ -158,6 +174,12 @@ export class ViewerSession implements vscode.Disposable {
     return !!this.large;
   }
 
+  /** Large files that cannot be written: compressed, not UTF-8, or not on a local disk. */
+  private get readOnly(): boolean {
+    const large = this.large;
+    return !!large && (large.gzip || large.encoding !== 'utf-8' || this.uri?.scheme !== 'file');
+  }
+
   bind(target: Target): void {
     if ('doc' in target) {
       if (this.doc === target.doc && !this.large) return;
@@ -168,8 +190,9 @@ export class ViewerSession implements vscode.Disposable {
     } else {
       this.doc = undefined;
       this.uri = target.uri;
-      this.large = { bytes: target.bytes };
-      this.jsonl = isJsonlPath(target.uri.path);
+      const gzip = !!target.gzip;
+      this.large = { bytes: target.bytes, gzip, encoding: encodingFor(target.uri), follow: this.large?.follow ?? false };
+      this.jsonl = isJsonlPath(gzip ? innerName(target.uri.path) : target.uri.path);
     }
     this.selfOpened = false;
     this.lastReport = undefined;
@@ -255,7 +278,7 @@ export class ViewerSession implements vscode.Disposable {
         if (this.uri !== uri) return;
         if (this.large) {
           clearTimeout(this.noticeTimer);
-          this.noticeTimer = setTimeout(() => this.post({ type: 'notice', message: t('The file changed on disk.'), action: 'reload' }), 500);
+          this.noticeTimer = setTimeout(() => void this.onLargeChanged(), 300);
         } else if (!this.doc || this.doc.isClosed) void this.reopen();
       };
       w.onDidChange(changed);
@@ -279,7 +302,7 @@ export class ViewerSession implements vscode.Disposable {
       const generation = ++this.generation;
       this.post({
         type: 'init',
-        doc: { ...info, languageId: this.jsonl ? 'jsonl' : 'json', isJsonl: this.jsonl, large: { bytes: this.large.bytes }, readOnly: true },
+        doc: { ...info, languageId: this.jsonl ? 'jsonl' : 'json', isJsonl: this.jsonl, large: { bytes: this.large.bytes, gzip: this.large.gzip }, readOnly: this.readOnly },
         text: '',
         version: generation,
         config: readConfig(),
@@ -304,36 +327,83 @@ export class ViewerSession implements vscode.Disposable {
     if (editor) this.sendSelection(editor.selections);
   }
 
-  /** Sends a large file as "chunk" messages. Each one waits for the one before, so the webview is not flooded. */
+  /**
+   * Sends a large file as "chunk" messages (UTF-8). Each one waits for the one before, so the
+   * webview is not flooded. Only the bytes up to the size it had at the start are read: the
+   * rest is new, and follow mode adds it.
+   */
   private async stream(uri: vscode.Uri, generation: number): Promise<void> {
-    const current = () => !this.disposed && generation === this.generation;
-    const send = (data: Uint8Array, done: boolean) => this.panel.webview.postMessage({ type: 'chunk', version: generation, data, done } satisfies HostMessage);
+    const large = this.large;
+    if (!large) return;
+    const current = () => !this.disposed && generation === this.generation && this.large === large;
     try {
-      if (uri.scheme === 'file') {
-        const file = await fs.promises.open(uri.fsPath, 'r');
-        try {
-          for (let pos = 0; current(); ) {
-            const buf = new Uint8Array(CHUNK);
-            const { bytesRead } = await file.read(buf, 0, CHUNK, pos);
-            if (!current()) return;
-            pos += bytesRead;
-            const done = bytesRead < CHUNK;
-            await send(done ? buf.slice(0, bytesRead) : buf, done);
-            if (done) return;
-          }
-        } finally {
-          await file.close();
-        }
-      } else {
-        const all = await vscode.workspace.fs.readFile(uri);
-        for (let pos = 0; current(); pos += CHUNK) {
-          const done = pos + CHUNK >= all.length;
-          await send(all.slice(pos, pos + CHUNK), done);
-          if (done) return;
-        }
+      const state = uri.scheme === 'file' && !large.gzip ? await fileState(uri.fsPath) : undefined;
+      let prev: { data: Uint8Array; read: number } | undefined;
+      for await (const piece of readUtf8(uri, { gzip: large.gzip, encoding: large.encoding, to: state?.size })) {
+        if (!current()) return;
+        if (prev) await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev.data, done: false, read: prev.read } satisfies HostMessage);
+        prev = piece;
       }
+      if (!current()) return;
+      large.state = state;
+      await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev?.data ?? new Uint8Array(0), done: true, read: prev?.read ?? 0 } satisfies HostMessage);
     } catch (e) {
       if (current()) this.post({ type: 'notice', message: t('Better JSONL could not read the file: {0}', errorMessage(e)) });
+    }
+  }
+
+  /** The file of a large view changed on disk. */
+  private async onLargeChanged(): Promise<void> {
+    const large = this.large;
+    const uri = this.uri;
+    if (!large || !uri) return;
+    if (!large.state || uri.scheme !== 'file') {
+      this.post({ type: 'notice', message: t('The file changed on disk.'), action: 'reload' });
+      return;
+    }
+    let how: 'same' | 'grew' | 'changed';
+    try {
+      how = await compare(uri.fsPath, large.state);
+    } catch {
+      return;
+    }
+    if (how === 'same') return;
+    if (how === 'grew') {
+      if (large.follow) await this.appendNew();
+      else this.post({ type: 'notice', message: t('New lines were added to the file.'), action: 'append' });
+      return;
+    }
+    if (large.follow) await this.reload();
+    else this.post({ type: 'notice', message: t('The file changed on disk.'), action: 'reload' });
+  }
+
+  /** Sends the bytes that were added at the end of a large file. */
+  private async appendNew(): Promise<void> {
+    if (this.appending) {
+      this.appendAgain = true;
+      return;
+    }
+    this.appending = true;
+    try {
+      do {
+        this.appendAgain = false;
+        const large = this.large;
+        const uri = this.uri;
+        if (!large?.state || !uri || this.disposed) return;
+        if ((await compare(uri.fsPath, large.state)) !== 'grew') return;
+        const generation = this.generation;
+        const now = await fileState(uri.fsPath);
+        for await (const piece of readUtf8(uri, { gzip: false, encoding: large.encoding, from: large.state.size, to: now.size })) {
+          if (this.disposed || generation !== this.generation || this.large !== large) return;
+          if (piece.data.length) await this.panel.webview.postMessage({ type: 'append', version: generation, data: piece.data } satisfies HostMessage);
+        }
+        large.state = now;
+        large.bytes = now.size;
+      } while (this.appendAgain);
+    } catch (e) {
+      this.post({ type: 'notice', message: t('Better JSONL could not read the file: {0}', errorMessage(e)) });
+    } finally {
+      this.appending = false;
     }
   }
 
@@ -485,7 +555,28 @@ export class ViewerSession implements vscode.Disposable {
           await this.revealPath(m.line, m.path);
           break;
         case 'editLine':
-          await this.editLine(m.line, m.original, m.text);
+          await this.editLine(m.line, m.original, m.text, !!m.exact);
+          break;
+        case 'editValue':
+          await this.editValue(m.path, m.version, m.text);
+          break;
+        case 'follow':
+          if (this.large) {
+            this.large.follow = m.on;
+            if (m.on) await this.onLargeChanged();
+          }
+          break;
+        case 'loadAppended':
+          await this.appendNew();
+          break;
+        case 'exportStart':
+          await this.exportStart(m.id, m.format, m.name, m.rows);
+          break;
+        case 'exportData':
+          await this.exportData(m.id, m.data, m.done);
+          break;
+        case 'diff':
+          await this.env.showDiff(m.left, m.right);
           break;
         case 'copy':
           await vscode.env.clipboard.writeText(m.text);
@@ -522,7 +613,7 @@ export class ViewerSession implements vscode.Disposable {
   /** Reads a large file from disk again. */
   private async reload(): Promise<void> {
     if (!this.large || !this.uri) return;
-    this.large = { bytes: (await vscode.workspace.fs.stat(this.uri)).size };
+    this.large = { ...this.large, bytes: (await vscode.workspace.fs.stat(this.uri)).size, state: undefined };
     this.sendInit();
   }
 
@@ -566,29 +657,133 @@ export class ViewerSession implements vscode.Disposable {
     }
   }
 
-  private async editLine(line: number, original: string, text: string): Promise<void> {
+  private async editLine(line: number, original: string, text: string, exact: boolean): Promise<void> {
     const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
-    if (this.large) return fail(t('This file is read-only here: it is too large for VS Code to edit through an extension.'));
+    try {
+      JSON.parse(text);
+    } catch (e) {
+      return fail(errorMessage(e));
+    }
+    const out = exact ? text : minifyJson(text);
+    if (/[\r\n]/.test(out)) return fail(t('A record must stay on one line.'));
+    if (this.large) return this.editLargeLine(line, original, out);
     // The live document: the check below must see what is in the file now.
     const doc = await this.liveDoc();
     if (!doc) return fail(t('No document.'));
     if (line >= doc.lineCount || doc.lineAt(line).text !== original) {
       return fail(t('Line {0} changed after the edit started. Nothing was written.', line + 1));
     }
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, doc.lineAt(line).range, out);
+    const ok = await vscode.workspace.applyEdit(edit);
+    this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.') });
+  }
+
+  /**
+   * A record of a large file: the line is replaced on disk (the file is written again).
+   * It works when the file is as the view read it and the line still has the text the edit started from.
+   */
+  private async editLargeLine(line: number, original: string, text: string): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
+    const large = this.large;
+    const uri = this.uri;
+    if (!large || !uri) return;
+    if (this.readOnly) return fail(t('This file is read-only here (compressed, not UTF-8, or not on this computer).'));
+    if (!large.state || (await compare(uri.fsPath, large.state)) !== 'same') return fail(t('The file changed on disk. Reload it, then edit again.'));
+    try {
+      large.state = await replaceLine(uri.fsPath, line, original, text);
+      large.bytes = large.state.size;
+    } catch (e) {
+      return fail(e instanceof LineConflict ? t('Line {0} changed after the edit started. Nothing was written.', line + 1) : errorMessage(e));
+    }
+    this.post({ type: 'editResult', ok: true, line, text });
+  }
+
+  /**
+   * One JSON document: the value at `path` gets the JSON `text`. Only that span of the file
+   * changes, so the rest stays as it is (spacing, comments, number text).
+   */
+  private async editValue(jsonPath: JsonPath, version: number, text: string): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
+    if (this.large) return fail(t('This file is read-only here: open it as text to edit it.'));
     try {
       JSON.parse(text);
     } catch (e) {
       return fail(errorMessage(e));
     }
+    const doc = await this.liveDoc();
+    if (!doc) return fail(t('No document.'));
+    if (doc.version !== version) return fail(t('The document changed after the edit started. Nothing was written.'));
+    const span = valueSpan(doc.getText(), jsonPath);
+    if (!span) return fail(t('The value is no longer in the document.'));
     const edit = new vscode.WorkspaceEdit();
-    edit.replace(doc.uri, doc.lineAt(line).range, minifyJson(text));
+    edit.replace(doc.uri, new vscode.Range(doc.positionAt(span.offset), doc.positionAt(span.offset + span.length)), text);
     const ok = await vscode.workspace.applyEdit(edit);
     this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.') });
+  }
+
+  /** Export: asks where to save, then opens the file for the pieces that follow. */
+  private async exportStart(id: number, format: 'jsonl' | 'csv', name: string, rows: number): Promise<void> {
+    const dir = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
+    const target =
+      this.testExportTarget ??
+      (await vscode.window.showSaveDialog({
+        defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
+        filters: format === 'csv' ? { CSV: ['csv'] } : { 'JSON Lines': ['jsonl', 'ndjson'] },
+      }));
+    if (!target) {
+      this.post({ type: 'exportReady', id, ok: false });
+      return;
+    }
+    if (target.scheme === 'file') {
+      const fh = await fs.promises.open(target.fsPath, 'w');
+      this.exports.set(id, {
+        uri: target,
+        rows,
+        write: async (data) => {
+          await fh.write(data, null, 'utf8');
+        },
+        finish: () => fh.close(),
+      });
+    } else {
+      const parts: Buffer[] = [];
+      this.exports.set(id, {
+        uri: target,
+        rows,
+        write: async (data) => {
+          parts.push(Buffer.from(data, 'utf8'));
+        },
+        finish: () => Promise.resolve(vscode.workspace.fs.writeFile(target, Buffer.concat(parts))),
+      });
+    }
+    this.post({ type: 'exportReady', id, ok: true });
+  }
+
+  private async exportData(id: number, data: string, done: boolean): Promise<void> {
+    const e = this.exports.get(id);
+    if (!e) return;
+    try {
+      if (data) await e.write(data);
+      if (!done) return;
+      this.exports.delete(id);
+      await e.finish();
+      const name = path.posix.basename(e.uri.path);
+      this.post({ type: 'exportDone', id, ok: true, message: t('Saved {0} rows to {1}.', e.rows.toLocaleString(), name) });
+    } catch (err) {
+      this.exports.delete(id);
+      await e.finish().catch(() => undefined);
+      this.post({ type: 'exportDone', id, ok: false, message: t('The export failed: {0}', errorMessage(err)) });
+    }
   }
 
   async openAsText(): Promise<void> {
     const uri = this.uri;
     if (!uri) return;
+    // VS Code shows a compressed file as binary data: there is no text to open.
+    if (this.large?.gzip) {
+      void vscode.window.showInformationMessage(t('Better JSONL: a compressed file has no text view.'));
+      return;
+    }
     if (this.host === 'editor') {
       await vscode.commands.executeCommand('vscode.openWith', uri, 'default', this.panel.viewColumn);
       this.panel.dispose();

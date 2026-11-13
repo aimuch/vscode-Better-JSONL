@@ -29,8 +29,19 @@ const sourceTextSupported = (() => {
  */
 const LONG_NUMBER = /(?:^|[\s:,[])-?\d{16,}|\d\.\d{15,}/;
 
+/** Digits in a number's text. A number with fewer than 16 cannot lose precision. */
+function digitCount(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 48 && c <= 57) n++;
+    else if (c === 101 || c === 69) break;
+  }
+  return n;
+}
+
 function keepSource(_k: string, v: unknown, ctx?: { source?: string }): unknown {
-  if (typeof v === 'number' && ctx && ctx.source !== undefined && !Number.isSafeInteger(v) && String(v) !== ctx.source) {
+  if (typeof v === 'number' && ctx && ctx.source !== undefined && !Number.isSafeInteger(v) && String(v) !== ctx.source && digitCount(ctx.source) >= 16) {
     return new RawNum(ctx.source);
   }
   return v;

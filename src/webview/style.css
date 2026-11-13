@@ -727,7 +727,8 @@ mark {
 
 /* ---------- record editor ---------- */
 
-.editpanel {
+.editpanel ,
+.comparepanel  {
   position: absolute;
   left: 12px;
   right: 12px;
@@ -759,7 +760,8 @@ mark {
   font-size: 12px;
 }
 
-.editpanel textarea {
+.editpanel textarea ,
+.comparepanel textarea  {
   flex: 1 1 auto;
   min-height: 160px;
   height: 320px;
@@ -775,7 +777,8 @@ mark {
   tab-size: 2;
 }
 
-.editpanel textarea:focus {
+.editpanel textarea:focus ,
+.comparepanel textarea:focus  {
   border-color: var(--accent);
 }
 
@@ -1674,4 +1677,120 @@ body.wrap .insp-val {
 
 .settings-link:hover {
   text-decoration: underline;
+}
+
+/* ---------- 0.5: cell editor, export menu, compare panel, column statistics ---------- */
+
+.gedit {
+  position: absolute;
+  z-index: 6;
+  box-sizing: border-box;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  background: var(--ctl);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--mono-size);
+  outline: none;
+}
+
+.gedit.bad {
+  border-color: var(--err);
+}
+
+.menu {
+  position: absolute;
+  top: 40px;
+  right: 12px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  min-width: 260px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--ctl));
+  box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+}
+
+.menu[hidden],
+.comparepanel[hidden] {
+  display: none;
+}
+
+.menu-item {
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover,
+.menu-item:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.comparepanel {
+  max-height: 70%;
+}
+
+.cmp-scroll {
+  overflow: auto;
+  min-height: 0;
+}
+
+.cmp {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.cmp th,
+.cmp td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  word-break: break-all;
+}
+
+.cmp-added td:nth-child(3),
+.cmp-removed td:nth-child(2),
+.cmp-changed td:nth-child(2),
+.cmp-changed td:nth-child(3) {
+  background: var(--vscode-diffEditor-insertedTextBackground, rgba(155, 185, 85, 0.2));
+}
+
+.cmp-removed td:nth-child(2),
+.cmp-changed td:nth-child(2) {
+  background: var(--vscode-diffEditor-removedTextBackground, rgba(255, 0, 0, 0.2));
+}
+
+.gf-stats {
+  padding: 2px 4px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.gmini {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 180px;
+  height: 120px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--ctl));
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.25));
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.gmini[hidden] {
+  display: none;
 }

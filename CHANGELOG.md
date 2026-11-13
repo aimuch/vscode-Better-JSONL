@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+- **jq and JSONPath** in the search box: a search that starts with `.` is a jq filter, one that starts with `$` is a JSONPath (RFC 9535). On JSON Lines they select records; in one JSON document `Enter` goes to each result, and a computed result shows in the status bar.
+- **Large files**: a record of a large UTF-8 JSON Lines file can be edited (the line is replaced on disk). Follow mode adds new lines at the end of a growing file without reading it again. Files in other encodings (a UTF-16 byte order mark, or `files.encoding`) are read. One JSON value above about 512 MB is parsed from the bytes.
+- **Compressed files**: `.jsonl.gz`, `.ndjson.gz` and `.json.gz` open in Better JSONL, read-only.
+- **Grid**: sorting and column filters work on large files of any length (the columns are read in the background). The filter popup shows column statistics. Double-click a value to edit it in place.
+- **Follow** button (JSON Lines): the view stays at the last line while lines are added.
+- **Export** the lines or rows on screen, or the selected lines, as JSON Lines or CSV.
+- **Compare** two selected lines field by field, or in the VS Code diff editor.
+- **Graph overview** in the corner when the graph does not fit the view.
+- Fixed: in the Grid, a double-click on a row that was not the current one did nothing (the first click painted the rows again).
+- CI also runs the host tests on VS Code 1.85, and can publish to the Visual Studio Marketplace and Open VSX (when the repository has the tokens).
+
 ## 0.4.0
 
 - **Large files.** A file above 50 MB (the size VS Code stops giving to extensions) now opens read-only: it is read from disk in chunks and shows while it loads. Lines are decoded and parsed only when they are needed, and search runs in the background. Measured: a 300 MB JSON Lines file shows its first rows in 0.3 s and is fully scanned in about 8 s; a 300 MB JSON array opens folded after about 2 s of parsing.

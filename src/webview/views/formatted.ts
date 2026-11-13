@@ -3,7 +3,7 @@ import type { RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
 import { childKey, decodeKey, esc, highlightRaw } from '../json';
 import { icon } from '../icons';
-import { K_ERROR, K_VALUE, stepIn } from '../model';
+import { isTextQuery, K_ERROR, K_VALUE, stepIn } from '../model';
 import { buildLines, countLines, isFolded, lineHtml, lineText, type PLine } from './lines';
 
 /** Browsers cap element height near 33.5M px. Above this the scroll space is scaled. */
@@ -446,7 +446,7 @@ export class FormattedView implements View {
     this.rows.innerHTML = html.join('');
     this.rendered = html.length;
     if (focus) this.refocus(focus);
-    if (app.query.text && !app.query.path) this.markMatches(app.query.text);
+    if (isTextQuery(app.query)) this.markMatches(app.query.text);
     if (this.rowPx && !this.remeasuring && this.measureRows()) {
       // Keep the row at the top of the screen still while the heights above it change.
       const anchor = this.rowAt(virtTop);

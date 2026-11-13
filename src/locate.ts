@@ -29,6 +29,13 @@ function nodeAt(root: Node, path: JsonPath): Node | undefined {
   return node;
 }
 
+/** The span of the value at `path` (without its key). Undefined when it is not there. */
+export function valueSpan(text: string, path: JsonPath): TextSpan | undefined {
+  const root = parseTree(text, [], { allowTrailingComma: true, disallowComments: false });
+  const node = root && nodeAt(root, path);
+  return node ? { offset: node.offset, length: node.length } : undefined;
+}
+
 /**
  * Finds the text span of `path` inside `text`. For an object member the span
  * starts at the key, so the selection shows `"key": value`.

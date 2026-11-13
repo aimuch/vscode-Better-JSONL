@@ -15,11 +15,12 @@ await mkdir(join(root, 'test-results'), { recursive: true });
 
 const installed = '/Applications/Visual Studio Code.app/Contents/MacOS/Code';
 // VSCODE_DOWNLOAD=1 always downloads a VS Code (CI does this, so runs do not depend on the machine).
-let vscodeExecutablePath = process.env.VSCODE_PATH || (process.env.VSCODE_DOWNLOAD !== '1' && existsSync(installed) ? installed : undefined);
+let vscodeExecutablePath = process.env.VSCODE_PATH || (process.env.VSCODE_DOWNLOAD !== '1' && !process.env.VSCODE_VERSION && existsSync(installed) ? installed : undefined);
 if (!vscodeExecutablePath) {
   // CI machines have no VS Code: download one. On macOS, VS Code now names its binary
   // "Code", while @vscode/test-electron 2.x still returns ".../MacOS/Electron".
-  const downloaded = await downloadAndUnzipVSCode('stable');
+  // VSCODE_VERSION picks a version (CI also tests the oldest one package.json allows).
+  const downloaded = await downloadAndUnzipVSCode(process.env.VSCODE_VERSION || 'stable');
   vscodeExecutablePath = existsSync(downloaded) ? downloaded : downloaded.replace(/\/Electron$/, '/Code');
 }
 

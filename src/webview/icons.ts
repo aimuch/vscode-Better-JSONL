@@ -17,6 +17,8 @@ const P: Record<string, string> = {
   download: '<path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/>',
   'file-code': '<path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z"/><path d="M9.5 1.5V5H13M6.5 8.5 5 10l1.5 1.5M9.5 8.5 11 10l-1.5 1.5"/>',
   plus: '<path d="M3 8h10M8 3v10"/>',
+  follow: '<path d="M2 4h7M2 8h7M2 12h5"/><path d="M12.5 3v9M10 9.5l2.5 2.5 2.5-2.5"/>',
+  compare: '<rect x="1.5" y="2.5" width="5" height="11" rx="1"/><rect x="9.5" y="2.5" width="5" height="11" rx="1"/><path d="M3 6h2M3 9h2M11 6h2M11 9h2"/>',
   minus: '<path d="M3 8h10"/>',
   fit: '<path d="M2 5.5V2h3.5M10.5 2H14v3.5M14 10.5V14h-3.5M5.5 14H2v-3.5"/>',
   close: '<path d="M4 4l8 8M12 4l-8 8"/>',

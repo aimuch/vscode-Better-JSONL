@@ -1,6 +1,7 @@
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { errorMessage, errorOffset, stripBom } from '../shared/jsonText';
 import type { JsonPath, TextChange } from '../shared/protocol';
+import { compileQuery, type Program } from './query';
 import { childKey, getAt, isContainer, isObj, parseJson, parsePath, plainText, primText, RawNum, stringifyPretty, type JObj, type JVal } from './json';
 
 export type Parsed =
@@ -77,6 +78,10 @@ export class ByteStore implements LineStore {
   private nStarts = 1;
   private lines = 0;
   private bomChecked = false;
+  /** Lines written by the view (record edits of a large file), by line number. */
+  private overlay: Map<number, Uint8Array> | undefined;
+  /** Bytes the overlay adds to the file (it can be less than 0). */
+  edited = 0;
   private readonly decoder = new TextDecoder('utf-8');
   /** Bytes received. */
   total = 0;
@@ -139,8 +144,28 @@ export class ByteStore implements LineStore {
     return out;
   }
 
+  /** True when the file is complete and its last line has no line end (more bytes would extend that line). */
+  get openEnd(): boolean {
+    return this.done && this.starts[this.nStarts - 1] < this.total;
+  }
+
+  /** The pieces received, in order (for a parser that reads bytes). */
+  chunkList(): readonly Uint8Array[] {
+    return this.chunks;
+  }
+
+  /** Line i now has this text (the file was changed on disk to match). */
+  replaceLine(i: number, text: string): void {
+    const bytes = new TextEncoder().encode(text);
+    this.overlay ??= new Map();
+    this.edited += bytes.length - this.size(i);
+    this.overlay.set(i, bytes);
+  }
+
   /** Bytes of line i without the line feed and without a carriage return before it. */
   private line(i: number, max = Infinity): Uint8Array {
+    const o = this.overlay?.get(i);
+    if (o) return o.length > max ? o.subarray(0, max) : o;
     const a = this.starts[i];
     const end = i + 1 < this.nStarts ? this.starts[i + 1] - 1 : this.total;
     if (end - a > max) return this.bytes(a, a + max);
@@ -164,6 +189,8 @@ export class ByteStore implements LineStore {
   }
 
   size(i: number): number {
+    const o = this.overlay?.get(i);
+    if (o) return o.length;
     const end = i + 1 < this.nStarts ? this.starts[i + 1] - 1 : this.total;
     return end - this.starts[i];
   }
@@ -303,7 +330,51 @@ export class DocModel {
   }
 
   get bytes(): number {
-    return this.knownBytes >= 0 ? this.knownBytes : (this.store as ByteStore).total;
+    if (this.knownBytes >= 0) return this.knownBytes;
+    const store = this.store as ByteStore;
+    return store.total + store.edited;
+  }
+
+  /** One JSON value parsed already (a file too large for one string). */
+  static fromValue(value: JVal, bytes: number): DocModel {
+    const m = new DocModel('', false, bytes);
+    m.cache.clear();
+    m.kinds[0] = 0;
+    m.blank = 0;
+    const p: Parsed = { kind: 'value', value };
+    m.note(0, p);
+    m.cache.set(0, p);
+    return m;
+  }
+
+  /** Record i changed: what was known about it is gone, and the scan reads it again. */
+  forget(i: number): void {
+    const k = this.kinds[i];
+    if (k === K_BLANK) this.blank--;
+    else if (k === K_ERROR) this.errors--;
+    else if (k === K_VALUE) this.valid--;
+    if (i < this.kinds.length) this.kinds[i] = 0;
+    this.cache.delete(i);
+    if (this.scanned > i) this.scanned = i;
+    this.errorsVersion++;
+  }
+
+  /** A large file: line i was written by the view. */
+  replaceLine(i: number, text: string): void {
+    (this.store as ByteStore).replaceLine(i, text);
+    this.forget(i);
+  }
+
+  /**
+   * A large file grew at the end. When its last line had no line end, more bytes extend
+   * that line: it is read again.
+   */
+  append(data: Uint8Array): void {
+    const store = this.store as ByteStore;
+    const open = store.openEnd;
+    const last = store.count - 1;
+    store.append(data, true);
+    if (open && last >= 0) this.forget(last);
   }
 
   /** True while a byte store still receives data. */
@@ -622,6 +693,15 @@ export interface Query {
   path?: JsonPath;
   op?: Op;
   value?: string;
+  /** A JSONPath or jq query (see query.ts). */
+  program?: Program;
+  /** The text looks like a query but is not a valid one: it is searched as text, and this says why. */
+  error?: string;
+}
+
+/** Plain text search: no path query, no JSONPath or jq. */
+export function isTextQuery(q: Query): boolean {
+  return !!q.text && !q.path && !q.program;
 }
 
 const PATH_QUERY = /^\s*(\$?[A-Za-z_$\[][^\s:=!<>]*)\s*(!=|=|:|>|<)\s*(.*)$/;
@@ -638,6 +718,11 @@ export function parseQuery(raw: string, model: DocModel): Query {
       q.value = m[3].trim();
     }
   }
+  if (!q.path && q.text) {
+    const c = compileQuery(raw);
+    q.program = c.program;
+    q.error = c.error;
+  }
   return q;
 }
 
@@ -651,6 +736,10 @@ function stripQuotes(s: string): string {
 
 export function matchesRecord(model: DocModel, i: number, q: Query): boolean {
   if (!q.text) return true;
+  if (q.program) {
+    const rec = model.scanValue(i);
+    return rec !== undefined && q.program.matches(rec);
+  }
   if (!q.path) return model.line(i).toLowerCase().includes(q.text);
   const rec = model.scanValue(i);
   if (rec === undefined) return false;

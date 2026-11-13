@@ -69,8 +69,8 @@ export interface DocInfo {
    * The file is too large for VS Code to give to an extension. The host reads it from disk
    * and sends it as "chunk" messages (UTF-8 bytes). `bytes` is the file size.
    */
-  large?: { bytes: number };
-  /** The view cannot write to the file (large files). */
+  large?: { bytes: number; gzip?: boolean };
+  /** The view cannot write to the file (compressed files, files that are not UTF-8). */
   readOnly?: boolean;
 }
 
@@ -116,14 +116,19 @@ export type HostMessage =
    */
   | { type: 'edit'; base: number; version: number; lineCount: number; chars: number; eol: 1 | 2; changes: TextChange[] }
   /** A piece of a large file. `version` is the version of the "init" it belongs to. */
-  | { type: 'chunk'; version: number; data: Uint8Array; done: boolean }
+  | { type: 'chunk'; version: number; data: Uint8Array; done: boolean; read?: number }
+  /** A large file grew: the new bytes at its end (follow mode, or "Load new lines"). */
+  | { type: 'append'; version: number; data: Uint8Array }
   | { type: 'selection'; lines: number[]; active: number; truncated?: boolean }
   | { type: 'config'; config: ViewerConfig }
   | { type: 'setView'; view: ViewKind }
   | { type: 'toggleExpandMode' }
   | { type: 'toggleWrap' }
-  | { type: 'editResult'; ok: boolean; message?: string }
-  | { type: 'notice'; message: string; action?: 'reload' };
+  /** `line` and `text`: a large file, where the view shows the written line itself. */
+  | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string }
+  | { type: 'exportReady'; id: number; ok: boolean }
+  | { type: 'exportDone'; id: number; ok: boolean; message: string }
+  | { type: 'notice'; message: string; action?: 'reload' | 'append' };
 
 export type WebviewMessage =
   | { type: 'ready' }
@@ -135,7 +140,18 @@ export type WebviewMessage =
   | { type: 'reload' }
   | { type: 'select'; line: number }
   | { type: 'reveal'; line: number; path: JsonPath }
-  | { type: 'editLine'; line: number; original: string; text: string }
+  /** `exact`: write the text as it is (a cell edit); otherwise it is made compact. */
+  | { type: 'editLine'; line: number; original: string; text: string; exact?: boolean }
+  /** One JSON document: replace the value at `path` with the JSON `text`. `version` is the version the view has. */
+  | { type: 'editValue'; path: JsonPath; version: number; text: string }
+  /** Large files: follow the end of the file (new bytes are added to the view as they come). */
+  | { type: 'follow'; on: boolean }
+  | { type: 'loadAppended' }
+  /** Export rows: the host asks where to save, then the view sends the text in pieces. */
+  | { type: 'exportStart'; id: number; format: 'jsonl' | 'csv'; name: string; rows: number }
+  | { type: 'exportData'; id: number; data: string; done: boolean }
+  /** Open two records side by side in the VS Code diff editor. */
+  | { type: 'diff'; left: { title: string; text: string }; right: { title: string; text: string } }
   | { type: 'copy'; text: string }
   | { type: 'openAsText' }
   | { type: 'export'; format: 'svg' | 'png'; data: string; name: string }

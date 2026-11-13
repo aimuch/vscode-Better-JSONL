@@ -2,7 +2,12 @@ import { setLang, t } from '../shared/i18n';
 import { prettyJson } from '../shared/jsonText';
 import type { DocInfo, ExpandMode, HostMessage, RenderReport, TextChange, ViewerConfig, ViewKind, WebviewMessage } from '../shared/protocol';
 import { errorMessage } from '../shared/jsonText';
-import { esc, formatBytes } from './json';
+import { valueSpan } from '../locate';
+import { ByteJsonError, parseJsonBytes } from './byteJson';
+import { diffValues, type Difference } from './diff';
+import { csvRow } from './exporter';
+import { childKey, esc, formatBytes, isContainer, isObj, pathToString, type JVal } from './json';
+import { compactJson, pathOf } from './query';
 import { ByteStore, DocModel, dropLastEmpty, KEEP_ALL_BYTES, lowerBound, matchesRecord, parseQuery, patchLines, TreeSearch, tryParse, type Query } from './model';
 import { icon } from './icons';
 import { SettingsPanel } from './settings';
@@ -41,6 +46,8 @@ export interface UIState {
   expandMode: ExpandMode;
   query: string;
   filterOnly: boolean;
+  /** JSON Lines: stay at the end when lines are added (like tail -f). */
+  follow: boolean;
   wrap: boolean;
   active: number;
   anchor: number;
@@ -72,6 +79,7 @@ interface Saved {
   selected?: number[];
   query?: string;
   filterOnly?: boolean;
+  follow?: boolean;
   foldDepth?: number | null;
   folds?: [number, string[]][];
   grid?: { sort: UIState['grid']['sort']; widths: Record<string, number>; open: string[]; filters: [string, { text: string; exclude: string[] }][] };
@@ -82,6 +90,13 @@ interface Saved {
 const SYNC_SEARCH_BYTES = 16 * 1024 * 1024;
 /** Time for the first scan before the first paint. Small files are complete after it. */
 const FIRST_SCAN_MS = 40;
+/**
+ * One JSON value from this many bytes on is parsed from the bytes (parseJsonBytes): a
+ * JavaScript string holds at most about 2^29 characters. The tests set a smaller value.
+ */
+const BYTE_JSON_AT = ((globalThis as { __betterJsonlByteJsonAt?: number }).__betterJsonlByteJsonAt ?? 2 ** 29 - 64);
+/** Text sent to the host in one piece of an export. */
+const EXPORT_PIECE = 2 * 1024 * 1024;
 /** A single JSON document above this size opens with its second level folded. */
 const BIG_JSON_BYTES = 8 * 1024 * 1024;
 const MAX_RANGE = 2000;
@@ -105,7 +120,7 @@ channel.port1.onmessage = (e: MessageEvent<number>) => {
  * in the background or covered, and a scan or search of a large file would almost stop there.
  * Input and painting still come between two tasks. `waitMs` asks for a real pause (a timer).
  */
-function defer(fn: () => void, waitMs = 0): () => void {
+export function defer(fn: () => void, waitMs = 0): () => void {
   if (waitMs > 0) {
     const timer = setTimeout(fn, waitMs);
     return () => clearTimeout(timer);
@@ -139,6 +154,8 @@ export class App {
   treeCapped = false;
   /** The match the Formatted view went to last (-1: none yet). */
   treeIndex = -1;
+  /** A JSONPath or jq query: what the status bar says about it (an error, or results that have no place). */
+  private queryNotes: string[] = [];
   /** Grows when `matches` or `treeMatches` change. Views use it to keep derived lists. */
   matchesVersion = 0;
   /** A sliced search over a large file is running. */
@@ -152,6 +169,15 @@ export class App {
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private rangeCapped = false;
   private lastMode: boolean | undefined;
+  /** File bytes read so far while a large file loads (compressed bytes for a .gz file). */
+  private loadRead = 0;
+  /** A cell edit waits for the host. */
+  private cellPending = false;
+  /** Ends the document listeners of the shell when it is built again. */
+  private shellGone = new AbortController();
+  private nextExport = 1;
+  /** The export in progress: it sends the next piece when the host is ready for it. */
+  private exporting: { id: number; next: () => string | null } | undefined;
   /** Row height of code lines in px. */
   readonly rh: number;
 
@@ -231,7 +257,18 @@ export class App {
         }
         break;
       case 'chunk':
+        if (m.read !== undefined) this.loadRead = m.read;
         this.onChunk(m.version, m.data, m.done);
+        break;
+      case 'append':
+        this.onAppend(m.version, m.data);
+        break;
+      case 'exportReady':
+        this.onExportReady(m.id, m.ok);
+        break;
+      case 'exportDone':
+        if (this.exporting?.id === m.id) this.exporting = undefined;
+        if (this.views) this.showBanner(m.message);
         break;
       case 'update':
         if (!this.model || !this.views || this.doc.large) break;
@@ -269,7 +306,7 @@ export class App {
         if (this.views) this.setExpandMode(this.state.expandMode === 'focus' ? 'all' : 'focus');
         break;
       case 'editResult':
-        this.onEditResult(m.ok, m.message);
+        this.onEditResult(m.ok, m.message, m.line, m.text);
         break;
       case 'notice':
         // While a large file loads there is no banner yet: the message takes the place of the progress text.
@@ -309,6 +346,7 @@ export class App {
       expandMode,
       query: old.query ?? '',
       filterOnly: !!old.filterOnly,
+      follow: !!old.follow,
       wrap: prev?.wrap ?? config.wrap,
       active: old.active !== undefined ? (model.loading ? old.active : Math.min(old.active, last)) : 0,
       anchor: 0,
@@ -356,14 +394,14 @@ export class App {
     setLang(config.lang);
     this.applyTheme();
     this.loadStore = new ByteStore();
+    this.loadRead = 0;
     this.loadMode = doc.isJsonl ? 'jsonl' : 'undecided';
     this.paintBoot();
   }
 
   private paintBoot(text?: string): void {
     const total = this.doc.large?.bytes ?? 0;
-    const got = this.loadStore?.total ?? 0;
-    const msg = text ?? t('Loading {0} of {1}…', formatBytes(got), formatBytes(total));
+    const msg = text ?? t('Loading {0} of {1}…', formatBytes(Math.min(this.loadRead, total)), formatBytes(total));
     this.root.innerHTML = `<div class="boot">${esc(msg)}</div>`;
   }
 
@@ -413,9 +451,11 @@ export class App {
       this.loadStore = undefined;
       let model: DocModel;
       try {
-        model = new DocModel(store.takeText(), false, store.total);
+        // Too long for one string: read the value from the bytes.
+        model = store.total >= BYTE_JSON_AT ? DocModel.fromValue(parseJsonBytes(store.chunkList()), store.total) : new DocModel(store.takeText(), false, store.total);
       } catch (e) {
-        this.paintBoot(t('This file is too large to show as one JSON value ({0}).', errorMessage(e)));
+        const why = e instanceof ByteJsonError ? t('not valid JSON: {0}', e.message) : errorMessage(e);
+        this.paintBoot(t('This file cannot be shown as one JSON value ({0}).', why));
         return;
       }
       this.start(model);
@@ -442,6 +482,7 @@ export class App {
   /** The document changed: `model` takes the place of the one on screen. */
   private swap(model: DocModel, version: number): void {
     this.version = version;
+    const before = this.model.count;
     // Records that did not change keep their parse results, folds and selection.
     const map = model.adopt(this.model);
     this.model = model;
@@ -479,6 +520,8 @@ export class App {
     this.renderAll();
     painted = true;
     this.postMode();
+    // Follow mode: lines were added at the end.
+    if (s.follow && model.isJsonl && n > before) this.jumpToEnd();
   }
 
   /** Tells the host what the document is shown as, so both sides read line numbers the same way. */
@@ -524,7 +567,8 @@ export class App {
 
   // ---------- state changes ----------
 
-  selectRecord(r: number, how: 'set' | 'toggle' | 'range' = 'set'): void {
+  /** `notify`: move the text editor cursor too (follow mode does not). */
+  selectRecord(r: number, how: 'set' | 'toggle' | 'range' = 'set', notify = true): void {
     const s = this.state;
     if (r < 0 || r >= this.model.count) return;
     this.rangeCapped = false;
@@ -547,7 +591,7 @@ export class App {
     s.graph.selectedNode = null;
     if (s.view === 'formatted' || s.view === 'graph') this.activeView.render(r);
     this.activeView.onActiveChanged(false);
-    if (this.model.isJsonl) this.post({ type: 'select', line: r });
+    if (notify && this.model.isJsonl) this.post({ type: 'select', line: r });
     this.paintChrome();
     this.stateChanged();
   }
@@ -663,7 +707,21 @@ export class App {
     this.post({ type: 'editLine', line: this.editRecord, original: this.editOriginal, text: ta.value });
   }
 
-  private onEditResult(ok: boolean, message?: string): void {
+  private onEditResult(ok: boolean, message?: string, line?: number, text?: string): void {
+    // A large file: the host wrote the line on disk; the view shows it at once.
+    if (ok && line !== undefined && text !== undefined && this.model?.large && line < this.model.count) {
+      this.model.replaceLine(line, text);
+      this.startSearch(() => this.repaint());
+      this.startBackground();
+      this.activeView.refresh();
+      this.paintChrome();
+      this.stateChanged();
+    }
+    if (this.cellPending) {
+      this.cellPending = false;
+      if (!ok) this.showBanner(message ?? t('The edit failed.'));
+      return;
+    }
     if (ok) {
       this.closeEditor();
       return;
@@ -672,11 +730,198 @@ export class App {
     if (err) err.textContent = message ?? t('The edit failed.');
   }
 
+  /** Grid cells can be edited: JSON Lines that can be written, or one JSON document of normal size. */
+  get canEditCells(): boolean {
+    return !this.readOnly && (this.model.isJsonl || !this.doc.large);
+  }
+
+  /**
+   * Writes one cell. JSON Lines: only the text of that value changes in its line (the rest of
+   * the line stays as it is). One JSON document: the host replaces the value at its path.
+   */
+  editCell(record: number, path: (string | number)[], json: string): void {
+    const m = this.model;
+    this.cellPending = true;
+    if (!m.isJsonl) {
+      this.post({ type: 'editValue', path, version: this.version, text: json });
+      return;
+    }
+    const line = m.line(record);
+    const span = valueSpan(line, path);
+    if (!span) {
+      this.cellPending = false;
+      this.showBanner(t('The value is no longer in line {0}.', record + 1));
+      return;
+    }
+    const text = line.slice(0, span.offset) + json + line.slice(span.offset + span.length);
+    this.post({ type: 'editLine', line: record, original: line, text, exact: true });
+  }
+
+  // ---------- follow ----------
+
+  private setFollow(on: boolean): void {
+    this.state.follow = on;
+    if (this.doc.large) this.post({ type: 'follow', on });
+    if (on) this.jumpToEnd();
+    this.paintChrome();
+    this.stateChanged();
+  }
+
+  /** Follow mode: the last record becomes the current one. */
+  private jumpToEnd(): void {
+    const m = this.model;
+    let r = m.count - 1;
+    while (r > 0 && m.isBlank(r)) r--;
+    if (r < 0) return;
+    if (this.state.active !== r || this.state.selected.size !== 1) this.selectRecord(r, 'set', false);
+    this.activeView.onActiveChanged(true);
+  }
+
+  /** A large file grew: its new bytes. */
+  private onAppend(version: number, data: Uint8Array): void {
+    const m = this.model;
+    if (!m || !this.views || !m.large || version !== this.version) return;
+    const before = m.count;
+    m.append(data);
+    this.startSearch(() => this.repaint());
+    this.startBackground();
+    if (this.state.follow && m.count > before) this.jumpToEnd();
+    if (this.state.view !== 'graph') this.activeView.refresh();
+    this.paintChrome();
+    this.stateChanged();
+  }
+
+  // ---------- export ----------
+
+  /** The rows an export writes, and how: JSON Lines (the raw lines) or CSV. */
+  private exportRows(which: 'rows' | 'selected', format: 'jsonl' | 'csv'): void {
+    const m = this.model;
+    let ids: number[];
+    let header: string[];
+    let line: (id: number) => string;
+    let cells: (id: number) => string[];
+    if (this.state.view === 'grid' && which === 'rows') {
+      ({ ids, header, line, cells } = (this.views.grid as GridView).exportSource());
+    } else {
+      const all = which === 'selected' ? [...this.state.selected].sort((a, b) => a - b) : this.query.text && m.isJsonl ? this.matches : Array.from({ length: m.count }, (_, i) => i);
+      ids = all.filter((i) => !m.isBlank(i));
+      const cols = [...(m.hasNonObject ? ['(value)'] : []), ...m.columns];
+      header = cols;
+      line = (id) => m.line(id);
+      cells = (id) => {
+        const v = m.scanValue(id);
+        return cols.map((c, k) => {
+          if (v === undefined) return k === 0 ? m.line(id) : '';
+          if (c === '(value)' && k === 0 && m.hasNonObject) return isObj(v) ? '' : cellString(v);
+          return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? cellString(v[c]) : '';
+        });
+      };
+    }
+    let i = 0;
+    let first = true;
+    const id = this.nextExport++;
+    const next = (): string | null => {
+      if (i >= ids.length && !first) return null;
+      const parts: string[] = [];
+      let size = 0;
+      if (first) {
+        first = false;
+        // A byte order mark tells spreadsheet programs that the CSV is UTF-8.
+        if (format === 'csv') parts.push('\ufeff' + csvRow(header));
+      }
+      for (; i < ids.length && size < EXPORT_PIECE; i++) {
+        const row = format === 'csv' ? csvRow(cells(ids[i])) : line(ids[i]);
+        parts.push(row);
+        size += row.length + 1;
+      }
+      return parts.length ? parts.join('\n') + '\n' : '';
+    };
+    this.exporting = { id, next };
+    const base = this.doc.fileName.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '');
+    this.post({ type: 'exportStart', id, format, name: `${base}-${which === 'selected' ? 'selected' : 'rows'}`, rows: ids.length });
+    this.showBanner(t('Exporting {0} rows…', ids.length.toLocaleString()));
+  }
+
+  /** The host is ready for the next piece of the export (or the user cancelled the save dialog). */
+  private onExportReady(id: number, ok: boolean): void {
+    const e = this.exporting;
+    if (!e || e.id !== id) return;
+    if (!ok) {
+      this.exporting = undefined;
+      this.banner.hidden = true;
+      return;
+    }
+    const piece = e.next();
+    this.post({ type: 'exportData', id, data: piece ?? '', done: piece === null });
+  }
+
+  private toggleExportMenu(): void {
+    const menu = this.root.querySelector('.export-menu') as HTMLElement;
+    if (!menu.hidden) {
+      menu.hidden = true;
+      return;
+    }
+    const m = this.model;
+    const grid = this.state.view === 'grid';
+    const rows = grid ? (this.views.grid as GridView).exportSource().ids.length : this.query.text && m.isJsonl ? this.matches.length : m.count - m.blank;
+    const sel = m.isJsonl ? [...this.state.selected].filter((r) => r < m.count && !m.isBlank(r)).length : 0;
+    const what = grid || this.query.text ? t('{0} rows on screen', rows.toLocaleString()) : t('all {0} rows', rows.toLocaleString());
+    const items: [string, string][] = [
+      ['rows:jsonl', t('{0} as JSON Lines…', what)],
+      ['rows:csv', t('{0} as CSV…', what)],
+    ];
+    if (sel > 0) items.push(['selected:jsonl', t('{0} selected lines as JSON Lines…', sel.toLocaleString())], ['selected:csv', t('{0} selected lines as CSV…', sel.toLocaleString())]);
+    menu.innerHTML = items.map(([k, label]) => `<button class="menu-item" role="menuitem" data-export="${k}">${esc(label)}</button>`).join('');
+    menu.hidden = false;
+    (menu.querySelector('button') as HTMLElement).focus();
+  }
+
+  // ---------- compare ----------
+
+  /** The two selected lines, field by field. */
+  private openCompare(): void {
+    const m = this.model;
+    const [a, b] = [...this.state.selected].sort((x, y) => x - y);
+    const va = m.value(a);
+    const vb = m.value(b);
+    if (b === undefined || va === undefined || vb === undefined) {
+      this.showBanner(t('Select two valid lines to compare them.'));
+      return;
+    }
+    const { rows, more } = diffValues(va, vb);
+    const panel = this.root.querySelector('.comparepanel') as HTMLElement;
+    const cell = (v: JVal | undefined) => (v === undefined ? `<td class="dim">${t('(missing)')}</td>` : `<td class="mono">${esc(compactJson(v).slice(0, 300))}</td>`);
+    const body = rows
+      .map((d: Difference) => `<tr class="cmp-${d.kind}"><td class="mono">${esc(pathToString(d.path))}</td>${cell(d.a)}${cell(d.b)}</tr>`)
+      .join('');
+    panel.innerHTML = `
+      <div class="ep-head"><span class="ep-title">${esc(t('Line {0} and line {1}', a + 1, b + 1))}</span><span class="dim">${esc(rows.length ? t(rows.length === 1 ? '{0} difference' : '{0} differences', `${rows.length.toLocaleString()}${more ? '+' : ''}`) : t('The two records are equal.'))}</span></div>
+      ${rows.length ? `<div class="cmp-scroll"><table class="cmp"><tr><th>${t('Path')}</th><th>${esc(t('Line {0}', a + 1))}</th><th>${esc(t('Line {0}', b + 1))}</th></tr>${body}</table></div>` : ''}
+      <div class="ep-actions">
+        <button class="btn primary cmp-diff">${t('Open in the diff editor')}</button>
+        <button class="btn cmp-close">${t('Close')} <kbd>Esc</kbd></button>
+      </div>`;
+    panel.hidden = false;
+    (panel.querySelector('.cmp-close') as HTMLElement).addEventListener('click', () => this.closeCompare());
+    (panel.querySelector('.cmp-diff') as HTMLElement).addEventListener('click', () => {
+      const side = (r: number) => ({ title: `${this.doc.fileName} line ${r + 1}`, text: prettyJson(m.line(r), this.config.indent) + '\n' });
+      this.post({ type: 'diff', left: side(a), right: side(b) });
+    });
+    (panel.querySelector('.cmp-close') as HTMLElement).focus();
+  }
+
+  private closeCompare(): void {
+    const panel = this.root.querySelector('.comparepanel') as HTMLElement | null;
+    if (panel) panel.hidden = true;
+  }
+
   // ---------- shell ----------
 
   private buildShell(): void {
     // The views of the shell before this one hold listeners on the window and the document.
     if (this.views) for (const v of Object.values(this.views)) v.dispose();
+    this.shellGone.abort();
+    this.shellGone = new AbortController();
     this.editRecord = -1;
     this.root.innerHTML = `
       <div class="toolbar" role="toolbar" aria-label="${t('Better JSONL toolbar')}"></div>
@@ -691,7 +936,9 @@ export class App {
           <button class="btn ep-cancel">${t('Cancel')} <kbd>Esc</kbd></button>
           <span class="ep-hint">${t('The record is saved back as one compact line.')}</span>
         </div>
-      </div>`;
+      </div>
+      <div class="comparepanel" hidden role="dialog" aria-label="${t('Compare two lines')}"></div>
+      <div class="export-menu menu" hidden role="menu" aria-label="${t('Export')}"></div>`;
     this.toolbar = this.root.querySelector('.toolbar') as HTMLElement;
     this.banner = this.root.querySelector('.banner') as HTMLElement;
     this.body = this.root.querySelector('.body') as HTMLElement;
@@ -711,6 +958,26 @@ export class App {
       ke.stopPropagation();
     });
     this.buildToolbar();
+    const menu = this.root.querySelector('.export-menu') as HTMLElement;
+    menu.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest('[data-export]') as HTMLElement | null;
+      if (!b) return;
+      menu.hidden = true;
+      const [which, format] = (b.dataset.export as string).split(':') as ['rows' | 'selected', 'jsonl' | 'csv'];
+      this.exportRows(which, format);
+    });
+    menu.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        menu.hidden = true;
+        (this.toolbar.querySelector('.export-btn') as HTMLElement).focus();
+      }
+    });
+    document.addEventListener('pointerdown', (e) => {
+      const t = e.target as HTMLElement;
+      if (!menu.hidden && !menu.contains(t) && !t.closest('.export-btn')) menu.hidden = true;
+    }, { signal: this.shellGone.signal });
     this.settings = new SettingsPanel(this);
     this.root.appendChild(this.settings.el);
     this.views = {
@@ -760,6 +1027,9 @@ export class App {
       </label>
       <div class="spring"></div>
       <div class="stats"></div>
+      <button class="icon-btn follow-btn" aria-pressed="false" aria-label="${t('Follow the end of the file')}" title="${t('Follow the end of the file: new lines show at once')}">${icon('follow')}</button>
+      <button class="icon-btn compare-btn" aria-label="${t('Compare the two selected lines')}" title="${t('Compare the two selected lines')}">${icon('compare')}</button>
+      <button class="icon-btn export-btn" aria-haspopup="menu" aria-label="${t('Export rows')}" title="${t('Export rows as JSON Lines or CSV')}">${icon('download')}</button>
       <button class="icon-btn wrap-btn" aria-label="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" title="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" aria-pressed="false">${icon('wrap')}</button>
       <button class="icon-btn open-text" aria-label="${t('Open as text')}" title="${t('Open as text')}">${icon('file-code')}</button>
       <button class="icon-btn gear-btn" aria-label="${t('Settings')}" title="${t('Settings')}">${icon('gear')}</button>`;
@@ -779,6 +1049,9 @@ export class App {
         this.stateChanged();
       } else if (t.classList.contains('open-text')) this.post({ type: 'openAsText' });
       else if (t.classList.contains('wrap-btn')) this.setWrap(!this.state.wrap);
+      else if (t.classList.contains('follow-btn')) this.setFollow(!this.state.follow);
+      else if (t.classList.contains('compare-btn')) this.openCompare();
+      else if (t.classList.contains('export-btn')) this.toggleExportMenu();
       else if (t.classList.contains('gear-btn')) this.settings?.toggle();
       else if (t.classList.contains('err-chip')) this.nextError();
     });
@@ -831,7 +1104,8 @@ export class App {
     const m = this.model;
     this.query = parseQuery(this.state.query, m);
     const q = this.query;
-    const finish = (out: number[], tree?: TreeSearch) => {
+    const finish = (out: number[], tree?: { matches: string[]; capped: boolean }) => {
+      this.queryNotes = q.error ? [q.error] : [];
       this.matches = out;
       this.matchSet = new Set(out);
       this.treeMatches = tree ? tree.matches : [];
@@ -861,6 +1135,32 @@ export class App {
       const root = m.value(0);
       if (root === undefined || q.path) {
         finish([]);
+        return;
+      }
+      if (q.program) {
+        // A query: its results that have a place are the matches; computed values are shown in the status bar.
+        let result: { matches: string[]; capped: boolean } = { matches: [], capped: false };
+        let notes: string[] = [];
+        try {
+          const run = q.program.run(root);
+          const seen = new Set<string>();
+          const loose: string[] = [];
+          for (const o of run.outs) {
+            if (o.p === undefined) {
+              if (loose.length < 3) loose.push(compactJson(o.v).slice(0, 80));
+              continue;
+            }
+            const key = pathOf(o.p).reduce<string>((k, seg) => childKey(k, seg), '');
+            if (!seen.has(key)) seen.add(key);
+          }
+          result = { matches: [...seen], capped: run.capped };
+          if (run.capped) notes.push(t('The query stopped: too many results'));
+          if (loose.length) notes.push(t('Result: {0}', loose.join(', ')));
+        } catch (e) {
+          notes = [`${q.program.kind === 'jq' ? 'jq' : 'JSONPath'}: ${errorMessage(e)}`];
+        }
+        finish([], result);
+        this.queryNotes = notes;
         return;
       }
       const tree = new TreeSearch(root, q.text);
@@ -917,17 +1217,20 @@ export class App {
   }
 
   /** A line under the toolbar. `action: 'reload'` adds a button that asks the host to read the file again. */
-  showBanner(text: string, action?: 'reload'): void {
+  showBanner(text: string, action?: 'reload' | 'append'): void {
     const b = this.banner;
     b.textContent = '';
     const span = document.createElement('span');
     span.textContent = text;
     b.appendChild(span);
-    if (action === 'reload') {
+    if (action === 'reload' || action === 'append') {
       const btn = document.createElement('button');
       btn.className = 'btn banner-act';
-      btn.textContent = t('Reload');
-      btn.addEventListener('click', () => this.post({ type: 'reload' }));
+      btn.textContent = action === 'reload' ? t('Reload') : t('Load new lines');
+      btn.addEventListener('click', () => {
+        b.hidden = true;
+        this.post({ type: action === 'reload' ? 'reload' : 'loadAppended' });
+      });
       b.appendChild(btn);
     }
     const close = document.createElement('button');
@@ -967,6 +1270,13 @@ export class App {
     allBtn.title = m.keepsAll ? t('All lines are pretty-printed') : t('Expand all is off for files over {0}. Only the selected lines are expanded.', formatBytes(KEEP_ALL_BYTES));
     (tb.querySelector('.foldall') as HTMLElement).hidden = !(s.view === 'formatted' && !m.isJsonl);
     (tb.querySelector('.linesel') as HTMLElement).hidden = !(s.view === 'graph' && m.isJsonl);
+    const followBtn = tb.querySelector('.follow-btn') as HTMLButtonElement;
+    followBtn.hidden = !m.isJsonl;
+    followBtn.classList.toggle('on', s.follow);
+    followBtn.setAttribute('aria-pressed', String(s.follow));
+    (tb.querySelector('.compare-btn') as HTMLButtonElement).hidden = !(m.isJsonl && s.selected.size === 2 && s.view !== 'graph');
+    (tb.querySelector('.export-btn') as HTMLButtonElement).hidden = !((s.view === 'formatted' && m.isJsonl) || (s.view === 'grid' && (m.isJsonl || (m.value(0) !== undefined && isContainer(m.value(0) as JVal)))));
+    (tb.querySelector('.open-text') as HTMLButtonElement).hidden = !!this.doc.large?.gzip;
     const wrapBtn = tb.querySelector('.wrap-btn') as HTMLButtonElement;
     wrapBtn.classList.toggle('on', s.wrap);
     wrapBtn.setAttribute('aria-pressed', String(s.wrap));
@@ -997,7 +1307,7 @@ export class App {
       s.view === 'graph'
         ? t('Drag or scroll to pan · {0}+scroll to zoom · click a node to inspect', navigator.platform.includes('Mac') ? '⌘' : 'Ctrl')
         : s.view === 'grid'
-          ? t('Click a header to sort · the funnel filters a column · drag a header edge to resize')
+          ? t('Click a header to sort · the funnel filters a column · double-click a value to edit')
           : m.isJsonl
             ? this.readOnly
               ? t('↑/↓ move · Shift extends · double-click jumps to source')
@@ -1008,7 +1318,7 @@ export class App {
 
   /** Limits that hide data right now. */
   private notes(): string[] {
-    const out = this.activeView.notes();
+    const out = [...this.queryNotes, ...this.activeView.notes()];
     if (this.rangeCapped) out.push(t('The selection stops at {0} lines', MAX_RANGE.toLocaleString()));
     return out;
   }
@@ -1018,16 +1328,18 @@ export class App {
     const count = this.toolbar?.querySelector('.count') as HTMLElement | null;
     if (!count) return;
     const m = this.model;
+    // A JSONPath or jq query says which one it is.
+    const kind = this.query.program ? `${this.query.program.kind === 'jq' ? 'jq' : 'JSONPath'} · ` : '';
     if (!this.query.text) count.textContent = '';
     else if (!m.isJsonl) {
       // One JSON document: the Formatted view steps through the matches in the value.
       if (this.state.view !== 'formatted' || this.query.path) count.textContent = '';
       else if (this.searching) count.textContent = t('Searching…');
-      else count.textContent = `${this.treeIndex >= 0 ? this.treeIndex + 1 : '–'} / ${this.treeMatches.length.toLocaleString()}${this.treeCapped ? '+' : ''}`;
-    } else if (this.searching) count.textContent = t('searching {0}%', this.searchPct);
+      else count.textContent = `${kind}${this.treeIndex >= 0 ? this.treeIndex + 1 : '–'} / ${this.treeMatches.length.toLocaleString()}${this.treeCapped ? '+' : ''}`;
+    } else if (this.searching) count.textContent = kind + t('searching {0}%', this.searchPct);
     else {
       const ri = this.matchSet.has(this.state.active) ? lowerBound(this.matches, this.state.active) : -1;
-      count.textContent = `${ri >= 0 ? ri + 1 : '–'} / ${this.matches.length.toLocaleString()}`;
+      count.textContent = `${kind}${ri >= 0 ? ri + 1 : '–'} / ${this.matches.length.toLocaleString()}`;
     }
   }
 
@@ -1071,7 +1383,8 @@ export class App {
       }
       if (done) {
         // A path query needs the column names: read the query again now that all are known.
-        if (!!parseQuery(this.state.query, model).path !== !!this.query.path) this.startSearch(() => this.repaint());
+        const again = parseQuery(this.state.query, model);
+        if (!!again.path !== !!this.query.path || !!again.program !== !!this.query.program) this.startSearch(() => this.repaint());
         this.stateChanged();
         return;
       }
@@ -1084,6 +1397,12 @@ export class App {
   // ---------- keyboard ----------
 
   private onKey(e: KeyboardEvent): void {
+    const compare = this.root.querySelector('.comparepanel') as HTMLElement | null;
+    if (e.key === 'Escape' && compare && !compare.hidden) {
+      e.preventDefault();
+      this.closeCompare();
+      return;
+    }
     if (e.key === 'Escape' && this.settings?.open) {
       e.preventDefault();
       this.settings.close();
@@ -1150,6 +1469,7 @@ export class App {
         selected: head(s.selected, MAX_RANGE),
         query: s.query,
         filterOnly: s.filterOnly,
+        follow: s.follow,
         foldDepth: Number.isFinite(s.foldDepth) ? s.foldDepth : null,
         folds: head(s.folds, 200)
           .filter(([, f]) => f.size > 0)
@@ -1194,4 +1514,9 @@ export class App {
     this.activeView.fillReport(r);
     this.post({ type: 'report', report: r });
   }
+}
+
+/** A cell for a CSV file: text as it is, other values as compact JSON. */
+function cellString(v: JVal): string {
+  return typeof v === 'string' ? v : compactJson(v);
 }

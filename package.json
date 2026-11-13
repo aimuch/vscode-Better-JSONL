@@ -2,7 +2,7 @@
   "name": "better-jsonl",
   "displayName": "Better JSONL",
   "description": "%description%",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "andy",
   "license": "MIT",
   "repository": {
@@ -58,6 +58,25 @@
           }
         ],
         "priority": "option"
+      },
+      {
+        "viewType": "betterJsonl.compressed",
+        "displayName": "Better JSONL",
+        "selector": [
+          {
+            "filenamePattern": "*.jsonl.gz"
+          },
+          {
+            "filenamePattern": "*.ndjson.gz"
+          },
+          {
+            "filenamePattern": "*.jsonlines.gz"
+          },
+          {
+            "filenamePattern": "*.json.gz"
+          }
+        ],
+        "priority": "default"
       }
     ],
     "commands": [
@@ -127,12 +146,12 @@
       "editor/title/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "0_betterJsonl@1"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "0_betterJsonl@2"
         }
       ],
@@ -161,12 +180,12 @@
       "explorer/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "navigation@20"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "navigation@21"
         }
       ],
