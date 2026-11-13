@@ -281,6 +281,9 @@ button {
 .btn:focus-visible,
 .chip:focus-visible,
 .vchip:focus-visible,
+.fold:focus-visible,
+.ph:focus-visible,
+.gh:focus-visible,
 .rbtn:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
@@ -441,12 +444,33 @@ button {
 }
 
 .banner {
-  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px 4px 12px;
   font-size: 12px;
   background: var(--vscode-editorInfo-background, var(--sel));
   color: var(--vscode-editorInfo-foreground, var(--fg));
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+}
+
+.banner[hidden] {
+  display: none;
+}
+
+.banner > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.banner .btn {
+  padding: 1px 10px;
+}
+
+.seg-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .status {
@@ -608,6 +632,11 @@ mark {
 
 .fold {
   display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   cursor: pointer;
   border-radius: 3px;
 }
@@ -1215,6 +1244,21 @@ mark {
 .gn.sel .gn-bg {
   stroke: var(--accent);
   stroke-width: 2;
+}
+
+.gn:focus,
+.gcanvas:focus {
+  outline: none;
+}
+
+.gn:focus-visible .gn-bg {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 4 2;
+}
+
+.gcanvas:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 .gn.hitnode .gn-bg {

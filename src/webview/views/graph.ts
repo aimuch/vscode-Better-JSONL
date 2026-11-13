@@ -1,7 +1,7 @@
 import { t } from '../../shared/i18n';
 import type { JsonPath, RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
-import { childKey, entriesOf, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
+import { childKey, entriesHead, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
 
 const HEADER_H = 26;
@@ -67,12 +67,14 @@ export class GraphView implements View {
   private drag: { x: number; y: number; tx: number; ty: number; moved: boolean } | null = null;
   private measureCtx: CanvasRenderingContext2D | null = null;
   private font = '12px monospace';
+  /** Ends the window listeners when the view is replaced. */
+  private readonly gone = new AbortController();
 
   constructor(private readonly app: App) {
     this.el = document.createElement('div');
     this.el.className = 'view graph';
     this.el.innerHTML = `
-      <div class="gcanvas" aria-label="${t('Graph canvas')}">
+      <div class="gcanvas" tabindex="0" aria-label="${t('Graph canvas')}">
         <svg class="gsvg" xmlns="http://www.w3.org/2000/svg"><g class="vp"></g></svg>
         <div class="gnote" hidden></div>
         <div class="exportbar" role="group" aria-label="${t('Export graph')}">
@@ -94,8 +96,10 @@ export class GraphView implements View {
     this.note = this.el.querySelector('.gnote') as HTMLElement;
     this.canvasEl.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     this.svg.addEventListener('pointerdown', (e) => this.onDown(e));
-    window.addEventListener('pointermove', (e) => this.onMove(e));
-    window.addEventListener('pointerup', (e) => this.onUp(e));
+    this.canvasEl.addEventListener('keydown', (e) => this.onKey(e));
+    this.svg.addEventListener('focusin', (e) => this.onFocus(e));
+    window.addEventListener('pointermove', (e) => this.onMove(e), { signal: this.gone.signal });
+    window.addEventListener('pointerup', (e) => this.onUp(e), { signal: this.gone.signal });
     this.el.querySelector('.zoombar')!.addEventListener('click', (e) => {
       const z = ((e.target as HTMLElement).closest('[data-z]') as HTMLElement | null)?.dataset.z;
       if (z === 'in') this.zoomAt(1.25);
@@ -117,6 +121,10 @@ export class GraphView implements View {
     this.el.hidden = true;
   }
 
+  dispose(): void {
+    this.gone.abort();
+  }
+
   render(): void {
     if (this.el.hidden) return;
     const sources = this.sources();
@@ -129,6 +137,15 @@ export class GraphView implements View {
     this.paint();
     if (fresh) this.fit();
     this.paintInspector();
+  }
+
+  refresh(): void {
+    this.render();
+  }
+
+  notes(): string[] {
+    const n = this.app.model.isJsonl ? this.app.state.selected.size : 0;
+    return n > MAX_COMPARE ? [t('The graph shows the first {0} of {1} selected lines', MAX_COMPARE, n.toLocaleString())] : [];
   }
 
   onWrapChanged(): void {
@@ -147,7 +164,7 @@ export class GraphView implements View {
     this.centerOn(n);
     this.paint();
     this.paintInspector();
-    this.app.scheduleReport();
+    this.app.stateChanged();
   }
 
   fillReport(r: RenderReport): void {
@@ -226,8 +243,8 @@ export class GraphView implements View {
         continue;
       }
       if (n.collapsed) continue;
-      const ents = entriesOf(v);
-      for (const [k, c] of ents.slice(0, MAX_ROWS)) {
+      const size = sizeOf(v);
+      for (const [k, c] of entriesHead(v, MAX_ROWS)) {
         const label = String(k);
         const isIdx = typeof k === 'number';
         if (!isContainer(c)) {
@@ -242,7 +259,7 @@ export class GraphView implements View {
         }
         n.rows.push(row);
       }
-      if (ents.length > MAX_ROWS) n.rows.push({ label: '', isIdx: false, text: t('… {0} more', ents.length - MAX_ROWS), cls: 'dim', note: true });
+      if (size > MAX_ROWS) n.rows.push({ label: '', isIdx: false, text: t('… {0} more', (size - MAX_ROWS).toLocaleString()), cls: 'dim', note: true });
     }
     for (const n of nodes) {
       n.rows.forEach((r, i) => {
@@ -371,7 +388,7 @@ export class GraphView implements View {
         ? `<g class="gtoggle" data-toggle="${esc(n.key)}" transform="translate(${n.w - 22},5)"><rect width="16" height="16" rx="3"/><path d="${n.collapsed ? 'M6 4l4 4-4 4' : 'M4 6l4 4 4-4'}"/></g>`
         : '';
       nodes.push(
-        `<g class="gn${sel === n.key ? ' sel' : ''}${n.hit ? ' hitnode' : ''}" data-n="${n.id}" transform="translate(${n.x},${n.y})">` +
+        `<g class="gn${sel === n.key ? ' sel' : ''}${n.hit ? ' hitnode' : ''}" data-n="${n.id}" data-key="${esc(n.key)}" tabindex="0" role="button" aria-label="${esc(`${n.title} · ${kind}`)}"${canFold ? ` aria-expanded="${!n.collapsed}"` : ''} transform="translate(${n.x},${n.y})">` +
           `<rect class="gn-bg" width="${n.w}" height="${n.h}" rx="6"/>` +
           `<line class="gsep" x1="0" x2="${n.w}" y1="${HEADER_H}" y2="${HEADER_H}"/>` +
           `<text class="gtitle" x="10" y="17">${esc(clip(n.title, 32))}<tspan class="dim" dx="8">${esc(kind)}</tspan></text>` +
@@ -380,7 +397,11 @@ export class GraphView implements View {
           `</g>`,
       );
     }
+    // Painting replaces every node: the one with the keyboard focus gets it back.
+    const focused = (document.activeElement as Element | null)?.closest?.('.gn');
+    const focusKey = focused && this.vp.contains(focused) ? focused.getAttribute('data-key') : null;
     this.vp.innerHTML = `<g class="edges">${edges.join('')}</g><g class="nodes">${nodes.join('')}</g>`;
+    if (focusKey !== null) (this.vp.querySelector(`.gn[data-key="${CSS.escape(focusKey)}"]`) as SVGGElement | null)?.focus({ preventScroll: true });
     this.applyTransform();
   }
 
@@ -515,44 +536,103 @@ export class GraphView implements View {
     if (!this.svg.contains(t)) return;
     const toggle = t.closest('[data-toggle]') as SVGElement | null;
     if (toggle) {
-      const key = toggle.getAttribute('data-toggle') as string;
-      const c = this.app.state.graph.collapsed;
-      if (c.has(key)) c.delete(key);
-      else c.add(key);
-      this.build(this.sources());
-      this.layout();
-      this.markSearch();
-      this.paint();
-      this.app.scheduleReport();
+      this.toggleNode(toggle.getAttribute('data-toggle') as string);
       return;
     }
     const g = t.closest('[data-n]') as SVGElement | null;
-    this.app.state.graph.selectedNode = g ? this.nodes[Number(g.getAttribute('data-n'))].key : null;
+    this.selectNode(g ? g.getAttribute('data-key') : null);
+  }
+
+  private toggleNode(key: string): void {
+    const c = this.app.state.graph.collapsed;
+    if (!c.delete(key)) c.add(key);
+    this.build(this.sources());
+    this.layout();
+    this.markSearch();
+    this.paint();
+    this.app.stateChanged();
+  }
+
+  private selectNode(key: string | null): void {
+    this.app.state.graph.selectedNode = key;
     this.paint();
     this.paintInspector();
-    this.app.scheduleReport();
+    this.app.stateChanged();
+  }
+
+  // ---------- keyboard ----------
+
+  /**
+   * Tab moves between nodes. On a node: Enter or Space selects it (the inspector shows it),
+   * Left folds it, Right unfolds it. On the canvas: + and - zoom, 0 fits the graph.
+   */
+  private onKey(e: KeyboardEvent): void {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const g = (e.target as Element).closest?.('.gn');
+    const node = g ? this.nodes[Number(g.getAttribute('data-n'))] : undefined;
+    if (node && (e.key === 'Enter' || e.key === ' ')) this.selectNode(node.key);
+    else if (node && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      const canFold = node.id !== 0 && node.value !== undefined && isContainer(node.value) && sizeOf(node.value as JObj) > 0;
+      if (!canFold || node.collapsed === (e.key === 'ArrowLeft')) return;
+      this.toggleNode(node.key);
+    } else if (e.key === '+' || e.key === '=') this.zoomAt(1.25);
+    else if (e.key === '-') this.zoomAt(0.8);
+    else if (e.key === '0') this.fit();
+    else return;
+    e.preventDefault();
+  }
+
+  /** A node that gets the focus off screen is brought to the middle. */
+  private onFocus(e: FocusEvent): void {
+    const g = (e.target as Element).closest?.('.gn');
+    const node = g ? this.nodes[Number(g.getAttribute('data-n'))] : undefined;
+    if (!node) return;
+    const x = node.x * this.k + this.tx;
+    const y = node.y * this.k + this.ty;
+    const seen = x + node.w * this.k > 0 && y + node.h * this.k > 0 && x < this.canvasEl.clientWidth && y < this.canvasEl.clientHeight;
+    if (!seen) this.centerOn(node);
   }
 
   // ---------- export ----------
+
+  /**
+   * The drawing as SVG markup for a file. It is a copy without the parts that only the live
+   * view needs (fold buttons, search marks, attributes for scripts and the keyboard): path keys
+   * hold control characters, and one of those makes an SVG file invalid XML.
+   */
+  private exportMarkup(): string {
+    const copy = this.vp.cloneNode(true) as SVGGElement;
+    copy.querySelectorAll('.gtoggle, .ghit').forEach((el) => el.remove());
+    for (const el of [copy, ...Array.from(copy.querySelectorAll('*'))]) {
+      for (const attr of Array.from(el.attributes)) {
+        if (/^(data-|aria-)|^(tabindex|role)$/.test(attr.name)) el.removeAttribute(attr.name);
+      }
+    }
+    const xml = new XMLSerializer();
+    return Array.from(copy.childNodes)
+      .map((n) => xml.serializeToString(n))
+      .join('')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g, '\ufffd');
+  }
 
   exportImage(format: 'svg' | 'png'): void {
     const b = this.bounds();
     const pad = 24;
     const css = getComputedStyle(document.body);
     const v = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
-    const root = getComputedStyle(document.body);
-    const tok = (name: string, fallback: string) => root.getPropertyValue(name).trim() || fallback;
+    // The same variable chain as style.css, so the export has the colors of the screen.
+    const edge = v('--vscode-editorIndentGuide-activeBackground1', v('--vscode-editorIndentGuide-activeBackground', '#707070'));
     const style = `
       text{font:12px ${v('--vscode-editor-font-family', 'monospace')};fill:${v('--vscode-editor-foreground', '#ccc')}}
       .gn-bg{fill:${v('--vscode-editorWidget-background', '#252526')};stroke:${v('--vscode-widget-border', '#454545')}}
       .gsep{stroke:${v('--vscode-widget-border', '#454545')}}
-      .ge{fill:none;stroke:${v('--vscode-editorIndentGuide-activeBackground', '#707070')};stroke-width:1.5}
-      .gdot{fill:${v('--vscode-editorIndentGuide-activeBackground', '#707070')}}
+      .ge{fill:none;stroke:${edge};stroke-width:1.5}
+      .gdot{fill:${edge}}
       .gtitle{font-weight:600}.dim{fill:${v('--vscode-descriptionForeground', '#9d9d9d')}}
-      .tk{fill:${tok('--tok-key', '#9cdcfe')}}.ts{fill:${tok('--tok-string', '#ce9178')}}.tn{fill:${tok('--tok-number', '#b5cea8')}}
-      .tb,.tz{fill:${tok('--tok-keyword', '#569cd6')}}.tz-idx{fill:${v('--vscode-descriptionForeground', '#9d9d9d')}}.tp{fill:${v('--vscode-editor-foreground', '#ccc')}}
-      .gtoggle,.ghit,.gn.sel .gn-bg{display:none}`;
-    const body = this.vp.innerHTML;
+      .tk{fill:${v('--tok-key', '#9cdcfe')}}.ts{fill:${v('--tok-string', '#ce9178')}}.tn{fill:${v('--tok-number', '#b5cea8')}}
+      .tb,.tz{fill:${v('--tok-keyword', '#569cd6')}}.tz-idx{fill:${v('--vscode-descriptionForeground', '#9d9d9d')}}.tp{fill:${v('--vscode-editor-foreground', '#ccc')}}
+`;
+    const body = this.exportMarkup();
     const bg = v('--vscode-editor-background', '#1e1e1e');
     const w = Math.ceil(b.w + pad * 2);
     const h = Math.ceil(b.h + pad * 2);

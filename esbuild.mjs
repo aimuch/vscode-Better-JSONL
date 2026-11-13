@@ -37,6 +37,14 @@ const builds = [
     mainFields: ['module', 'main'],
   },
   {
+    entryPoints: ['test/unit/unit.test.ts'],
+    outfile: 'dist-test/unit/unit.test.js',
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    mainFields: ['module', 'main'],
+  },
+  {
     entryPoints: ['test/host/suite.ts'],
     outfile: 'dist-test/host/suite.js',
     platform: 'node',

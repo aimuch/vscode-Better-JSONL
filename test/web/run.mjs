@@ -10,7 +10,7 @@ const root = fileURLToPath(new URL('../../', import.meta.url));
 const outDir = `${root}test-results/web`;
 const CHROME =
   process.env.CHROME_PATH ??
-  ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/chromium'].find((p) => existsSync(p));
+  ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/chromium', 'C:/Program Files/Google/Chrome/Application/chrome.exe'].find((p) => existsSync(p));
 
 if (!CHROME) {
   console.error('No Chrome found. Set CHROME_PATH.');
@@ -495,7 +495,7 @@ await scenario('W23', 'Theme setting: light, dark and follow system override the
     await send(page, { type: 'config', config: { ...base, theme } });
   };
   await page.evaluate(() => {
-    window.__lastConfig = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en' };
+    window.__lastConfig = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en', reports: true };
   });
   await cfg('light');
   let r = await report(page, (x) => x.theme === 'light');
@@ -534,6 +534,7 @@ await scenario('W24', 'Settings panel: gear opens it, every control writes a set
   await pick('jsonl.expandMode', 'all');
   await page.fill('.settings-num', '800');
   await page.press('.settings-num', 'Tab');
+  await page.click('.settings-check input[data-key="preview.followActiveEditor"]');
   await page.click('.settings-check input[data-key="formatDocument.enabled"]');
   await page.click('.settings-check input[data-key="expandLines.showReminder"]');
   const sent = (await posted(page, 'setSetting')).map((m) => [m.key, m.value]);
@@ -544,6 +545,7 @@ await scenario('W24', 'Settings panel: gear opens it, every control writes a set
     ['defaultView', 'grid'],
     ['jsonl.expandMode', 'all'],
     ['graph.maxNodes', 800],
+    ['preview.followActiveEditor', false],
     ['formatDocument.enabled', true],
     ['expandLines.showReminder', false],
   ]);
@@ -609,7 +611,7 @@ await scenario('W26', 'Language: Simplified Chinese UI, switch in the settings p
   await page.click('.settings-seg[data-key="language"] .seg-btn[data-value="en"]');
   check.eq('language sent to VS Code', (await posted(page, 'setSetting')).at(-1), { type: 'setSetting', key: 'language', value: 'en' });
   // The host answers with a config message; the UI switches without losing the state.
-  const base = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true };
+  const base = { defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, reports: true };
   await send(page, { type: 'config', config: { ...base, language: 'en', lang: 'en', vscodeLanguage: 'zh-cn' } });
   r = await report(page, (x) => x.lang === 'en');
   check.eq('view tab in English', await text('[data-view="formatted"]'), 'Formatted');
@@ -673,6 +675,395 @@ await scenario('W27', 'Grid: header filters (value list, search, cascade, clear)
   r = await report(page, (x) => x.grid.rows === 20);
   check.eq('clear all filters', r.grid.filters, {});
   check.eq('header click still sorts', r.view, 'grid');
+});
+
+
+// ---------- large files, limits and state ----------
+
+async function openBlank(page) {
+  await page.goto(`${base}?theme=dark`);
+  await page.waitForFunction(() => window.harness && window.__posted.some((m) => m.type === 'ready'));
+}
+
+const statusText = (page) => page.locator('.status').innerText();
+
+await scenario('W28', 'Large file: bytes arrive in chunks, lines are decoded on demand, the view is read-only', ['F5', 'F6', 'F15'], async ({ page, check, shot }) => {
+  const lines = [];
+  for (let i = 0; i < 3000; i++) lines.push(`{"id":${i},"name":"名字-${i}-ünï","tags":["a","b"],"n":9007199254740993}`);
+  lines[10] = '{"bad": }';
+  lines[20] = '';
+  // A BOM, CRLF line ends, and 1000-byte chunks that cut lines and multi-byte characters.
+  const text = '﻿' + lines.join('\r\n') + '\r\n';
+  await openBlank(page);
+  await page.evaluate((t) => window.harness.loadLarge('big.jsonl', new TextEncoder().encode(t), { chunk: 1000 }), text);
+  let r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
+  check.eq('lines', r.stats.lines, 3000);
+  check.eq('valid', r.stats.valid, 2998);
+  check.eq('errors', r.stats.errors, 1);
+  check.eq('blank', r.stats.blank, 1);
+  check.eq('the webview says it shows JSON Lines', (await posted(page, 'docMode')).at(-1), { type: 'docMode', isJsonl: true });
+  const first = (await rowLocator(page, 0).locator('xpath=..').innerText()) || '';
+  check.ok('the first line is decoded (BOM skipped, UTF-8, big integer)', first.includes('"名字-0-ünï"') && first.includes('9007199254740993'), first.slice(0, 200));
+  check.eq('no Edit button on a read-only file', await page.locator('.a-edit').count(), 0);
+  check.ok('status bar says read-only', (await statusText(page)).includes('Read-only'));
+  check.eq('the invalid line has two rows', await page.locator('.formatted .row.err[data-r="10"]').count(), 2);
+  await send(page, { type: 'selection', lines: [2999], active: 2999 });
+  r = await report(page, (x) => x.active === 2999);
+  const last = await page.locator('.formatted .row[data-r="2999"]').allInnerTexts();
+  check.ok('the last line expands with its own text and no carriage return', last.join('\n').includes('"名字-2999-ünï"') && !last.join('').includes('\r'), last.slice(0, 3));
+  await page.fill('.search input', '名字-2500-');
+  r = await report(page, (x) => x.matches === 1 && !x.searching);
+  check.eq('search reads the bytes', r.matches, 1);
+  await page.fill('.search input', '');
+  await report(page, (x) => x.matches === 0);
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid');
+  check.eq('grid rows (blank line skipped)', r.grid.rows, 2999);
+  check.eq('grid columns', r.grid.columns, ['id', 'name', 'tags', 'n']);
+  await shot('Large file (bytes) in the grid');
+  await page.keyboard.press('Enter');
+  check.eq('Enter does not open the record editor', await page.locator('.editpanel:not([hidden])').count(), 0);
+});
+
+await scenario('W29', 'Large .json: JSON Lines are detected while loading; one big JSON value opens folded', ['F15', 'F16'], async ({ page, check, shot }) => {
+  await openBlank(page);
+  await page.evaluate(() => window.harness.loadLarge('lines.json', new TextEncoder().encode('{"k":1,"v":"one"}\n{"k":2,"v":"two"}\n{"k":3,"v":"three"}\n'), { chunk: 7 }));
+  let r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
+  check.eq('.json with one value per line is JSON Lines', [r.isJsonl, r.stats.lines, r.stats.valid], [true, 3, 3]);
+  check.eq('the host is told', (await posted(page, 'docMode')).at(-1), { type: 'docMode', isJsonl: true });
+  // One JSON value of about 10 MB: it needs the whole file, and opens with the second level folded.
+  await openBlank(page);
+  await page.evaluate(() => {
+    const rows = Array.from({ length: 200000 }, (_, i) => ({ id: i, name: 'n' + i, pos: { x: i, y: -i } }));
+    return window.harness.loadLarge('doc.json', new TextEncoder().encode(JSON.stringify({ rows, meta: { n: 1 } }, null, 1)), { chunk: 1 << 20 });
+  });
+  r = await report(page, (x) => x.large && x.fileName === 'doc.json' && x.formatted, 20000);
+  check.eq('one JSON value', [r.isJsonl, r.stats.valid], [false, 1]);
+  check.eq('the root is open, its members are folded', r.formatted.totalRows, 4);
+  await shot('A 10 MB JSON value opens folded');
+  await page.locator('.formatted .ph').first().click();
+  r = await report(page, (x) => x.formatted.totalRows > 4);
+  check.eq('opening "rows" lists the items, each one folded', r.formatted.totalRows, 200000 + 5);
+  await page.locator('.toolbar [data-fold="collapse"]').click();
+  r = await report(page, (x) => x.formatted.totalRows === 4);
+  check.eq('Collapse all', r.formatted.totalRows, 4);
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid');
+  check.eq('grid of the root object', [r.grid.rows, r.grid.columns], [2, ['key', 'value']]);
+});
+
+await scenario('W30', 'Grid: keys named "#" and "(value)" are ordinary columns', [], async ({ page, check, shot }) => {
+  await open(page, 'x.jsonl', { text: '{"#":"hello","(value)":"v1","a":1}\n{"#":"world","(value)":"v2","a":2}\n[1,2]\n', config: { defaultView: 'grid' } });
+  const r = await report(page, (x) => x.view === 'grid' && x.stats.parsed >= 3);
+  check.eq('columns: the built-in value column, then the three keys', r.grid.columns, ['(value)', '#', '(value)', 'a']);
+  const cells = await page.$$eval('.grow', (els) => els.map((e) => [...e.querySelectorAll('.gcells > .gc')].map((c) => c.textContent)));
+  check.eq('the "#" and "(value)" keys show their own values', cells.slice(0, 2), [['1', '', 'hello', 'v1', '1'], ['2', '', 'world', 'v2', '2']]);
+  check.ok('the array record shows in the built-in value column', cells[2][1].includes('[2]'), cells[2]);
+  await page.locator('.gh[data-col="#"]').click();
+  await page.locator('.gh[data-col="#"]').click();
+  await page.waitForTimeout(100);
+  check.eq('sorting by the "#" key sorts its values (descending)', await page.locator('.grows .grow').first().getAttribute('data-id'), '1');
+  await shot('Keys "#" and "(value)" beside the built-in columns');
+});
+
+await scenario('W31', 'Limits that hide data are named in the status bar', [], async ({ page, check, shot }) => {
+  const wide = {};
+  for (let i = 0; i < 400; i++) wide['k' + i] = i;
+  const lines = [JSON.stringify(wide)];
+  for (let i = 0; i < 2500; i++) lines.push(JSON.stringify({ id: i }));
+  await open(page, 'wide.jsonl', { text: lines.join('\n') + '\n', config: { defaultView: 'grid' } });
+  let r = await report(page, (x) => x.view === 'grid' && x.stats.parsed >= x.stats.lines);
+  check.eq('grid shows 300 columns', r.grid.columns.length, 300);
+  check.eq('and says so', r.notes, ['Showing the first 300 columns']);
+  check.ok('in the status bar', (await statusText(page)).includes('Showing the first 300 columns'));
+  await shot('Status bar names the column limit');
+  await send(page, { type: 'selection', lines: Array.from({ length: 12 }, (_, i) => i + 1), active: 1 });
+  await tabBtn(page, 'graph').click();
+  r = await report(page, (x) => x.view === 'graph' && x.selected.length === 12);
+  check.eq('graph: only 10 of 12 selected lines', r.notes, ['The graph shows the first 10 of 12 selected lines']);
+  await tabBtn(page, 'formatted').click();
+  await report(page, (x) => x.view === 'formatted');
+  // The range starts at line 2501 (the editor cursor) and is extended up to line 2 with Shift-click.
+  await send(page, { type: 'selection', lines: [2500], active: 2500 });
+  await report(page, (x) => x.active === 2500);
+  await page.evaluate(() => document.querySelector('.formatted .scroller').scrollTo(0, 0));
+  await page.waitForTimeout(100);
+  await rowLocator(page, 1).click({ modifiers: ['Shift'] });
+  r = await report(page, (x) => x.selected.length === 2000);
+  check.eq('a Shift range stops at 2 000 lines, counted from where it started', [r.selected[0], r.selected.at(-1)], [501, 2500]);
+  check.eq('and says so', r.notes, ['The selection stops at 2,000 lines']);
+});
+
+await scenario('W32', 'Graph export keeps the box of the selected node', [], async ({ page, check }) => {
+  await open(page, 'g.jsonl', { text: '{"a":{"b":1},"c":[1,2]}\n', config: { defaultView: 'graph' } });
+  await report(page, (x) => x.view === 'graph' && x.graph && x.graph.nodes === 3);
+  const box = await page.locator('.gsvg [data-n="0"] .gn-bg').boundingBox();
+  await page.mouse.click(box.x + 20, box.y + 40);
+  await report(page, (x) => x.graph && x.graph.selectedPath === '$');
+  await page.click('[data-export="svg"]');
+  await page.waitForFunction(() => window.harness.posted('export').length > 0);
+  const svg = (await posted(page, 'export'))[0].data;
+  check.ok('the selected node is in the export', /class="gn sel/.test(svg));
+  // A file must be well-formed XML. Path keys hold control characters: none may reach the file.
+  const xml = await page.evaluate((s) => new DOMParser().parseFromString(s, 'image/svg+xml').querySelector('parsererror')?.textContent ?? 'well-formed', svg);
+  check.eq('the SVG file is well-formed XML', xml, 'well-formed');
+  check.ok('nothing for scripts or the keyboard is in the file', !/data-|tabindex|aria-|gtoggle/.test(svg), svg.match(/data-\w+|tabindex|aria-\w+|gtoggle/)?.[0]);
+  await page.click('[data-export="png"]');
+  const png = await page.waitForFunction(() => window.harness.posted('export')[1], null, { timeout: 5000 }).then((h) => h.jsonValue(), () => undefined);
+  check.ok('PNG export gives an image', png?.format === 'png' && png.data.startsWith('data:image/png;base64,') && png.data.length > 2000, png?.data?.slice(0, 40));
+  await page.setContent(`<html><body style="margin:0">${svg}</body></html>`);
+  check.eq('every node box is drawn', await page.$$eval('.gn-bg', (els) => els.map((e) => getComputedStyle(e).display)), ['inline', 'inline', 'inline']);
+});
+
+await scenario('W33', 'A document update keeps folds, open sub-grids and the selection, also when lines move', ['F11'], async ({ page, check }) => {
+  const text = await open(page, 'events.jsonl').then(() => page.evaluate(async () => (await fetch('/test/fixtures/events.jsonl')).text()));
+  await complete(page);
+  await rowLocator(page, 2).click();
+  let r = await report(page, (x) => x.active === 2);
+  await page.locator('.formatted .row[data-r="2"] .fold[data-k]').nth(1).click();
+  r = await report(page, (x) => x.formatted.totalRows < r.formatted.totalRows);
+  const folded = r.formatted.totalRows;
+  await tabBtn(page, 'grid').click();
+  await report(page, (x) => x.view === 'grid');
+  await page.locator('.grow[data-id="2"] .vchip').first().click();
+  await report(page, (x) => x.grid.openCells === 1);
+  // A new first line: every record moves down by one.
+  await send(page, { type: 'update', text: '{"id":0,"level":"new"}\n' + text, version: 2 });
+  r = await report(page, (x) => x.version === 2 && x.stats.parsed >= x.stats.lines);
+  check.eq('lines', r.stats.lines, 22);
+  check.eq('the selection follows its record', [r.active, r.selected], [3, [3]]);
+  check.eq('the open sub-grid follows its record', [r.grid.openCells, await page.locator('.grow[data-id="3"] .gdetail').count()], [1, 1]);
+  await tabBtn(page, 'formatted').click();
+  r = await report(page, (x) => x.view === 'formatted');
+  check.eq('the folded node is still folded', r.formatted.totalRows, folded + 1);
+  // The record itself changes: its state is dropped, nothing else.
+  const lines = ('{"id":0,"level":"new"}\n' + text).split('\n');
+  lines[3] = '{"id":3,"changed":true}';
+  await send(page, { type: 'update', text: lines.join('\n'), version: 3 });
+  r = await report(page, (x) => x.version === 3 && x.stats.parsed >= x.stats.lines);
+  check.eq('valid count after the edit', r.stats.valid, 19);
+  check.eq('the edited record is still the active one', r.active, 3);
+});
+
+await scenario('W34', '200 000 lines: the first paint does not wait for the scan; late errors get their second row', ['F1', 'F7'], async ({ page, check }) => {
+  await openBlank(page);
+  const ms = await page.evaluate(() => {
+    const rows = [];
+    for (let i = 0; i < 200000; i++) rows.push(JSON.stringify({ id: i, level: i % 7 ? 'info' : 'warn', msg: 'request finished ' + i, user: { name: 'ada', roles: ['a', 'b'] }, ms: i % 900 }));
+    rows[199990] = '{"id": oops}';
+    const data = { type: 'init', doc: { uri: 'file:///big.jsonl', fileName: 'big.jsonl', languageId: 'jsonl', isJsonl: true, host: 'preview' }, text: rows.join('\n') + '\n', version: 1, config: window.harness.config() };
+    const t0 = performance.now();
+    window.dispatchEvent(new MessageEvent('message', { data }));
+    return performance.now() - t0;
+  });
+  check.ok('init returns before the whole file is parsed (under 400 ms)', ms < 400, Math.round(ms));
+  const first = await page.waitForFunction(() => window.harness.posted('report')[0]?.report).then((h) => h.jsonValue());
+  check.ok('the first report is sent while the scan is still running', first.stats.parsed < first.stats.lines, first.stats);
+  let r = await complete(page);
+  check.eq('the scan finds the one invalid line', [r.stats.lines, r.stats.errors], [200000, 1]);
+  await send(page, { type: 'selection', lines: [199995], active: 199995 });
+  r = await report(page, (x) => x.active === 199995);
+  check.eq('the invalid line has its two rows', await page.locator('.formatted .row.err[data-r="199990"]').count(), 2);
+  await page.fill('.search input', 'level=warn');
+  r = await report(page, (x) => !x.searching && x.matches > 0, 20000);
+  // Line 199 990 was a "warn" line before it became invalid.
+  check.eq('a path query over 21 MB runs in slices and finds every 7th line', r.matches, Math.ceil(200000 / 7) - 1);
+});
+
+await scenario('W35', 'A read error while a large file loads is shown; replaced views leave no listeners behind', [], async ({ page, check }) => {
+  await openBlank(page);
+  await page.evaluate(() =>
+    window.harness.send({
+      type: 'init',
+      doc: { uri: 'file:///fixtures/gone.jsonl', fileName: 'gone.jsonl', languageId: 'jsonl', isJsonl: true, host: 'preview', large: { bytes: 80 * 1024 * 1024 }, readOnly: true },
+      text: '',
+      version: 7,
+      config: window.harness.config(),
+    }),
+  );
+  await page.waitForFunction(() => document.querySelector('.boot')?.textContent.includes('Loading'));
+  await send(page, { type: 'notice', message: 'Better JSONL could not read the file: ENOENT' });
+  await page.waitForTimeout(100);
+  check.eq('the message takes the place of the progress text', await page.locator('.boot').innerText(), 'Better JSONL could not read the file: ENOENT');
+  // Every "init" builds new views (the preview follows the active editor). The old ones must let go of the window.
+  const cdp = await page.context().newCDPSession(page);
+  const listeners = async () => {
+    const out = {};
+    for (const target of ['window', 'document']) {
+      const { result } = await cdp.send('Runtime.evaluate', { expression: target });
+      out[target] = (await cdp.send('DOMDebugger.getEventListeners', { objectId: result.objectId })).listeners.length;
+    }
+    return out;
+  };
+  await page.evaluate(() => window.harness.load('events.jsonl'));
+  await report(page, (x) => x.fileName === 'events.jsonl' && x.stats.parsed >= x.stats.lines);
+  const once = await listeners();
+  for (const file of ['sample.json', 'events.jsonl', 'special-keys.jsonl', 'events.jsonl']) {
+    await page.evaluate((f) => window.harness.load(f), file);
+    await report(page, (x) => x.fileName === file && x.stats.parsed >= x.stats.lines);
+  }
+  check.eq('window and document listeners after four more files', await listeners(), once);
+});
+
+await scenario('W37', 'One JSON document: search finds what is inside folded nodes and opens only the way to it', [], async ({ page, check, shot }) => {
+  await openBlank(page);
+  // About 10 MB: it opens with the second level folded, so no match is on screen at first.
+  await page.evaluate(() => {
+    const rows = Array.from({ length: 200000 }, (_, i) => ({ id: i, name: 'n' + i, pos: { x: i, y: -i } }));
+    return window.harness.load('doc.json', { text: JSON.stringify({ rows, meta: { owner: 'needle-in-meta' } }) });
+  });
+  let r = await report(page, (x) => x.fileName === 'doc.json' && x.formatted);
+  check.eq('opens folded', r.formatted.totalRows, 4);
+  await page.fill('.search input', 'n199999');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('the counter shows the match before anything is opened', [await page.locator('.search .count').innerText(), r.formatted.totalRows], ['– / 1', 4]);
+  await page.press('.search input', 'Enter');
+  r = await report(page, (x) => x.formatted.totalRows > 4);
+  const hit = page.locator('.formatted .row.hit');
+  check.eq('Enter goes to the match', [await hit.count(), (await hit.innerText()).includes('"n199999"'), await page.locator('.search .count').innerText()], [1, true, '1 / 1']);
+  // "rows" and the one item are open; the other 199 999 items stay folded.
+  check.eq('only the way to the match is opened', r.formatted.totalRows, 200000 + 5 + 4);
+  check.ok('the text is marked', (await page.locator('.formatted .row.hit mark').count()) === 1);
+  await shot('Search inside a folded 10 MB JSON document');
+  await page.fill('.search input', 'needle');
+  // The search before also had one match: wait for the counter of the new one (no match in focus yet).
+  await page.waitForFunction(() => document.querySelector('.search .count').textContent === '– / 1');
+  await page.press('.search input', 'Enter');
+  await page.waitForFunction(() => document.querySelector('.formatted .row.hit')?.textContent.includes('needle-in-meta'));
+  check.ok('a second search goes to its own match', true);
+  await page.fill('.search input', '"id": ');
+  r = await report(page, (x) => x.matches === 1000);
+  check.eq('many matches: the counter stops at 1 000 and says there are more', await page.locator('.search .count').innerText(), '– / 1,000+');
+  await page.press('.search input', 'Enter');
+  await page.press('.search input', 'Enter');
+  await page.press('.search input', 'Shift+Enter');
+  await page.waitForFunction(() => document.querySelector('.search .count').textContent.startsWith('1 /'));
+  check.ok('Enter and Shift+Enter step through the matches', (await hit.innerText()).includes('"id": 0'), await hit.innerText());
+});
+
+await scenario('W38', 'Settings panel: an indent from settings.json that is not 2 or 4 is offered too', [], async ({ page, check }) => {
+  await open(page, 'events.jsonl', { config: { indent: 3 } });
+  await complete(page);
+  await page.click('.gear-btn');
+  await report(page, (x) => x.settingsOpen === true);
+  const options = await page.$$eval('.settings-seg[data-key="indent"] .seg-btn', (els) => els.map((e) => [e.dataset.value, e.classList.contains('on')]));
+  check.eq('2, the value in use, and 4', options, [['2', false], ['3', true], ['4', false]]);
+});
+
+await scenario('W39', 'JSON Lines edits arrive as changes: the lines are patched, the state follows, a mismatch asks for the whole text', ['F11'], async ({ page, check }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  const text = await page.evaluate(async () => (await (await fetch('/test/fixtures/events.jsonl')).text()));
+  const lines = text.split('\n');
+  await rowLocator(page, 2).click();
+  let r = await report(page, (x) => x.active === 2);
+  const edit = (base, version, changes, now) => send(page, { type: 'edit', base, version, lineCount: now.length, chars: now.join('\n').length, eol: 1, changes });
+  // 1. A new first line.
+  let now = ['{"id":0,"level":"new"}', ...lines];
+  await edit(1, 2, [{ sl: 0, sc: 0, el: 0, ec: 0, text: '{"id":0,"level":"new"}\n' }], now);
+  r = await report(page, (x) => x.version === 2 && x.stats.parsed >= x.stats.lines);
+  check.eq('one more line, the selection follows its record', [r.stats.lines, r.stats.valid, r.active, r.activeText], [22, 19, 3, lines[2]]);
+  // 2. Two changes in one message: inside the active line, and two lines joined further down.
+  const at = now[3].indexOf('slow query');
+  const joined = now.slice();
+  joined[3] = now[3].replace('slow query', 'slow 查询');
+  joined.splice(8, 2, now[8] + now[9]);
+  await edit(2, 3, [{ sl: 8, sc: now[8].length, el: 9, ec: 0, text: '' }, { sl: 3, sc: at, el: 3, ec: at + 10, text: 'slow 查询' }], joined);
+  r = await report(page, (x) => x.version === 3 && x.stats.parsed >= x.stats.lines);
+  now = joined;
+  check.eq('the edited line shows the new text', r.activeText, now[3]);
+  check.eq('two lines joined: one line less, and it is not valid JSON', [r.stats.lines, r.stats.errors], [21, 3]);
+  check.eq('nothing asked for the whole text so far', (await posted(page, 'resync')).length, 0);
+  // 3. The last line feed goes away: the same records, no empty last line.
+  const last = now.length - 1;
+  await edit(3, 4, [{ sl: last - 1, sc: now[last - 1].length, el: last, ec: 0, text: '' }], now.slice(0, -1));
+  r = await report(page, (x) => x.version === 4);
+  check.eq('records stay the same without the last line feed', r.stats.lines, 21);
+  // 4. Changes that do not fit (a wrong base version, then a wrong size): the webview asks for the text.
+  await edit(9, 10, [{ sl: 0, sc: 0, el: 0, ec: 0, text: 'x' }], now);
+  await page.waitForFunction(() => window.harness.posted('resync').length === 1);
+  await send(page, { type: 'edit', base: 4, version: 5, lineCount: 99, chars: 1, eol: 1, changes: [{ sl: 0, sc: 0, el: 0, ec: 0, text: 'x' }] });
+  await page.waitForFunction(() => window.harness.posted('resync').length === 2);
+  r = await report(page);
+  check.eq('the view is unchanged after a mismatch', [r.version, r.stats.lines], [4, 21]);
+  await send(page, { type: 'update', text, version: 6 });
+  r = await report(page, (x) => x.version === 6 && x.stats.parsed >= x.stats.lines);
+  check.eq('the whole text puts both sides in step again', [r.stats.lines, r.stats.valid, r.stats.errors], [21, 18, 2]);
+});
+
+await scenario('W40', 'Keyboard: fold arrows, toolbar buttons, grid headers and graph nodes work without a mouse', [], async ({ page, check, shot }) => {
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await rowLocator(page, 2).click();
+  let r = await report(page, (x) => x.active === 2);
+  const rows = r.formatted.totalRows;
+  const focusInfo = () => page.evaluate(() => {
+    const a = document.activeElement;
+    return { tag: a.tagName.toLowerCase(), cls: a.getAttribute('class'), expanded: a.getAttribute('aria-expanded'), row: a.closest('.row')?.dataset.j ?? null };
+  });
+  // The fold arrow of "user" (the second arrow of the record) is a button.
+  await page.locator('.formatted .row[data-r="2"] .fold[data-k]').nth(1).focus();
+  const before = await focusInfo();
+  check.eq('a fold arrow is a button that says it is open', [before.tag, before.expanded], ['button', 'true']);
+  await page.keyboard.press('Enter');
+  r = await report(page, (x) => x.formatted.totalRows < rows);
+  let now = await focusInfo();
+  check.eq('Enter folds the node; the focus stays on its arrow', [now.cls, now.expanded, now.row], ['fold closed', 'false', before.row]);
+  check.eq('Enter on a button does not open the record editor', await page.locator('.editpanel:not([hidden])').count(), 0);
+  await page.keyboard.press('Space');
+  r = await report(page, (x) => x.formatted.totalRows === rows);
+  now = await focusInfo();
+  check.eq('Space unfolds it again', [now.cls, now.expanded], ['fold', 'true']);
+  // Toolbar: Enter on the Grid tab switches the view.
+  await tabBtn(page, 'grid').focus();
+  await page.keyboard.press('Enter');
+  r = await report(page, (x) => x.view === 'grid');
+  check.eq('Enter on a toolbar button presses it', [r.view, await page.locator('.editpanel:not([hidden])').count()], ['grid', 0]);
+  // Grid: Enter on a header sorts, twice for descending.
+  await page.locator('.gh[data-col="ms"]').focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(100);
+  check.eq('Enter on a header sorts by it', [await page.locator('.grows .grow').first().getAttribute('data-id'), await page.locator('.gh[data-col="ms"]').getAttribute('aria-sort')], ['2', 'descending']);
+  check.eq('the header keeps the focus', (await focusInfo()).cls.includes('gh'), true);
+  // Graph: nodes take the focus; Enter selects, Left folds, Right unfolds.
+  await tabBtn(page, 'graph').click();
+  r = await report(page, (x) => x.view === 'graph' && x.graph);
+  const nodes = r.graph.nodes;
+  const user = page.locator('.gn').filter({ has: page.locator('.gtitle', { hasText: 'user' }) }).first();
+  await user.focus();
+  await page.keyboard.press('Enter');
+  r = await report(page, (x) => x.graph.selectedPath === '$.user');
+  check.eq('Enter selects the node', r.graph.selectedPath, '$.user');
+  await page.keyboard.press('ArrowLeft');
+  r = await report(page, (x) => x.graph.nodes < nodes);
+  const folded = await page.evaluate(() => [document.activeElement.getAttribute('class')?.includes('gn'), document.activeElement.getAttribute('aria-expanded')]);
+  check.eq('Left folds it (its child nodes go away); the focus stays on the node', folded, [true, 'false']);
+  await shot('Graph: a node folded with the keyboard, focus ring on it');
+  await page.keyboard.press('ArrowRight');
+  r = await report(page, (x) => x.graph.nodes === nodes);
+  check.eq('Right unfolds it', r.graph.nodes, nodes);
+});
+
+await scenario('W36', 'The background scan and search do not wait for timers (a window in the background slows timers down)', [], async ({ page, check }) => {
+  await openBlank(page);
+  // Every timer takes at least 3 seconds, as in a window the system put to sleep.
+  await page.evaluate(() => {
+    const real = window.setTimeout.bind(window);
+    window.setTimeout = (fn, ms, ...args) => real(fn, Math.max(ms || 0, 3000), ...args);
+  });
+  await page.evaluate(() => {
+    const rows = [];
+    // About 24 MB: above the size where a search runs in slices.
+    for (let i = 0; i < 200000; i++) rows.push(JSON.stringify({ id: i, level: i % 7 ? 'info' : 'warn', msg: 'request finished ' + i + ' ' + 'x'.repeat(40), ms: i % 900 }));
+    return window.harness.load('big.jsonl', { text: rows.join('\n') + '\n' });
+  });
+  // The report itself comes from a (slow) timer. The scan must be complete when it arrives.
+  const first = await page.waitForFunction(() => window.harness.posted('report')[0]?.report, null, { timeout: 15000 }).then((h) => h.jsonValue());
+  check.eq('the whole file is scanned by the first report', [first.stats.parsed, first.stats.valid], [200000, 200000]);
+  await page.fill('.search input', 'level=warn');
+  const r = await report(page, (x) => x.matches > 0 && !x.searching, 20000);
+  check.eq('the sliced search finishes too', r.matches, Math.ceil(200000 / 7));
 });
 
 await browser.close();

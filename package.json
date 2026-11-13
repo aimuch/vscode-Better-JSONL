@@ -2,9 +2,13 @@
   "name": "better-jsonl",
   "displayName": "Better JSONL",
   "description": "%description%",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "andy",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aimuch/vscode-Better-JSONL.git"
+  },
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.85.0"
@@ -145,12 +149,12 @@
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || resourceExtname == .jsonlines",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@3"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || resourceExtname == .jsonlines",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@4"
         }
       ],
@@ -173,11 +177,11 @@
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || resourceExtname == .jsonlines"
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || resourceExtname == .jsonlines || editorLangId == json"
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         }
       ]
     },
@@ -314,7 +318,10 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit -p .",
     "icon": "rsvg-convert -w 128 -h 128 media/icon.svg -o media/icon.png",
-    "package": "npm run typecheck && node esbuild.mjs --production && node -e \"require('fs').mkdirSync('dist-vsix',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links -o dist-vsix/",
+    "package": "npm run typecheck && node esbuild.mjs --production && node -e \"require('fs').mkdirSync('dist-vsix',{recursive:true})\" && vsce package --no-dependencies --no-rewrite-relative-links -o dist-vsix/",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node esbuild.mjs && node --test dist-test/unit/unit.test.js",
+    "screenshots": "node esbuild.mjs && node test/web/screenshots.mjs",
     "test:e2e:host": "node esbuild.mjs && node test/host/run.mjs",
     "test:e2e:web": "node esbuild.mjs && node test/web/run.mjs",
     "test:e2e": "npm run test:e2e:host && npm run test:e2e:ui && npm run test:e2e:web",

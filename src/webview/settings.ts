@@ -7,8 +7,9 @@ import { icon } from './icons';
 type Option = [value: string, label: string];
 
 /**
- * Settings drawer (like Git Map's). Every change is written to the VS Code user settings
- * by the extension host, so the panel and settings.json always agree.
+ * Settings drawer (like Git Map's). Every change is written to the VS Code settings by the
+ * extension host (to the workspace when the workspace sets that value, to the user settings
+ * otherwise), so the panel always shows the value in use.
  */
 export class SettingsPanel {
   readonly el: HTMLElement;
@@ -23,7 +24,7 @@ export class SettingsPanel {
     this.el.innerHTML = `
       <div class="settings-head"><h2>${t('Settings')}</h2><span class="dim">Better JSONL</span><button class="icon-btn settings-close" aria-label="${t('Close settings')}">${icon('close', 16)}</button></div>
       <div class="settings-content"></div>
-      <div class="settings-foot"><span class="dim">${t('Saved to your VS Code user settings.')}</span><a href="#" class="settings-link">${t('Open in VS Code Settings')}</a></div>`;
+      <div class="settings-foot"><span class="dim">${t('Saved to your VS Code settings.')}</span><a href="#" class="settings-link">${t('Open in VS Code Settings')}</a></div>`;
     this.content = this.el.querySelector('.settings-content') as HTMLElement;
     this.el.querySelector('.settings-close')!.addEventListener('click', () => this.close());
     this.el.querySelector('.settings-link')!.addEventListener('click', (e) => {
@@ -44,13 +45,13 @@ export class SettingsPanel {
     this.refresh();
     this.el.classList.add('active');
     (this.el.querySelector('.settings-close') as HTMLElement).focus();
-    this.app.scheduleReport();
+    this.app.stateChanged();
   }
 
   close(): void {
     this.open = false;
     this.el.classList.remove('active');
-    this.app.scheduleReport();
+    this.app.stateChanged();
   }
 
   /** Re-renders from the current config (after a change from here or from settings.json). */
@@ -66,11 +67,13 @@ export class SettingsPanel {
     const check = (key: SettingKey, label: string, value: boolean, hint: string) =>
       `<label class="settings-check"><input type="checkbox" data-key="${key}"${value ? ' checked' : ''}><span><span class="settings-check-label">${esc(label)}</span><span class="settings-hint">${esc(hint)}</span></span></label>`;
     const alt = navigator.platform.includes('Mac') ? '⌥Z' : 'Alt+Z';
+    // 2 and 4, and the value in use when settings.json has another one (the setting allows 1 to 8).
+    const indents = [...new Set([2, 4, c.indent])].sort((a, b) => a - b);
     this.content.innerHTML = `
       <section class="settings-section"><h3>${t('APPEARANCE')}</h3>
         ${row(t('Theme'), seg('theme', [['vscode', t('Follow VS Code')], ['light', t('Light')], ['dark', t('Dark')], ['system', t('Follow system')]], c.theme))}
         ${row(t('Word wrap'), seg('wordWrap', [['followEditor', t('Follow editor')], ['on', t('On')], ['off', t('Off')]], c.wordWrap), t('{0} toggles wrap in the open view.', alt))}
-        ${row(t('Indent'), seg('indent', [['2', t('{0} spaces', 2)], ['4', t('{0} spaces', 4)]], String(c.indent)), t('Used by the views and the record editor.'))}
+        ${row(t('Indent'), seg('indent', indents.map((n) => [String(n), t('{0} spaces', n)]), String(c.indent)), t('Used by the views and the record editor.'))}
       </section>
       <section class="settings-section"><h3>${t('LANGUAGE')}</h3>
         <div class="settings-control">
@@ -85,6 +88,7 @@ export class SettingsPanel {
       </section>
       <section class="settings-section"><h3>${t('TEXT EDITOR')}</h3>
         ${check('syncSelection', t('Sync the current line with the text editor'), c.syncSelection, t('Moving the cursor expands that line; clicking a line moves the cursor.'))}
+        ${check('preview.followActiveEditor', t('The side preview follows the active editor'), c.followActiveEditor, t('It switches to the JSON or JSONL editor that becomes active.'))}
         ${check('formatDocument.enabled', t('Format Document compacts JSONL lines'), c.formatDocument, t('Off: Format Document does not change .jsonl files.'))}
         ${check('expandLines.showReminder', t('Remind me after Expand Selected Lines'), c.expandReminder, t('The file is not valid JSON Lines until you compact it.'))}
       </section>`;

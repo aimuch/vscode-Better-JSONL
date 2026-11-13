@@ -1,5 +1,7 @@
 // Extension-host E2E tests. They run in a real VS Code with the extension loaded.
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { BetterJsonlApi } from '../../src/extension';
@@ -10,6 +12,14 @@ import type { RenderReport } from '../../src/shared/protocol';
 const FIXTURES = process.env.BETTER_JSONL_FIXTURES as string;
 const uri = (name: string) => vscode.Uri.file(path.join(FIXTURES, name));
 const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Removes a temporary folder. On Windows a file can still be held for a moment: that must not fail the test. */
+function removeDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch {
+    // The system cleans its temporary folder later.
+  }
+}
 const parsed = (r: RenderReport) => r.stats.parsed >= r.stats.lines;
 
 async function waitFor<T>(fn: () => T | undefined | false, label: string, timeout = 10000): Promise<T> {
@@ -410,6 +420,190 @@ describe('Better JSONL · extension host', () => {
     const zh = await read('package.nls.zh-cn.json');
     assert.deepStrictEqual(Object.keys(zh).sort(), Object.keys(en).sort(), 'every English entry has a Chinese one');
     assert.strictEqual(zh['command.openPreviewToSide'], 'Better JSONL: 在侧边打开预览');
+  });
+
+  it('H23 a .json file with one value per line: reveal and cursor sync use line numbers', async () => {
+    const s = await previewFor('lines.json');
+    assert.strictEqual(s.lastReport?.isJsonl, true);
+    await waitFor(() => s.received.some((m) => m.type === 'docMode' && m.isJsonl), 'the webview tells the host it shows JSON Lines');
+    await s.handle({ type: 'reveal', line: 1, path: ['v'] });
+    const ed = vscode.window.activeTextEditor as vscode.TextEditor;
+    assert.strictEqual(ed.selection.start.line, 1, 'reveal goes to the record, not to the first line');
+    assert.strictEqual(ed.document.getText(ed.selection), '"v":"two"');
+    await settle(200);
+    ed.selection = new vscode.Selection(2, 0, 2, 0);
+    const r = await s.waitForReport((x) => x.active === 2);
+    assert.deepStrictEqual(r.selected, [2], 'the editor cursor drives the view');
+  });
+
+  it('H24 a file above 50 MB opens read-only: read from disk in chunks, reloaded on request [F15]', async function () {
+    this.timeout(180000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    const file = vscode.Uri.file(path.join(dir, 'big.jsonl'));
+    try {
+      // About 52 MB: more than VS Code gives to an extension. BETTER_JSONL_BIG_MB makes it larger, to measure.
+      const megabytes = Number(process.env.BETTER_JSONL_BIG_MB) || 52;
+      let lines = 0;
+      const fd = fs.openSync(file.fsPath, 'w');
+      for (let block = 0; block < megabytes; block++) {
+        const rows: string[] = [];
+        let size = 0;
+        while (size < 1024 * 1024) {
+          const row = `{"id":${lines},"level":"${lines % 7 ? 'info' : 'warn'}","msg":"名字 request finished ${lines}","big":9007199254740993}\n`;
+          rows.push(row);
+          size += Buffer.byteLength(row);
+          lines++;
+        }
+        fs.writeSync(fd, rows.join(''));
+      }
+      fs.closeSync(fd);
+      const bytes = fs.statSync(file.fsPath).size;
+      assert.ok(bytes > 50 * 1024 * 1024, `test file has ${bytes} bytes`);
+      const started = Date.now();
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
+      const s = await waitFor(() => api.sessions().find((x) => x.isLarge && x.resource?.fsPath === file.fsPath), 'a session for the large file', 20000);
+      const shown = await s.waitForReport((x) => x.large && x.stats.lines > 0, 120000);
+      const firstRows = Date.now() - started;
+      let r = await s.waitForReport((x) => x.large && !x.loading && parsed(x), 120000);
+      console.log(`H24: ${Math.round(bytes / 1048576)} MB, ${lines} lines: first rows after ${firstRows} ms (${shown.stats.lines} lines), loaded and scanned after ${Date.now() - started} ms`);
+      assert.strictEqual(s.document, undefined, 'no text document for a large file');
+      assert.deepStrictEqual([r.isJsonl, r.stats.lines, r.stats.valid, r.stats.errors], [true, lines, lines, 0]);
+      // Read-only: an edit is refused and the file stays as it is.
+      await s.handle({ type: 'editLine', line: 0, original: 'x', text: '{}' });
+      assert.strictEqual(fs.statSync(file.fsPath).size, bytes);
+      // "Open Preview" again shows the same panel; it does not read the file a second time.
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
+      assert.strictEqual(api.sessions().filter((x) => x.isLarge).length, 1);
+      // Reload after the file grew.
+      fs.appendFileSync(file.fsPath, '{"id":"last"}\n');
+      await s.handle({ type: 'reload' });
+      r = await s.waitForReport((x) => x.stats.lines === lines + 1 && !x.loading && parsed(x), 120000);
+      assert.strictEqual(r.stats.valid, lines + 1);
+      // The full view of a large file is the same kind of panel (the custom editor needs a text document).
+      await vscode.commands.executeCommand('betterJsonl.openInViewer', file);
+      assert.strictEqual(api.sessions().filter((x) => x.isLarge).length, 1);
+      s.panel.dispose();
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H25 the view follows the file when its text document is gone; an edit checks the text that is there now [F13]', async function () {
+    this.timeout(30000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    const file = vscode.Uri.file(path.join(dir, 't.jsonl'));
+    try {
+      fs.writeFileSync(file.fsPath, '{"a":1}\n{"a":2}\n');
+      // From the Explorer: a preview without a text editor.
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
+      const s = await waitFor(() => (api.preview()?.resource?.fsPath === file.fsPath ? api.preview() : undefined), 'preview for the file');
+      await s.waitForReport((r) => parsed(r) && r.stats.lines === 2);
+      // As when VS Code closes the unused document after a few minutes.
+      (s as unknown as { doc: vscode.TextDocument | undefined }).doc = undefined;
+      fs.writeFileSync(file.fsPath, '{"a":1}\n{"a":3}\n{"a":4}\n');
+      const r = await s.waitForReport((x) => parsed(x) && x.stats.lines === 3, 15000);
+      assert.strictEqual(r.stats.valid, 3, 'the change on disk reached the view');
+      const doc = await waitFor(() => s.document, 'the session has the document again');
+      await s.handle({ type: 'editLine', line: 1, original: '{"a":2}', text: '{"a":9}' });
+      assert.strictEqual(doc.lineAt(1).text, '{"a":3}', 'an edit that started on the old text is refused');
+      await s.handle({ type: 'editLine', line: 1, original: '{"a":3}', text: '{ "a": 9 }' });
+      await waitFor(() => doc.lineAt(1).text === '{"a":9}', 'the edit on the current text is written');
+      await doc.save();
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H26 the settings panel refuses values that are not valid, and writes to the workspace when the workspace sets the value', async () => {
+    const s = await customEditorFor('events.jsonl');
+    const cfg = () => vscode.workspace.getConfiguration('betterJsonl');
+    const settingsDir = path.join(FIXTURES, '.vscode');
+    const hadDir = fs.existsSync(settingsDir);
+    try {
+      await s.handle({ type: 'setSetting', key: 'theme', value: 'pink' });
+      await s.handle({ type: 'setSetting', key: 'graph.maxNodes', value: 5 });
+      await s.handle({ type: 'setSetting', key: 'syncSelection', value: 'yes' });
+      assert.deepStrictEqual(
+        ['theme', 'graph.maxNodes', 'syncSelection'].map((k) => cfg().inspect(k)?.globalValue),
+        [undefined, undefined, undefined],
+      );
+      await cfg().update('indent', 4, vscode.ConfigurationTarget.Workspace);
+      await s.handle({ type: 'setSetting', key: 'indent', value: 2 });
+      const now = cfg().inspect('indent');
+      assert.deepStrictEqual([now?.workspaceValue, now?.globalValue, cfg().get('indent')], [2, undefined, 2], 'the value in use changed');
+    } finally {
+      await cfg().update('indent', undefined, vscode.ConfigurationTarget.Workspace);
+      await cfg().update('indent', undefined, vscode.ConfigurationTarget.Global);
+      if (!hadDir) fs.rmSync(settingsDir, { recursive: true, force: true });
+    }
+  });
+
+  it('H27 Expand Selected Lines with several cursors on the same lines expands each record once', async () => {
+    const doc = await vscode.workspace.openTextDocument({ language: 'jsonl', content: '{"a":1}\n{"b":2}\n{"c":3}\n' });
+    const editor = await vscode.window.showTextDocument(doc);
+    editor.options = { tabSize: 2, insertSpaces: true };
+    // Two cursors on line 1, one of them a selection that reaches into line 2, and a cursor on line 3.
+    editor.selections = [new vscode.Selection(0, 1, 0, 1), new vscode.Selection(0, 4, 1, 2), new vscode.Selection(2, 0, 2, 0)];
+    const n = await vscode.commands.executeCommand<number>('betterJsonl.expandLines');
+    assert.strictEqual(n, 3);
+    assert.strictEqual(doc.getText(), '{\n  "a": 1\n}\n{\n  "b": 2\n}\n{\n  "c": 3\n}\n');
+  });
+
+  it('H28 Compact Lines works on every selection, like Expand Selected Lines', async () => {
+    const text = '{\n  "a": 1\n}\n{ "keep" : "as it is" }\n{\n  "c": 3\n}\n';
+    const doc = await vscode.workspace.openTextDocument({ language: 'jsonl', content: text });
+    const editor = await vscode.window.showTextDocument(doc);
+    // Two selections: the first and the last record. The record between them is not selected.
+    editor.selections = [new vscode.Selection(0, 0, 2, 1), new vscode.Selection(4, 0, 6, 1)];
+    const ok = await vscode.commands.executeCommand<boolean>('betterJsonl.compactLines');
+    assert.strictEqual(ok, true);
+    assert.strictEqual(doc.getText(), '{"a":1}\n{ "keep" : "as it is" }\n{"c":3}\n');
+  });
+
+  it('H29 edits of a JSON Lines document reach the view as changes, and the view shows the same text [F11]', async () => {
+    const s = await previewFor('crlf.jsonl');
+    const doc = s.document as vscode.TextDocument;
+    const editor = vscode.window.visibleTextEditors.find((e) => e.document === doc) as vscode.TextEditor;
+    const before = doc.getText();
+    const inView = async (line: number) => {
+      editor.selection = new vscode.Selection(line, 0, line, 0);
+      const r = await s.waitForReport((x) => x.version === doc.version && x.active === line && parsed(x));
+      assert.strictEqual(r.activeText, doc.lineAt(line).text, `line ${line + 1} in the view`);
+      return r;
+    };
+    const sent = () => s.sentKinds.join(',');
+    s.sentKinds.length = 0;
+    // Typing inside a line.
+    await editor.edit((b) => b.insert(new vscode.Position(1, 1), '"名字":"ünï",'));
+    await inView(1);
+    // A new line in the middle, with the line end of the document (CRLF).
+    await editor.edit((b) => b.insert(new vscode.Position(1, 0), '{"new":true}\r\n'));
+    let r = await inView(1);
+    assert.strictEqual(r.stats.lines, 4);
+    await inView(2);
+    // Two cursors in one edit, then a line removed.
+    await editor.edit((b) => {
+      b.insert(new vscode.Position(0, 1), '"x":0,');
+      b.insert(new vscode.Position(3, 1), '"y":9,');
+    });
+    await inView(0);
+    await inView(3);
+    await editor.edit((b) => b.delete(new vscode.Range(1, 0, 2, 0)));
+    r = await inView(1);
+    assert.strictEqual(r.stats.lines, 3);
+    assert.strictEqual(sent(), 'edit,edit,edit,edit', 'four updates, each one a list of changes');
+    assert.strictEqual(s.received.filter((m) => m.type === 'resync').length, 0, 'the view never asked for the whole text');
+    // Undo everything: the view is back at the file.
+    while (doc.isDirty) await vscode.commands.executeCommand('undo');
+    assert.strictEqual(doc.getText(), before);
+    r = await inView(2);
+    assert.deepStrictEqual([r.stats.lines, r.stats.valid], [3, 3]);
+    // A large paste goes as the whole text.
+    s.sentKinds.length = 0;
+    await editor.edit((b) => b.insert(new vscode.Position(0, 0), `{"pad":"${'x'.repeat(80000)}"}\r\n`));
+    await inView(1);
+    assert.strictEqual(sent(), 'update');
+    await vscode.commands.executeCommand('undo');
   });
 
   it('H15 the preview follows the active JSON editor', async () => {

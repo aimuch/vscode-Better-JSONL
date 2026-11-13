@@ -19,7 +19,15 @@ export interface PLine {
 
 type Frame = { ents: [string | number, JVal][]; i: number; d: number; arr: boolean; path: string; comma: boolean };
 
-export function buildLines(root: JVal, folds: ReadonlySet<string>): PLine[] {
+/**
+ * `folds` holds the containers the user toggled. A container at depth `foldDepth` or deeper
+ * starts folded, so a toggle there opens it; above that depth a toggle folds it.
+ */
+export function isFolded(folds: ReadonlySet<string>, path: string, depth: number, foldDepth: number): boolean {
+  return folds.has(path) !== depth >= foldDepth;
+}
+
+export function buildLines(root: JVal, folds: ReadonlySet<string>, foldDepth = Infinity): PLine[] {
   const out: PLine[] = [];
   const stack: Frame[] = [];
   const emit = (v: JVal, key: string | number | undefined, d: number, path: string, comma: boolean) => {
@@ -32,7 +40,7 @@ export function buildLines(root: JVal, folds: ReadonlySet<string>): PLine[] {
     const n = sizeOf(v);
     if (n === 0) {
       out.push({ d, key: k, kind: 'empty', br: arr ? '[]' : '{}', comma, path });
-    } else if (folds.has(path)) {
+    } else if (isFolded(folds, path, d, foldDepth)) {
       out.push({ d, key: k, kind: 'folded', br: arr ? '[]' : '{}', count: n, comma, path });
     } else {
       out.push({ d, key: k, kind: 'open', br: arr ? '[' : '{', count: n, comma: false, path });
@@ -53,10 +61,10 @@ export function buildLines(root: JVal, folds: ReadonlySet<string>): PLine[] {
   return out;
 }
 
-/** Same count as buildLines(root, folds).length, without building the lines. */
-export function countLines(root: JVal, folds: ReadonlySet<string>): number {
+/** Same count as buildLines(root, folds, foldDepth).length, without building the lines. */
+export function countLines(root: JVal, folds: ReadonlySet<string>, foldDepth = Infinity): number {
   let n = 0;
-  if (folds.size === 0) {
+  if (folds.size === 0 && foldDepth === Infinity) {
     const stack: JVal[] = [root];
     while (stack.length) {
       const v = stack.pop() as JVal;
@@ -73,34 +81,20 @@ export function countLines(root: JVal, folds: ReadonlySet<string>): number {
     }
     return n;
   }
-  const stack: [JVal, string][] = [[root, '']];
+  const stack: [JVal, string, number][] = [[root, '', 0]];
   while (stack.length) {
-    const [v, p] = stack.pop() as [JVal, string];
+    const [v, p, d] = stack.pop() as [JVal, string, number];
     if (!isContainer(v)) {
       n++;
       continue;
     }
-    const ents = entriesOf(v);
-    if (!ents.length || folds.has(p)) n++;
+    if (sizeOf(v) === 0 || isFolded(folds, p, d, foldDepth)) n++;
     else {
       n += 2;
-      for (const [k, c] of ents) stack.push([c, childKey(p, k)]);
+      for (const [k, c] of entriesOf(v)) stack.push([c, childKey(p, k), d + 1]);
     }
   }
   return n;
-}
-
-/** Path keys of every non-root container with members. */
-export function containerKeys(root: JVal): string[] {
-  const out: string[] = [];
-  const stack: [JVal, string][] = [[root, '']];
-  while (stack.length) {
-    const [v, p] = stack.pop() as [JVal, string];
-    if (!isContainer(v) || sizeOf(v) === 0) continue;
-    if (p) out.push(p);
-    for (const [k, c] of entriesOf(v)) stack.push([c, childKey(p, k)]);
-  }
-  return out;
 }
 
 const MAX_STRING = 10_000;

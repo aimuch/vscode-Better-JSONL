@@ -42,6 +42,7 @@ try {
       BETTER_JSONL_FIXTURES: fixtures,
       BETTER_JSONL_RESULTS: process.env.MOCHA_GREP ? join(work, 'partial.json') : join(root, 'test-results/host-e2e.json'),
       MOCHA_GREP: process.env.MOCHA_GREP ?? '',
+      BETTER_JSONL_BIG_MB: process.env.BETTER_JSONL_BIG_MB ?? '',
     },
   });
   console.log('Host E2E passed. Results: test-results/host-e2e.json');

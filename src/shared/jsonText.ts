@@ -150,12 +150,14 @@ export type CompactResult = { ok: true; text: string; count: number } | { ok: fa
 
 /**
  * Turns text that holds JSON values (one per line, or pretty-printed over
- * several lines) into one compact value per line. Nothing changes when any
- * value is invalid.
+ * several lines) into one compact value per line. Blank lines between values
+ * stay. Nothing changes when any value is invalid.
  */
 export function compactText(src: string, eol = '\n'): CompactResult {
   const spans = splitJsonValues(src);
   const out: string[] = [];
+  let prev = 0;
+  let count = 0;
   for (const s of spans) {
     const piece = src.slice(s.start, s.end);
     try {
@@ -163,9 +165,15 @@ export function compactText(src: string, eol = '\n'): CompactResult {
     } catch (e) {
       return { ok: false, message: errorMessage(e), line: lineOf(src, s.start) };
     }
+    // Blank lines between values stay: one line feed ends the value before, each further one is a blank line.
+    let feeds = 0;
+    for (let i = prev; i < s.start; i++) if (src.charCodeAt(i) === 10) feeds++;
+    for (let i = count ? 1 : 0; i < feeds; i++) out.push('');
     out.push(minifyJson(piece));
+    prev = s.end;
+    count++;
   }
-  return { ok: true, text: out.join(eol), count: out.length };
+  return { ok: true, text: out.join(eol), count };
 }
 
 export function errorMessage(e: unknown): string {

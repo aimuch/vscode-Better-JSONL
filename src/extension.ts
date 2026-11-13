@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
-import { formatDocumentEnabled, isSupportedDocument, uiLanguage } from './config';
+import { formatDocumentEnabled, isSupportedDocument, setTestMode, uiLanguage } from './config';
 import { setLang, t } from './shared/i18n';
 import { ViewerEditorProvider, VIEWER_VIEW_TYPE } from './customEditor';
 import { compactLines, expandLines, formatJsonl } from './lineCommands';
-import { PREVIEW_VIEW_TYPE, PreviewManager } from './preview';
-import type { ViewerSession } from './session';
+import { PREVIEW_VIEW_TYPE, PreviewManager, resolveTarget } from './preview';
+import type { SessionEnv, Target, ViewerSession } from './session';
 import type { HostMessage } from './shared/protocol';
 
 export interface BetterJsonlApi {
@@ -14,6 +14,9 @@ export interface BetterJsonlApi {
 
 export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
   setLang(uiLanguage());
+  const testMode = context.extensionMode === vscode.ExtensionMode.Test;
+  setTestMode(testMode);
+  const env: SessionEnv = { extensionUri: context.extensionUri, extensionId: context.extension.id, testMode };
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('betterJsonl.language')) setLang(uiLanguage());
@@ -34,11 +37,11 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
     });
   };
 
-  const preview = new PreviewManager(context.extensionUri, track);
+  const preview = new PreviewManager(env, track);
   context.subscriptions.push(
     preview,
     vscode.window.registerWebviewPanelSerializer(PREVIEW_VIEW_TYPE, preview),
-    vscode.window.registerCustomEditorProvider(VIEWER_VIEW_TYPE, new ViewerEditorProvider(context.extensionUri, track), {
+    vscode.window.registerCustomEditorProvider(VIEWER_VIEW_TYPE, new ViewerEditorProvider(env, track), {
       webviewOptions: { retainContextWhenHidden: true },
       supportsMultipleEditorsPerDocument: true,
     }),
@@ -62,17 +65,20 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
     { dispose: () => formatter?.dispose() },
   );
 
-  const targetDocument = async (uri?: vscode.Uri): Promise<vscode.TextDocument | undefined> => {
-    if (uri instanceof vscode.Uri) return vscode.workspace.openTextDocument(uri);
-    const editor = vscode.window.activeTextEditor;
-    if (editor && isSupportedDocument(editor.document)) return editor.document;
-    const tab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
-    if (tab instanceof vscode.TabInputText || tab instanceof vscode.TabInputCustom) {
-      return vscode.workspace.openTextDocument(tab.uri);
+  /** The file a command is for: the argument, the active text editor, or the active tab. */
+  const target = async (uri?: vscode.Uri): Promise<Target | undefined> => {
+    try {
+      if (uri instanceof vscode.Uri) return await resolveTarget(uri);
+      const editor = vscode.window.activeTextEditor;
+      if (editor && isSupportedDocument(editor.document)) return { doc: editor.document };
+      // VS Code shows a file above 50 MB in a tab, but extensions get no text editor for it.
+      const tab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+      if (tab instanceof vscode.TabInputText || tab instanceof vscode.TabInputCustom) return await resolveTarget(tab.uri);
+    } catch (e) {
+      void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', e instanceof Error ? e.message : String(e)));
+      return undefined;
     }
-    void vscode.window.showWarningMessage(
-      t('Better JSONL: open a JSON or JSONL file first. VS Code does not give extensions files larger than 50 MB.'),
-    );
+    void vscode.window.showWarningMessage(t('Better JSONL: open a JSON or JSONL file first.'));
     return undefined;
   };
 
@@ -91,16 +97,19 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
 
   reg('betterJsonl.openPreviewToSide', async (uri?: vscode.Uri) => {
-    const doc = await targetDocument(uri);
-    if (doc) preview.show(doc, true);
+    const what = await target(uri);
+    if (what) preview.show(what, true);
   });
   reg('betterJsonl.openPreview', async (uri?: vscode.Uri) => {
-    const doc = await targetDocument(uri);
-    if (doc) preview.show(doc, false);
+    const what = await target(uri);
+    if (what) preview.show(what, false);
   });
   reg('betterJsonl.openInViewer', async (uri?: vscode.Uri) => {
-    const doc = await targetDocument(uri);
-    if (doc) await vscode.commands.executeCommand('vscode.openWith', doc.uri, VIEWER_VIEW_TYPE);
+    const what = await target(uri);
+    if (!what) return;
+    // The custom editor needs a text document. A large file has none: it opens in its own panel.
+    if ('doc' in what) await vscode.commands.executeCommand('vscode.openWith', what.doc.uri, VIEWER_VIEW_TYPE);
+    else preview.show(what, false);
   });
   reg('betterJsonl.openAsText', async () => {
     const s = activeSession();

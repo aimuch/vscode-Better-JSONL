@@ -111,6 +111,29 @@
     send(msg) {
       window.postMessage(msg, '*');
     },
+    config(over) {
+      return Object.assign({ defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, followActiveEditor: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en', reports: true }, over || {});
+    },
+    /** A large file: "init" without text, then the UTF-8 bytes in "chunk" messages (as the host sends them). */
+    async loadLarge(file, bytes, opts = {}) {
+      const isJsonl = /\.(jsonl|ndjson)$/.test(file);
+      const version = (window.__gen = (window.__gen || 100) + 1);
+      window.harness.send({
+        type: 'init',
+        doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview', large: { bytes: bytes.length }, readOnly: true },
+        text: '',
+        version,
+        config: window.harness.config(opts.config),
+      });
+      const size = opts.chunk || 65536;
+      for (let p = 0; ; p += size) {
+        const done = p + size >= bytes.length;
+        window.harness.send({ type: 'chunk', version, data: bytes.slice(p, p + size), done });
+        if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
+        if (done) break;
+      }
+      return version;
+    },
     async load(file, opts = {}) {
       const text = opts.text ?? (await (await fetch('/test/fixtures/' + file)).text());
       const isJsonl = /\.(jsonl|ndjson)$/.test(file);
@@ -119,7 +142,7 @@
         doc: { uri: 'file:///fixtures/' + file, fileName: file, languageId: isJsonl ? 'jsonl' : 'json', isJsonl, host: 'preview' },
         text,
         version: 1,
-        config: Object.assign({ defaultView: 'formatted', expandMode: 'focus', indent: 2, graphMaxNodes: 1500, syncSelection: true, theme: 'vscode', wordWrap: 'followEditor', wrap: false, formatDocument: false, expandReminder: true, language: 'auto', lang: 'en', vscodeLanguage: 'en' }, opts.config || {}),
+        config: window.harness.config(opts.config),
       });
     },
   };

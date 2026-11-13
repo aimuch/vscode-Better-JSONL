@@ -10,10 +10,6 @@ export function setLang(lang: Lang): void {
   current = lang;
 }
 
-export function getLang(): Lang {
-  return current;
-}
-
 /** 'auto' follows the VS Code display language (zh-cn, zh-sg and zh-hans* map to Simplified Chinese). */
 export function resolveLang(setting: string | undefined, vscodeLanguage: string): Lang {
   if (setting === 'en' || setting === 'zh-cn') return setting;
@@ -168,7 +164,7 @@ const ZH: Record<string, string> = {
   // settings panel
   'Better JSONL settings': 'Better JSONL 设置',
   'Close settings': '关闭设置',
-  'Saved to your VS Code user settings.': '保存在 VS Code 用户设置中。',
+  'Saved to your VS Code settings.': '保存在 VS Code 设置中。',
   'Open in VS Code Settings': '在 VS Code 设置中打开',
   APPEARANCE: '外观',
   Theme: '主题',
@@ -217,7 +213,31 @@ const ZH: Record<string, string> = {
   'Compact Lines': '压缩行',
   "Don't Show Again": '不再提示',
   'Better JSONL: line {0} is not valid JSON ({1}). Nothing changed.': 'Better JSONL：第 {0} 行不是有效的 JSON（{1}）。未做任何修改。',
-  'Better JSONL: open a JSON or JSONL file first. VS Code does not give extensions files larger than 50 MB.':
-    'Better JSONL：请先打开一个 JSON 或 JSONL 文件。VS Code 不会把大于 50 MB 的文件交给扩展。',
+  'Better JSONL: open a JSON or JSONL file first.': 'Better JSONL：请先打开一个 JSON 或 JSONL 文件。',
   'Better JSONL: open a Better JSONL view first.': 'Better JSONL：请先打开一个 Better JSONL 视图。',
+  'Better JSONL could not read the file: {0}': 'Better JSONL 无法读取文件：{0}',
+  'The file changed on disk.': '磁盘上的文件已变化。',
+  'The file was deleted or moved. The view shows its last content.': '文件已被删除或移动。视图显示的是它最后的内容。',
+  'Not a valid value for {0}: {1}': '{0} 的值无效：{1}',
+  // large files
+  'Loading {0} of {1}…': '加载中 {0} / {1}…',
+  'Parsing {0}…': '正在解析 {0}…',
+  'This file is too large to show as one JSON value ({0}).': '文件太大，无法作为单个 JSON 值显示（{0}）。',
+  'Expand all is off for files over {0}. Only the selected lines are expanded.': '超过 {0} 的文件不支持全部展开，只展开选中的行。',
+  'This file is read-only here: it is too large for VS Code to edit through an extension.': '此文件在这里是只读的：它太大，VS Code 不允许扩展编辑。',
+  '↑/↓ move · Shift extends · double-click jumps to source': '↑/↓ 移动 · Shift 扩展选择 · 双击跳到源码',
+  'The side preview follows the active editor': '侧边预览跟随活动编辑器',
+  'It switches to the JSON or JSONL editor that becomes active.': '切换到当前活动的 JSON 或 JSONL 编辑器。',
+  Reload: '重新加载',
+  Dismiss: '关闭提示',
+  'Read-only (large file)': '只读（大文件）',
+  'The selection stops at {0} lines': '选区最多 {0} 行',
+  'searching {0}%': '搜索中 {0}%',
+  'loading {0}%': '加载中 {0}%',
+  'Searching…': '搜索中…',
+  ' … about {0} more bytes': ' … 还有约 {0} 字节',
+  'Showing the first {0} columns': '只显示前 {0} 列',
+  'Sorting and column filters need {0} rows or fewer in a file this large. Search to narrow the rows.': '这么大的文件，排序和列过滤最多支持 {0} 行。请先用搜索缩小范围。',
+  '… {0} more columns': '… 还有 {0} 列',
+  'The graph shows the first {0} of {1} selected lines': '图只显示所选 {1} 行中的前 {0} 行',
 };

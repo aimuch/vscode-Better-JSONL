@@ -22,7 +22,12 @@ const sourceTextSupported = (() => {
   }
 })();
 
-const LONG_DIGITS = /\d{16,}/;
+/**
+ * A number that may not fit a JavaScript number: 16 or more digits where a number can start,
+ * or a long fraction. Digits inside a string do not count: the slower parse below is only worth
+ * it for real numbers (it takes about 6 times as long).
+ */
+const LONG_NUMBER = /(?:^|[\s:,[])-?\d{16,}|\d\.\d{15,}/;
 
 function keepSource(_k: string, v: unknown, ctx?: { source?: string }): unknown {
   if (typeof v === 'number' && ctx && ctx.source !== undefined && !Number.isSafeInteger(v) && String(v) !== ctx.source) {
@@ -33,7 +38,7 @@ function keepSource(_k: string, v: unknown, ctx?: { source?: string }): unknown 
 
 /** JSON.parse that keeps the exact text of numbers that would lose precision. */
 export function parseJson(text: string): JVal {
-  if (sourceTextSupported && LONG_DIGITS.test(text)) return JSON.parse(text, keepSource as never) as JVal;
+  if (sourceTextSupported && LONG_NUMBER.test(text)) return JSON.parse(text, keepSource as never) as JVal;
   return JSON.parse(text) as JVal;
 }
 
@@ -61,6 +66,20 @@ export function kindOf(v: JVal): Kind {
 export function entriesOf(v: JVal[] | JObj): [string | number, JVal][] {
   if (Array.isArray(v)) return v.map((x, i) => [i, x]);
   return Object.keys(v).map((k) => [k, v[k]]);
+}
+
+/** The first `max` members, without building the list of all of them. */
+export function entriesHead(v: JVal[] | JObj, max: number): [string | number, JVal][] {
+  const out: [string | number, JVal][] = [];
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length && i < max; i++) out.push([i, v[i]]);
+    return out;
+  }
+  for (const k in v) {
+    if (out.length >= max) break;
+    out.push([k, v[k]]);
+  }
+  return out;
 }
 
 export function sizeOf(v: JVal[] | JObj): number {
@@ -179,12 +198,23 @@ export function parsePath(text: string): JsonPath | undefined {
 }
 
 // Path keys: a compact, typed encoding of a JSON path for maps, sets and
-// data-* attributes. The HTML parser keeps U+001F and U+001E (it replaces U+0000).
+// data-* attributes. The HTML parser keeps U+001D to U+001F (it replaces U+0000).
+// A key that holds one of these three characters is escaped, so two paths never share a key.
 const SEP = '\u001f';
 const NUM = '\u001e';
+const ESCAPE = '\u001d';
+const SPECIAL = /[\u001d-\u001f]/;
+
+function escapeKey(k: string): string {
+  return SPECIAL.test(k) ? k.replace(/[\u001d-\u001f]/g, (c) => ESCAPE + String.fromCharCode(c.charCodeAt(0) + 0x40)) : k;
+}
+
+function unescapeKey(k: string): string {
+  return k.includes(ESCAPE) ? k.replace(/\u001d(.)/g, (_m, c: string) => String.fromCharCode(c.charCodeAt(0) - 0x40)) : k;
+}
 
 export function childKey(parent: string, k: string | number): string {
-  return parent + SEP + (typeof k === 'number' ? NUM + k : k);
+  return parent + SEP + (typeof k === 'number' ? NUM + k : escapeKey(k));
 }
 
 export function decodeKey(key: string): JsonPath {
@@ -192,7 +222,7 @@ export function decodeKey(key: string): JsonPath {
   return key
     .split(SEP)
     .slice(1)
-    .map((s) => (s[0] === NUM ? Number(s.slice(1)) : s));
+    .map((s) => (s[0] === NUM ? Number(s.slice(1)) : unescapeKey(s)));
 }
 
 export function esc(s: string): string {

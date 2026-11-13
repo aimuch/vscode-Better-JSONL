@@ -1,34 +1,70 @@
 import * as vscode from 'vscode';
-import { isSupportedDocument, previewFollowsActiveEditor } from './config';
-import { ViewerSession } from './session';
+import { isSupportedDocument, LARGE_FILE_BYTES, previewFollowsActiveEditor } from './config';
+import { ViewerSession, type SessionEnv, type Target } from './session';
 
 export const PREVIEW_VIEW_TYPE = 'betterJsonl.preview';
 
-/** One side preview, like the Markdown preview. It follows the active JSON/JSONL editor. */
+/**
+ * What to show for a file. A file above the VS Code limit for extensions (or one VS Code
+ * cannot open as text) is a large file: Better JSONL reads it from disk itself.
+ */
+export async function resolveTarget(uri: vscode.Uri): Promise<Target> {
+  const key = uri.toString();
+  const open = vscode.workspace.textDocuments.find((d) => d.uri.toString() === key && !d.isClosed);
+  if (open) return { doc: open };
+  let bytes = 0;
+  try {
+    bytes = (await vscode.workspace.fs.stat(uri)).size;
+  } catch {
+    // Not a file on disk (for example an untitled document): open it as a text document.
+  }
+  if (bytes > LARGE_FILE_BYTES) return { uri, bytes };
+  try {
+    return { doc: await vscode.workspace.openTextDocument(uri) };
+  } catch (e) {
+    if (bytes > 0) return { uri, bytes };
+    throw e;
+  }
+}
+
+/**
+ * The previews. One side preview follows the active JSON/JSONL editor, like the Markdown
+ * preview. Each large file has its own panel: reading it again is not free, and no text
+ * editor of an extension can stand for it.
+ */
 export class PreviewManager implements vscode.Disposable, vscode.WebviewPanelSerializer {
   private session: ViewerSession | undefined;
+  private readonly large = new Map<string, ViewerSession>();
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
-    private readonly extensionUri: vscode.Uri,
+    private readonly env: SessionEnv,
     private readonly onSession: (s: ViewerSession) => void,
   ) {
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (!editor || !this.session || !previewFollowsActiveEditor()) return;
-      if (isSupportedDocument(editor.document)) this.session.bind(editor.document);
+      if (isSupportedDocument(editor.document)) this.session.bind({ doc: editor.document });
     }, null, this.disposables);
   }
 
+  /** The preview that follows the active editor. */
   get current(): ViewerSession | undefined {
     return this.session;
   }
 
-  show(doc: vscode.TextDocument, toSide: boolean): ViewerSession {
+  /** The panels of large files. */
+  get largeSessions(): ViewerSession[] {
+    return [...this.large.values()];
+  }
+
+  show(target: Target, toSide: boolean): ViewerSession {
     const column = toSide ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active;
-    if (this.session) {
-      this.session.bind(doc);
-      this.session.panel.reveal(column, toSide);
-      return this.session;
+    const existing = 'doc' in target ? this.session : this.large.get(target.uri.toString());
+    if (existing) {
+      if ('doc' in target) existing.bind(target);
+      // An open panel stays in its column: "Beside" would move it each time.
+      existing.panel.reveal(existing.panel.viewColumn ?? column, toSide);
+      return existing;
     }
     const panel = vscode.window.createWebviewPanel(
       PREVIEW_VIEW_TYPE,
@@ -36,7 +72,7 @@ export class PreviewManager implements vscode.Disposable, vscode.WebviewPanelSer
       { viewColumn: column, preserveFocus: toSide },
       { enableScripts: true, retainContextWhenHidden: true },
     );
-    return this.adopt(panel, doc);
+    return this.adopt(panel, target);
   }
 
   async deserializeWebviewPanel(panel: vscode.WebviewPanel, state: unknown): Promise<void> {
@@ -46,8 +82,7 @@ export class PreviewManager implements vscode.Disposable, vscode.WebviewPanelSer
       return;
     }
     try {
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));
-      this.adopt(panel, doc);
+      this.adopt(panel, await resolveTarget(vscode.Uri.parse(uri)));
     } catch {
       panel.dispose();
     }
@@ -55,17 +90,27 @@ export class PreviewManager implements vscode.Disposable, vscode.WebviewPanelSer
 
   dispose(): void {
     this.session?.panel.dispose();
+    for (const s of this.largeSessions) s.panel.dispose();
     this.disposables.forEach((d) => d.dispose());
   }
 
-  private adopt(panel: vscode.WebviewPanel, doc: vscode.TextDocument): ViewerSession {
-    this.session?.panel.dispose();
-    const session = new ViewerSession(panel, this.extensionUri, 'preview');
-    session.onDidDispose(() => {
-      if (this.session === session) this.session = undefined;
-    });
-    this.session = session;
-    session.bind(doc);
+  private adopt(panel: vscode.WebviewPanel, target: Target): ViewerSession {
+    const session = new ViewerSession(panel, this.env, 'preview');
+    if ('doc' in target) {
+      this.session?.panel.dispose();
+      session.onDidDispose(() => {
+        if (this.session === session) this.session = undefined;
+      });
+      this.session = session;
+    } else {
+      const key = target.uri.toString();
+      this.large.get(key)?.panel.dispose();
+      session.onDidDispose(() => {
+        if (this.large.get(key) === session) this.large.delete(key);
+      });
+      this.large.set(key, session);
+    }
+    session.bind(target);
     this.onSession(session);
     return session;
   }

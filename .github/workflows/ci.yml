@@ -15,11 +15,17 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  test-and-package:
-    name: E2E tests and VSIX package
-    # The E2E suites drive VS Code and Chrome; they were written and verified on macOS.
-    runs-on: macos-latest
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -39,12 +45,23 @@ jobs:
             exit 1
           fi
 
+      - name: Unit tests
+        run: npm run test:unit
+
+      # VS Code needs a display on Linux: xvfb gives it one.
       - name: Extension host E2E (downloads VS Code)
         env:
           VSCODE_DOWNLOAD: '1'
-        run: npm run test:e2e:host
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a npm run test:e2e:host
+          else
+            npm run test:e2e:host
+          fi
 
+      # The UI checks drive the macOS application bundle, so they and the package step run there.
       - name: Package VSIX and UI E2E in a real VS Code window
+        if: runner.os == 'macOS'
         run: |
           app="$(ls -d .vscode-test/vscode-*/Visual\ Studio\ Code.app 2>/dev/null | head -n 1)"
           [ -n "$app" ] || app="/Applications/Visual Studio Code.app"
@@ -55,6 +72,7 @@ jobs:
         run: npm run test:e2e:web
 
       - name: Upload VSIX
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: vsix
@@ -65,14 +83,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-report
+          name: e2e-report-${{ matrix.os }}
           path: test-results/
           if-no-files-found: ignore
 
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test-and-package
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write

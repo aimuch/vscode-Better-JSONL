@@ -2,6 +2,19 @@ import * as vscode from 'vscode';
 import { resolveLang, type LanguageSetting } from './shared/i18n';
 import type { ViewerConfig, WrapSetting } from './shared/protocol';
 
+/**
+ * VS Code does not give extensions the text of a file above 50 MB. Better JSONL reads such a
+ * file from disk itself and shows it read-only.
+ */
+export const LARGE_FILE_BYTES = 50 * 1024 * 1024;
+
+let testMode = false;
+
+/** The E2E tests turn on render reports from the webview. */
+export function setTestMode(on: boolean): void {
+  testMode = on;
+}
+
 /** Settings for a viewer. `doc` scopes "editor.wordWrap" to the document's language. */
 export function readConfig(doc?: vscode.TextDocument): ViewerConfig {
   const c = vscode.workspace.getConfiguration('betterJsonl');
@@ -13,6 +26,7 @@ export function readConfig(doc?: vscode.TextDocument): ViewerConfig {
     indent: c.get('indent', 2),
     graphMaxNodes: c.get('graph.maxNodes', 1500),
     syncSelection: c.get('syncSelection', true),
+    followActiveEditor: c.get('preview.followActiveEditor', true),
     theme: c.get('theme', 'vscode'),
     wordWrap,
     wrap: wordWrap === 'on' || (wordWrap === 'followEditor' && editorWrap !== 'off'),
@@ -21,6 +35,7 @@ export function readConfig(doc?: vscode.TextDocument): ViewerConfig {
     language: c.get<LanguageSetting>('language', 'auto'),
     lang: uiLanguage(),
     vscodeLanguage: vscode.env.language,
+    reports: testMode,
   };
 }
 
@@ -34,11 +49,20 @@ export function formatDocumentEnabled(): boolean {
   return vscode.workspace.getConfiguration('betterJsonl').get('formatDocument.enabled', false);
 }
 
+/** Read on every cursor move, so it does not build the whole viewer config. */
+export function syncSelectionEnabled(): boolean {
+  return vscode.workspace.getConfiguration('betterJsonl').get('syncSelection', true);
+}
+
 export function previewFollowsActiveEditor(): boolean {
   return vscode.workspace.getConfiguration('betterJsonl').get('preview.followActiveEditor', true);
 }
 
 const JSONL_EXT = /\.(jsonl|ndjson|jsonlines)$/i;
+
+export function isJsonlPath(path: string): boolean {
+  return JSONL_EXT.test(path);
+}
 
 export function isJsonlDocument(doc: vscode.TextDocument): boolean {
   return doc.languageId === 'jsonl' || JSONL_EXT.test(doc.uri.path);

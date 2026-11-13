@@ -1,7 +1,7 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
 import type { App, ColFilter, View } from '../app';
-import { childKey, decodeKey, entriesOf, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
+import { childKey, decodeKey, entriesHead, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
 import type { Parsed } from '../model';
 
@@ -10,7 +10,22 @@ const NESTED_ROWS = 200;
 const NESTED_COLS = 50;
 const CELL_CHARS = 300;
 const CELL_CHARS_WRAP = 5000;
-const VALUE_COL = '(value)';
+/**
+ * Column ids. A data key is its own id. The built-in columns start with U+0001, and a data key
+ * that starts with U+0001 gets one more in front, so no key in a file can take a built-in id.
+ */
+const ESC = '\u0001';
+/** The row-number column. */
+const NUM = ESC + '#';
+/** Records that are not objects show here. */
+const VALUE_COL = ESC + 'v';
+/** The two columns of a root object. */
+const OKEY = ESC + 'k';
+const OVAL = ESC + 'o';
+const colId = (key: string): string => (key.startsWith(ESC) ? ESC + key : key);
+const keyOf = (id: string): string => (id.startsWith(ESC) ? id.slice(1) : id);
+/** When parsed records are not all kept in memory, sorting and column filters work on this many rows at most. */
+const HEAVY_ROWS = 200_000;
 /** Values listed in a column filter before "… n more". */
 const FILTER_LIST = 500;
 /** Filter key of a missing cell. */
@@ -49,11 +64,26 @@ export class GridView implements View {
   private modelRef: unknown;
   /** Rows after the search, before the column filters. */
   private baseIds: number[] = [];
+  /** What baseIds and rowIds were computed from. They are computed again only when this changes. */
+  private baseSig = '';
+  private rowSig = '';
+  /** Keys of the root object (object mode). */
+  private objKeys: string[] = [];
+  /** Columns of a root array (records mode of a single JSON document). */
+  private arrayCols: string[] = [];
+  private arrayColsCut = false;
+  private colsCut = false;
+  /** Column widths that come from the content, by column id. */
+  private readonly autoWidths = new Map<string, number>();
+  /** Sorting and column filters are off: too many rows for a file whose records are not all in memory. */
+  private heavyOff = false;
   /** The open filter popup: its column and the column's values. */
   private fcol: string | null = null;
   private fvalues: FilterValue[] = [];
   private readonly fel: HTMLElement;
   private ftimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly resizes: ResizeObserver;
+  private readonly gone = new AbortController();
 
   constructor(private readonly app: App) {
     this.rowH = app.rh + 6;
@@ -65,13 +95,25 @@ export class GridView implements View {
     this.bodyEl = this.el.querySelector('.gbody') as HTMLElement;
     this.rowsEl = this.el.querySelector('.grows') as HTMLElement;
     this.scroll.addEventListener('scroll', () => this.paint(), { passive: true });
-    new ResizeObserver(() => this.paint()).observe(this.scroll);
+    this.resizes = new ResizeObserver(() => this.paint());
+    this.resizes.observe(this.scroll);
+    // Listeners outside this view go away with it (dispose).
+    const signal = this.gone.signal;
     this.head.addEventListener('pointerdown', (e) => this.onHeadPointer(e));
     this.head.addEventListener('click', (e) => this.onHeadClick(e));
+    this.head.addEventListener('keydown', (e) => {
+      // Enter or Space on a header sorts by it, like a click. The header is painted again: keep the focus on it.
+      const h = e.target as HTMLElement;
+      if ((e.key !== 'Enter' && e.key !== ' ') || !h.classList.contains('gh')) return;
+      e.preventDefault();
+      const col = h.dataset.col as string;
+      h.click();
+      (this.head.querySelector(`[data-col="${CSS.escape(col)}"]`) as HTMLElement | null)?.focus();
+    });
     this.rowsEl.addEventListener('click', (e) => this.onClick(e));
     this.rowsEl.addEventListener('dblclick', (e) => this.onDblClick(e));
-    window.addEventListener('pointermove', (e) => this.onDrag(e));
-    window.addEventListener('pointerup', () => (this.dragging = null));
+    window.addEventListener('pointermove', (e) => this.onDrag(e), { signal });
+    window.addEventListener('pointerup', () => (this.dragging = null), { signal });
     this.scroll.addEventListener('scroll', () => this.placeFilter(), { passive: true });
     this.fel = document.createElement('div');
     this.fel.className = 'gfilter';
@@ -88,13 +130,27 @@ export class GridView implements View {
       }
       e.stopPropagation();
     });
-    document.addEventListener('pointerdown', (e) => {
-      const t = e.target as HTMLElement;
-      if (this.fcol !== null && !this.fel.contains(t) && !t.closest('[data-f]')) this.closeFilter();
-    });
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && this.fcol !== null) this.closeFilter(true);
-    });
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        const t = e.target as HTMLElement;
+        if (this.fcol !== null && !this.fel.contains(t) && !t.closest('[data-f]')) this.closeFilter();
+      },
+      { signal },
+    );
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key === 'Escape' && this.fcol !== null) this.closeFilter(true);
+      },
+      { signal },
+    );
+  }
+
+  dispose(): void {
+    clearTimeout(this.ftimer);
+    this.resizes.disconnect();
+    this.gone.abort();
   }
 
   show(): void {
@@ -116,6 +172,30 @@ export class GridView implements View {
         this.placeFilter();
       } else this.closeFilter();
     }
+  }
+
+  refresh(): void {
+    this.render();
+  }
+
+  notes(): string[] {
+    const out: string[] = [];
+    if (this.colsCut) out.push(t('Showing the first {0} columns', MAX_COLUMNS));
+    if (this.heavyOff && (this.app.state.grid.sort || this.activeFilters().length)) out.push(this.heavyNote());
+    return out;
+  }
+
+  private heavyNote(): string {
+    return t('Sorting and column filters need {0} rows or fewer in a file this large. Search to narrow the rows.', HEAVY_ROWS.toLocaleString());
+  }
+
+  /** The text a column shows in its header. */
+  private label(col: string): string {
+    if (col === NUM) return '#';
+    if (col === VALUE_COL) return t('(value)');
+    if (col === OKEY) return t('key');
+    if (col === OVAL) return t('value');
+    return keyOf(col);
   }
 
   onWrapChanged(): void {
@@ -146,16 +226,17 @@ export class GridView implements View {
   }
 
   fillReport(r: RenderReport): void {
+    const name = (c: string) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : keyOf(c));
     const filters: Record<string, { text: string; exclude: number }> = {};
-    for (const [c, f] of this.activeFilters()) filters[c] = { text: f.text, exclude: f.exclude.size };
-    r.grid = { rows: this.rowIds.length, columns: [...this.cols], openCells: this.app.state.grid.open.size, unfiltered: this.baseIds.length, filters };
+    for (const [c, f] of this.activeFilters()) filters[name(c)] = { text: f.text, exclude: f.exclude.size };
+    r.grid = { rows: this.rowIds.length, columns: this.cols.map(name), openCells: this.app.state.grid.open.size, unfiltered: this.baseIds.length, filters };
   }
 
   /** Status bar text while column filters are on, e.g. "Filtered: level, ms · 5 of 20 rows". */
   filterStatus(): string {
     const f = this.activeFilters();
     if (!f.length) return '';
-    const names = f.map(([c]) => (c === VALUE_COL ? t('(value)') : this.mode === 'object' ? t(c) : c)).join(', ');
+    const names = f.map(([c]) => this.label(c)).join(', ');
     return `${t('Filtered: {0}', names)} · ${t('{0} of {1} rows', this.rowIds.length.toLocaleString(), this.baseIds.length.toLocaleString())}`;
   }
 
@@ -175,14 +256,15 @@ export class GridView implements View {
 
   private cell(id: number, col: string): JVal | undefined {
     if (this.mode === 'object') {
-      const root = this.rootValue() as JObj;
-      const key = Object.keys(root)[id];
-      return col === 'key' ? key : root[key];
+      const key = this.objKeys[id];
+      return col === OKEY ? key : (this.rootValue() as JObj)[key];
     }
     const p = this.record(id);
     if (p.kind !== 'value') return undefined;
     if (col === VALUE_COL) return isObj(p.value) ? undefined : p.value;
-    return isObj(p.value) ? p.value[col] : undefined;
+    if (!isObj(p.value)) return undefined;
+    const key = keyOf(col);
+    return Object.prototype.hasOwnProperty.call(p.value, key) ? p.value[key] : undefined;
   }
 
   private layout(): void {
@@ -191,61 +273,88 @@ export class GridView implements View {
     if (this.modelRef !== m) {
       this.modelRef = m;
       this.heights.clear();
+      this.baseSig = '';
     }
     const root = this.rootValue();
-    let ids: number[] = [];
+    const q = app.query.text;
+    this.colsCut = false;
+    // 1. The mode and the columns. This is cheap, and the columns grow while the file is scanned.
     if (m.isJsonl) {
       this.mode = 'records';
-      const q = app.query.text;
-      const base = q ? app.matches : Array.from({ length: m.count }, (_, i) => i);
-      ids = base.filter((i) => m.get(i).kind !== 'blank');
-      this.cols = m.columns.slice(0, MAX_COLUMNS);
+      this.colsCut = m.columns.length > MAX_COLUMNS;
+      this.cols = m.columns.slice(0, MAX_COLUMNS).map(colId);
       // Non-object records (arrays, strings, numbers) show in a first "(value)" column.
       if (m.hasNonObject || !this.cols.length) this.cols.unshift(VALUE_COL);
     } else if (root !== undefined && isArr(root)) {
       this.mode = 'records';
-      const keys = new Set<string>();
-      let nonObj = false;
-      for (const item of root) {
-        if (isObj(item)) for (const k in item) keys.add(k);
-        else nonObj = true;
-        if (keys.size > MAX_COLUMNS) break;
-      }
-      this.cols = [...keys].slice(0, MAX_COLUMNS);
-      if (nonObj || !this.cols.length) this.cols.push(VALUE_COL);
-      ids = root.map((_, i) => i);
-      const q = app.query.text;
-      if (q) ids = ids.filter((i) => JSON.stringify(root[i] instanceof RawNum ? (root[i] as RawNum).src : root[i]).toLowerCase().includes(q));
     } else if (root !== undefined && isObj(root)) {
       this.mode = 'object';
-      this.cols = ['key', 'value'];
-      ids = Object.keys(root).map((_, i) => i);
-      const q = app.query.text;
-      if (q) {
-        const keys = Object.keys(root);
-        ids = ids.filter((i) => (keys[i] + ' ' + JSON.stringify(root[keys[i]])).toLowerCase().includes(q));
-      }
+      this.cols = [OKEY, OVAL];
     } else {
       this.mode = 'scalar';
       this.cols = [VALUE_COL];
-      ids = root === undefined ? [] : [0];
     }
-    this.baseIds = ids;
-    const filters = this.activeFilters();
-    if (filters.length) ids = ids.filter((id) => this.passes(id, filters));
-    const sort = app.state.grid.sort;
-    if (sort && (sort.col === '#' || this.cols.includes(sort.col))) {
-      const keyed = ids.map((id) => [id, sort.col === '#' ? id : this.cell(id, sort.col)] as [number, JVal | number | undefined]);
-      keyed.sort((a, b) => {
-        // Missing values stay at the bottom in both directions.
-        const ma = a[1] === undefined;
-        const mb = b[1] === undefined;
-        if (ma !== mb) return ma ? 1 : -1;
-        return sort.dir * compare(a[1] as JVal | undefined, b[1] as JVal | undefined) || a[0] - b[0];
-      });
-      ids = keyed.map((k) => k[0]);
+    // 2. The rows after the search. Computed again only when the lines or the matches change.
+    const baseSig = `${m.count}|${app.matchesVersion}|${q}`;
+    if (baseSig !== this.baseSig) {
+      this.baseSig = baseSig;
+      this.rowSig = '';
+      this.autoWidths.clear();
+      const ids: number[] = [];
+      if (m.isJsonl) {
+        if (q) {
+          for (const i of app.matches) if (!m.isBlank(i)) ids.push(i);
+        } else {
+          for (let i = 0; i < m.count; i++) if (!m.isBlank(i)) ids.push(i);
+        }
+      } else if (root !== undefined && isArr(root)) {
+        const keys = new Set<string>();
+        let nonObj = false;
+        for (const item of root) {
+          if (!isObj(item)) nonObj = true;
+          else if (keys.size <= MAX_COLUMNS) for (const k in item) keys.add(k);
+        }
+        this.arrayCols = [...keys].slice(0, MAX_COLUMNS).map(colId);
+        this.arrayColsCut = keys.size > MAX_COLUMNS;
+        if (nonObj || !this.arrayCols.length) this.arrayCols.push(VALUE_COL);
+        for (let i = 0; i < root.length; i++) {
+          if (!q || JSON.stringify(root[i] instanceof RawNum ? (root[i] as RawNum).src : root[i]).toLowerCase().includes(q)) ids.push(i);
+        }
+      } else if (root !== undefined && isObj(root)) {
+        this.objKeys = Object.keys(root);
+        for (let i = 0; i < this.objKeys.length; i++) {
+          if (!q || (this.objKeys[i] + ' ' + JSON.stringify(root[this.objKeys[i]])).toLowerCase().includes(q)) ids.push(i);
+        }
+      } else if (root !== undefined) ids.push(0);
+      this.baseIds = ids;
     }
-    this.rowIds = ids;
+    if (!m.isJsonl && this.mode === 'records') {
+      this.cols = this.arrayCols;
+      this.colsCut = this.arrayColsCut;
+    }
+    // 3. Column filters and the sort. Both read a cell of every row, so the result is kept.
+    this.heavyOff = !m.keepsAll && this.baseIds.length > HEAVY_ROWS;
+    const filters = this.heavyOff ? [] : this.activeFilters();
+    const g = app.state.grid.sort;
+    const sort = !this.heavyOff && g && (g.col === NUM || this.cols.includes(g.col)) ? g : null;
+    const rowSig = JSON.stringify([sort, filters.map(([c, f]) => [c, f.text, [...f.exclude]])]);
+    if (rowSig !== this.rowSig) {
+      this.rowSig = rowSig;
+      let ids = this.baseIds;
+      if (filters.length) ids = ids.filter((id) => this.passes(id, filters));
+      if (sort) {
+        const keyed = ids.map((id) => [id, sort.col === NUM ? id : this.cell(id, sort.col)] as [number, JVal | number | undefined]);
+        keyed.sort((a, b) => {
+          // Missing values stay at the bottom in both directions.
+          const ma = a[1] === undefined;
+          const mb = b[1] === undefined;
+          if (ma !== mb) return ma ? 1 : -1;
+          return sort.dir * compare(a[1] as JVal | undefined, b[1] as JVal | undefined) || a[0] - b[0];
+        });
+        ids = keyed.map((k) => k[0]);
+      }
+      this.rowIds = ids;
+    }
     this.computeOffsets();
     this.paintHead();
   }
@@ -261,9 +370,19 @@ export class GridView implements View {
   private width(col: string): number {
     const w = this.app.state.grid.widths[col];
     if (w) return w;
-    if (col === '#') return 64;
+    if (col === NUM) return 64;
+    // A width from the content is kept until the rows change: every layout asks for every column.
+    let auto = this.autoWidths.get(col);
+    if (auto === undefined) {
+      auto = this.measureWidth(col);
+      this.autoWidths.set(col, auto);
+    }
+    return auto;
+  }
+
+  private measureWidth(col: string): number {
     // The header also holds the sort arrow and the filter button.
-    let max = col.length + 5;
+    let max = this.label(col).length + 5;
     // Measured on the rows before the column filters, so filtering does not resize the columns.
     const ids = this.baseIds;
     for (let i = 0; i < Math.min(40, ids.length); i++) {
@@ -275,7 +394,7 @@ export class GridView implements View {
   }
 
   private allCols(): string[] {
-    return this.mode === 'records' ? ['#', ...this.cols] : this.cols;
+    return this.mode === 'records' ? [NUM, ...this.cols] : this.cols;
   }
 
   private paintHead(): void {
@@ -287,14 +406,15 @@ export class GridView implements View {
     this.head.innerHTML = cols
       .map((c, i) => {
         const sorted = sort && sort.col === c ? (sort.dir > 0 ? icon('chev-up', 11) : icon('chev-down', 11)) : '';
-        const label = c === VALUE_COL ? `<span class="dim">${t('(value)')}</span>` : this.mode === 'object' ? esc(t(c)) : esc(c);
+        const label = c === VALUE_COL ? `<span class="dim">${t('(value)')}</span>` : esc(this.label(c));
         const f = filters.get(c);
         const on = !!f && (!!f.text || f.exclude.size > 0);
         const fbtn =
-          filterable && c !== '#'
-            ? `<button class="gh-f${on ? ' on' : ''}${this.fcol === c ? ' open' : ''}" data-f="${esc(c)}" aria-label="${esc(t('Filter {0}', c === VALUE_COL ? t('(value)') : c))}" aria-pressed="${on}" title="${t('Filter this column')}">${icon('filter', 12)}</button>`
+          filterable && c !== NUM
+            ? `<button class="gh-f${on ? ' on' : ''}${this.fcol === c ? ' open' : ''}" data-f="${esc(c)}" aria-label="${esc(t('Filter {0}', this.label(c)))}" aria-pressed="${on}" title="${t('Filter this column')}">${icon('filter', 12)}</button>`
             : '';
-        return `<div class="gh${c === '#' ? ' num' : ''}${on ? ' filtered' : ''}" role="columnheader" data-col="${esc(c)}" style="width:var(--w${i})" title="${esc(c)}"><span class="gh-l">${label}</span>${sorted}${fbtn}<span class="rz" data-rz="${esc(c)}"></span></div>`;
+        const sortState = sort && sort.col === c ? (sort.dir > 0 ? 'ascending' : 'descending') : 'none';
+        return `<div class="gh${c === NUM ? ' num' : ''}${on ? ' filtered' : ''}" role="columnheader" tabindex="0" aria-sort="${sortState}" data-col="${esc(c)}" style="width:var(--w${i})" title="${esc(this.label(c))}"><span class="gh-l">${label}</span>${sorted}${fbtn}<span class="rz" data-rz="${esc(c)}"></span></div>`;
       })
       .join('');
   }
@@ -370,7 +490,7 @@ export class GridView implements View {
     } else {
       cols.forEach((c, i) => {
         const style = `style="width:var(--w${i})"`;
-        if (c === '#') {
+        if (c === NUM) {
           cells.push(`<div class="gc num" ${style}>${jsonl ? id + 1 : id}</div>`);
           return;
         }
@@ -379,7 +499,7 @@ export class GridView implements View {
           cells.push(`<div class="gc miss" ${style}></div>`);
           return;
         }
-        if (this.mode === 'object' && c === 'key') {
+        if (c === OKEY) {
           cells.push(`<div class="gc tk" ${style} title="${esc(String(v))}">${esc(String(v))}</div>`);
           return;
         }
@@ -407,9 +527,9 @@ export class GridView implements View {
 
   /** Path key of a top-level cell, relative to the record. */
   private cellPath(id: number, col: string): string {
-    if (this.mode === 'object') return childKey('', Object.keys(this.rootValue() as JObj)[id]);
+    if (this.mode === 'object') return childKey('', this.objKeys[id]);
     if (col === VALUE_COL) return '';
-    return childKey('', col);
+    return childKey('', keyOf(col));
   }
 
   private recordPath(id: number, rel: string): (string | number)[] {
@@ -436,7 +556,7 @@ export class GridView implements View {
     const n = sizeOf(v as JObj);
     const kind = Array.isArray(v) ? `${t('array')} · ${t(n === 1 ? '{0} item' : '{0} items', n)}` : `${t('object')} · ${t(n === 1 ? '{0} key' : '{0} keys', n)}`;
     // The sub-grid starts under the column that was opened.
-    const i = Math.max(0, this.allCols().indexOf(this.mode === 'object' ? 'value' : col));
+    const i = Math.max(0, this.allCols().indexOf(this.mode === 'object' ? OVAL : col));
     return `<div class="gsub" style="margin-left:var(--x${i})"><div class="gsub-h"><span class="mono">${esc(pathToString(path))}</span><span class="dim">${where}${kind}</span></div>${this.nested(v, id, rel, 0)}</div>`;
   }
 
@@ -454,15 +574,16 @@ export class GridView implements View {
       return chip(child, ck, isOpen) + (isOpen ? this.nested(child, id, key, depth + 1) : '');
     };
     const rows: string[] = [];
+    let colsCut = 0;
     if (isArr(v) && v.length && v.every((x) => isObj(x))) {
       const keys: string[] = [];
       const seen = new Set<string>();
       for (const item of v.slice(0, NESTED_ROWS)) {
         for (const k in item as JObj) {
-          if (!seen.has(k) && keys.length < NESTED_COLS) {
-            seen.add(k);
-            keys.push(k);
-          }
+          if (seen.has(k)) continue;
+          seen.add(k);
+          if (keys.length < NESTED_COLS) keys.push(k);
+          else colsCut++;
         }
       }
       rows.push(`<tr><th class="num">#</th>${keys.map((k) => `<th>${esc(k)}</th>`).join('')}</tr>`);
@@ -475,14 +596,15 @@ export class GridView implements View {
       });
     } else {
       rows.push(`<tr><th>${isArr(v) ? '#' : t('key')}</th><th>${t('value')}</th></tr>`);
-      entriesOf(v)
-        .slice(0, NESTED_ROWS)
-        .forEach(([k, child]) => {
+      entriesHead(v, NESTED_ROWS).forEach(([k, child]) => {
           const label = typeof k === 'number' ? `<td class="num dim">${k}</td>` : `<td class="tk">${esc(k)}</td>`;
-          rows.push(`<tr>${label}<td>${inner(child, childKey(rel, k))}</td></tr>`);
-        });
+        rows.push(`<tr>${label}<td>${inner(child, childKey(rel, k))}</td></tr>`);
+      });
     }
-    const more = sizeOf(v) > NESTED_ROWS ? `<div class="dim more">${t('… {0} more', (sizeOf(v) - NESTED_ROWS).toLocaleString())}</div>` : '';
+    const cut: string[] = [];
+    if (sizeOf(v) > NESTED_ROWS) cut.push(t('… {0} more', (sizeOf(v) - NESTED_ROWS).toLocaleString()));
+    if (colsCut) cut.push(t('… {0} more columns', colsCut.toLocaleString()));
+    const more = cut.length ? `<div class="dim more">${esc(cut.join(' · '))}</div>` : '';
     return `<table class="ng">${rows.join('')}</table>${more}`;
   }
 
@@ -514,6 +636,10 @@ export class GridView implements View {
     const t = e.target as HTMLElement;
     if (t.closest('[data-rz]')) return;
     const fb = t.closest('[data-f]') as HTMLElement | null;
+    if ((fb || t.closest('[data-col]')) && this.heavyOff) {
+      this.app.showBanner(this.heavyNote());
+      return;
+    }
     if (fb) {
       const col = fb.dataset.f as string;
       if (this.fcol === col) this.closeFilter();
@@ -528,7 +654,7 @@ export class GridView implements View {
     else if (g.sort.dir === 1) g.sort = { col, dir: -1 };
     else g.sort = null;
     this.render();
-    this.app.scheduleReport();
+    this.app.stateChanged();
   }
 
   private onClick(e: MouseEvent): void {
@@ -549,7 +675,7 @@ export class GridView implements View {
         for (const k of [...open]) if (k === key || k.startsWith(key + '\u001f')) open.delete(k);
       } else open.add(key);
       this.render();
-      this.app.scheduleReport();
+      this.app.stateChanged();
       return;
     }
     if (t.closest('.gdetail')) return;
@@ -570,7 +696,7 @@ export class GridView implements View {
     const cellEl = t.closest('.gc') as HTMLElement | null;
     const idx = cellEl ? Array.from(cellEl.parentElement!.children).indexOf(cellEl) : -1;
     const col = idx >= 0 ? this.allCols()[idx] : undefined;
-    const rel = col && col !== '#' ? this.cellPath(id, col) : '';
+    const rel = col && col !== NUM ? this.cellPath(id, col) : '';
     const path = this.recordPath(id, rel);
     this.app.post({ type: 'reveal', line: this.app.model.isJsonl ? id : 0, path });
   }
@@ -638,7 +764,7 @@ export class GridView implements View {
     this.fcol = col;
     this.fvalues = this.valuesOf(col);
     const f = this.app.state.grid.filters.get(col);
-    const name = col === VALUE_COL ? t('(value)') : this.mode === 'object' ? t(col) : col;
+    const name = this.label(col);
     this.fel.setAttribute('aria-label', t('Filter {0}', name));
     this.fel.innerHTML = `
       <div class="gf-title" title="${esc(name)}">${icon('filter', 12)}<span>${esc(name)}</span></div>
@@ -729,7 +855,7 @@ export class GridView implements View {
     this.paintFilterFoot();
     this.placeFilter();
     this.app.paintChrome();
-    this.app.scheduleReport();
+    this.app.stateChanged();
   }
 
   private onFilterInput(e: Event): void {
@@ -770,7 +896,7 @@ export class GridView implements View {
       this.app.state.grid.sort = { col: this.fcol, dir: Number(b.dataset.fsort) as 1 | -1 };
       this.closeFilter(true);
       this.render();
-      this.app.scheduleReport();
+      this.app.stateChanged();
     } else if (b.classList.contains('gf-clear')) {
       this.app.state.grid.filters.delete(this.fcol);
       this.closeFilter(true);
@@ -806,11 +932,13 @@ function valueClass(v: JVal | undefined): string {
   return isContainer(v) ? 'tp' : primClass(v);
 }
 
-function compact(v: JVal): string {
+/** Compact JSON text of a value. Nesting deeper than 200 levels is cut, so the call stack stays small. */
+function compact(v: JVal, depth = 0): string {
   if (v instanceof RawNum) return v.src;
-  if (Array.isArray(v)) return `[${v.map(compact).join(',')}]`;
-  if (v !== null && typeof v === 'object') return `{${Object.keys(v).map((k) => `${JSON.stringify(k)}:${compact(v[k])}`).join(',')}}`;
-  return JSON.stringify(v);
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (depth > 200) return '…';
+  if (Array.isArray(v)) return `[${v.map((x) => compact(x, depth + 1)).join(',')}]`;
+  return `{${Object.keys(v).map((k) => `${JSON.stringify(k)}:${compact(v[k], depth + 1)}`).join(',')}}`;
 }
 
 function chip(v: JVal, key: string, open: boolean): string {

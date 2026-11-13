@@ -44,6 +44,16 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 
 ![Graph view](docs/screenshots/graph.png)
 
+### Large files (above 50 MB)
+
+VS Code does not give extensions the text of a file above 50 MB. Better JSONL reads such a file from disk itself and shows it **read-only**, in its own panel:
+
+- A JSON Lines file shows while it loads: the first rows are there at once, and you can scroll, select and search as the rest arrives. A 300 MB file with 3.4 million lines takes about 8 seconds to load and scan on a recent laptop.
+- Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress.
+- One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded.
+- What is different: no record editing and no cursor sync; **Expand all** is off above 50 MB; sorting and column filters in the Grid need 200 000 rows or fewer (search first to narrow the rows). **Source** opens the file in VS Code at that line.
+- When the file changes on disk, a **Reload** button appears. The file is read as UTF-8.
+
 ### Search and filter
 
 Type plain text, or a path query:
@@ -58,9 +68,18 @@ Type plain text, or a path query:
 
 In the Formatted view, the filter button shows only the matching lines.
 
+In one JSON document (not JSON Lines), the search reads the whole value, so it also finds text inside folded nodes. The counter shows the matches (`1,000+` when there are more), and `Enter` / `Shift+Enter` go to the next or previous one. Only the nodes on the way to that match are opened.
+
+### Keyboard
+
+- `Cmd/Ctrl+F` goes to the search box; `Enter` and `Shift+Enter` step through the matches.
+- JSON Lines: `↑` / `↓` move the current line, `Shift` extends the selection, `Enter` edits the record, `Cmd/Ctrl+C` copies the selected lines.
+- `Tab` reaches every control. Fold arrows: `Enter` or `Space`. Grid headers: `Enter` sorts.
+- Graph nodes: `Enter` selects (the inspector shows the node), `←` folds, `→` unfolds; `+`, `-` and `0` zoom in, zoom out and fit.
+
 ### Settings panel
 
-Click the gear at the top right of the view. The panel changes the same settings as the VS Code Settings editor (they are saved to your user settings):
+Click the gear at the top right of the view. The panel changes the same settings as the VS Code Settings editor. A change is saved to your user settings, or to the workspace settings when the workspace sets that value:
 
 - **Theme**: Follow VS Code, Light, Dark, or Follow system (the operating system's light or dark mode).
 - **Word wrap**: Follow editor (`editor.wordWrap`), On, or Off.
@@ -82,8 +101,10 @@ All commands are also in the Command Palette under `Better JSONL: …`.
 
 | Command | What it does |
 |---------|--------------|
-| **Better JSONL: Expand Selected Lines** (right-click menu) | Pretty-prints the selected JSONL lines in place. It uses the editor's own indentation (Tab Size, spaces or tabs). A reminder then offers **Compact Lines**; choose **Don't Show Again** to turn it off. |
-| **Better JSONL: Compact Lines** (right-click menu) | Turns the selection (or the whole file) back into one record per line. Nothing changes if any record is invalid. |
+| **Better JSONL: Expand Selected Lines** (right-click menu) | Pretty-prints the selected lines in place (each line that is a JSON value). It uses the editor's own indentation (Tab Size, spaces or tabs). A reminder then offers **Compact Lines**; choose **Don't Show Again** to turn it off. |
+| **Better JSONL: Compact Lines** (right-click menu) | Turns the selections (or the whole file) back into one record per line. Blank lines stay. Nothing changes if any record is invalid. |
+
+Both commands are in the right-click menu and the Command Palette for JSON and JSON Lines files. In a `.json` file, Compact Lines with no selection makes the whole document one compact line.
 | **Format Document** on a `.jsonl` file | Off by default: Format Document does not change JSONL files. Turn on `betterJsonl.formatDocument.enabled` to make each line compact and canonical. It never expands records, because that would break the JSONL format. |
 
 ## Settings
@@ -104,7 +125,8 @@ All commands are also in the Command Palette under `Better JSONL: …`.
 
 ## Limits
 
-- VS Code does not give extensions files larger than 50 MB. Open those files as text.
+- Files above 50 MB are read-only (see "Large files"). One JSON value above about 512 MB cannot be shown.
+- A limit that hides data (300 grid columns, 10 lines in one graph, 2 000 selected lines) is named in the status bar when it applies.
 - `.json` files with comments or trailing commas are parsed as JSON with Comments.
 - A `.json` file with one JSON value per line is shown as JSON Lines.
 
@@ -113,16 +135,18 @@ All commands are also in the Command Palette under `Better JSONL: …`.
 ```bash
 npm install
 npm run build        # dist/extension.js, dist/webview.js, dist/webview.css
+npm run test:unit    # unit and property tests (node --test)
 npm run test:e2e     # VS Code host tests + packaged-VSIX UI checks + webview tests in Chrome → test-results/report.html
 npm run package      # dist-vsix/better-jsonl-<version>.vsix
+npm run screenshots  # docs/screenshots/*.png, from the real webview in Chrome
 ```
 
 ## Continuous integration and releases
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request, on macOS:
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request, on macOS, Linux and Windows:
 
-1. Extension host E2E tests (a downloaded VS Code).
-2. Packages the VSIX and runs the UI checks against it in a real VS Code window.
+1. Unit tests, then the extension host E2E tests (a downloaded VS Code).
+2. On macOS: packages the VSIX and runs the UI checks against it in a real VS Code window.
 3. Webview E2E tests in Chrome.
 
 The VSIX and the E2E report are uploaded as build artifacts.
@@ -130,8 +154,8 @@ The VSIX and the E2E report are uploaded as build artifacts.
 To publish a release, set `version` in `package.json`, commit, then push a matching tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 The workflow checks that the tag matches the version, runs the tests, and attaches the tested VSIX to a new GitHub Release.

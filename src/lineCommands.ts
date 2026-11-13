@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { isJsonlDocument } from './config';
 import { t } from './shared/i18n';
 import { compactText, minifyJson, prettyJson } from './shared/jsonText';
 
@@ -10,6 +11,17 @@ function fullLines(doc: vscode.TextDocument, sel: vscode.Selection): vscode.Rang
   let end = sel.end.line;
   if (end > sel.start.line && sel.end.character === 0) end--;
   return new vscode.Range(sel.start.line, 0, end, doc.lineAt(end).text.length);
+}
+
+/** The selections as whole-line ranges in file order. Ranges that share a line are joined: one edit cannot touch a line twice. */
+function lineRanges(doc: vscode.TextDocument, selections: readonly vscode.Selection[]): vscode.Range[] {
+  const out: vscode.Range[] = [];
+  for (const r of selections.map((s) => fullLines(doc, s)).sort((a, b) => a.start.line - b.start.line)) {
+    const last = out[out.length - 1];
+    if (!last || r.start.line > last.end.line) out.push(r);
+    else if (r.end.line > last.end.line) out[out.length - 1] = new vscode.Range(last.start, r.end);
+  }
+  return out;
 }
 
 /** The indent text of this editor (its Tab Size and Insert Spaces), so the result matches the editor. */
@@ -26,8 +38,7 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
   const eol = eolOf(doc);
   let count = 0;
   const ok = await editor.edit((b) => {
-    for (const sel of editor.selections) {
-      const range = fullLines(doc, sel);
+    for (const range of lineRanges(doc, editor.selections)) {
       const out: string[] = [];
       let changed = false;
       for (let l = range.start.line; l <= range.end.line; l++) {
@@ -52,7 +63,8 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
     }
   });
   const cfg = vscode.workspace.getConfiguration('betterJsonl');
-  if (ok && count > 0 && cfg.get('expandLines.showReminder', true)) {
+  // In a JSON Lines file the expanded records break the format. In a .json file they do not.
+  if (ok && count > 0 && isJsonlDocument(doc) && cfg.get('expandLines.showReminder', true)) {
     // Not awaited: the command must finish without waiting for the notification.
     const compact = t('Compact Lines');
     const never = t("Don't Show Again");
@@ -71,26 +83,30 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
   return count;
 }
 
-/** Compacts the selection (or the whole file) back to one JSON value per line. */
+/**
+ * Compacts the selections (or the whole file when nothing is selected) back to one JSON value
+ * per line. Nothing changes when any value is invalid.
+ */
 export async function compactLines(editor: vscode.TextEditor): Promise<boolean> {
   const doc = editor.document;
   const eol = eolOf(doc);
-  const sel = editor.selection;
-  const range = sel.isEmpty
-    ? new vscode.Range(0, 0, doc.lineCount - 1, doc.lineAt(doc.lineCount - 1).text.length)
-    : fullLines(doc, sel);
-  const src = doc.getText(range);
-  const res = compactText(src, eol);
-  if (!res.ok) {
-    void vscode.window.showErrorMessage(
-      t('Better JSONL: line {0} is not valid JSON ({1}). Nothing changed.', range.start.line + res.line, res.message),
-    );
-    return false;
+  const whole = editor.selections.every((s) => s.isEmpty);
+  const ranges = whole ? [new vscode.Range(0, 0, doc.lineCount - 1, doc.lineAt(doc.lineCount - 1).text.length)] : lineRanges(doc, editor.selections);
+  const edits: { range: vscode.Range; text: string }[] = [];
+  for (const range of ranges) {
+    const src = doc.getText(range);
+    const res = compactText(src, eol);
+    if (!res.ok) {
+      void vscode.window.showErrorMessage(
+        t('Better JSONL: line {0} is not valid JSON ({1}). Nothing changed.', range.start.line + res.line, res.message),
+      );
+      return false;
+    }
+    const text = res.text + (whole && /\r?\n\s*$/.test(src) ? eol : '');
+    if (text !== src) edits.push({ range, text });
   }
-  const trailing = sel.isEmpty && /\r?\n\s*$/.test(src) ? eol : '';
-  const text = res.text + trailing;
-  if (text === src) return true;
-  return editor.edit((b) => b.replace(range, text));
+  if (!edits.length) return true;
+  return editor.edit((b) => edits.forEach((e) => b.replace(e.range, e.text)));
 }
 
 /**
