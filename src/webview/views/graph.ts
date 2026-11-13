@@ -563,7 +563,7 @@ export class GraphView implements View {
     const what = b.dataset.i;
     if (what === 'copy-path') this.app.post({ type: 'copy', text: pathToString(n.path) });
     else if (what === 'copy-value') this.app.post({ type: 'copy', text: stringifyPretty(n.value, this.app.config.indent, 5_000_000) });
-    else if (what === 'reveal') this.app.post({ type: 'reveal', line: n.line, path: n.path });
+    else if (what === 'reveal') this.app.reveal(n.line, n.path);
   }
 
   // ---------- pointer ----------

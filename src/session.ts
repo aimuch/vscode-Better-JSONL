@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { isJsonlDocument, isJsonlPath, readConfig, syncSelectionEnabled } from './config';
+import { EncodeError } from './encoding';
 import { compare, encodingFor, fileState, innerName, LineConflict, readUtf8, replaceLine, type FileState } from './largeFile';
 import { locatePath, valueSpan } from './locate';
 import { t } from './shared/i18n';
@@ -32,6 +33,19 @@ interface Large {
   /** Size, time and last bytes of the file when it was read: a file that only grew can be followed. */
   state?: FileState;
   follow: boolean;
+  /** UTF-8 bytes the view has, and the last of them: a compressed file that only grew is followed by these. */
+  decoded?: number;
+  decodedTail?: Buffer;
+}
+
+/** Bytes kept from the end of what the view has. */
+const TAIL = 4096;
+
+function tailOf(prev: Buffer, data: Uint8Array): Buffer {
+  const d = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (d.length >= TAIL) return Buffer.from(d.subarray(d.length - TAIL));
+  const all = Buffer.concat([prev, d]);
+  return all.length > TAIL ? Buffer.from(all.subarray(all.length - TAIL)) : all;
 }
 const MAX_SYNC_LINES = 2000;
 /** More changes or more new text than this between two updates: the whole text is sent instead. */
@@ -174,10 +188,9 @@ export class ViewerSession implements vscode.Disposable {
     return !!this.large;
   }
 
-  /** Large files that cannot be written: compressed, not UTF-8, or not on a local disk. */
+  /** Large and compressed files can be written when they are on this computer. */
   private get readOnly(): boolean {
-    const large = this.large;
-    return !!large && (large.gzip || large.encoding !== 'utf-8' || this.uri?.scheme !== 'file');
+    return !!this.large && this.uri?.scheme !== 'file';
   }
 
   bind(target: Target): void {
@@ -337,19 +350,68 @@ export class ViewerSession implements vscode.Disposable {
     if (!large) return;
     const current = () => !this.disposed && generation === this.generation && this.large === large;
     try {
-      const state = uri.scheme === 'file' && !large.gzip ? await fileState(uri.fsPath) : undefined;
+      const state = uri.scheme === 'file' ? await fileState(uri.fsPath) : undefined;
       let prev: { data: Uint8Array; read: number } | undefined;
+      let decoded = 0;
+      let tail: Buffer = Buffer.alloc(0);
       for await (const piece of readUtf8(uri, { gzip: large.gzip, encoding: large.encoding, to: state?.size })) {
         if (!current()) return;
         if (prev) await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev.data, done: false, read: prev.read } satisfies HostMessage);
         prev = piece;
+        decoded += piece.data.length;
+        tail = tailOf(tail, piece.data);
       }
       if (!current()) return;
       large.state = state;
+      large.decoded = decoded;
+      large.decodedTail = tail;
       await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev?.data ?? new Uint8Array(0), done: true, read: prev?.read ?? 0 } satisfies HostMessage);
     } catch (e) {
       if (current()) this.post({ type: 'notice', message: t('Better JSONL could not read the file: {0}', errorMessage(e)) });
     }
+  }
+
+  /**
+   * A compressed file changed: it is decompressed again. When the text the view has is still
+   * its start (the last bytes match), only the rest is sent. Returns false when the start
+   * changed too (the caller reads the file again).
+   */
+  private async appendCompressed(large: Large, uri: vscode.Uri): Promise<boolean> {
+    const known = large.decoded;
+    const tail = large.decodedTail;
+    if (known === undefined || !tail || !large.state) return false;
+    const generation = this.generation;
+    const now = await fileState(uri.fsPath);
+    if (now.size === large.state.size && now.mtimeMs === large.state.mtimeMs) return true;
+    const from = known - tail.length;
+    const seen = Buffer.alloc(tail.length);
+    let pos = 0;
+    let checked = tail.length === 0;
+    let last: Buffer = Buffer.alloc(0);
+    for await (const piece of readUtf8(uri, { gzip: true, encoding: large.encoding, to: now.size })) {
+      if (this.disposed || generation !== this.generation || this.large !== large) return true;
+      const d = Buffer.from(piece.data.buffer, piece.data.byteOffset, piece.data.byteLength);
+      const start = pos;
+      pos += d.length;
+      const a = Math.max(start, from);
+      const b = Math.min(pos, known);
+      if (a < b) d.copy(seen, a - from, a - start, b - start);
+      if (pos > known) {
+        if (!checked) {
+          if (!seen.equals(tail)) return false;
+          checked = true;
+        }
+        const out = d.subarray(Math.max(0, known - start));
+        if (out.length) await this.panel.webview.postMessage({ type: 'append', version: generation, data: new Uint8Array(out) } satisfies HostMessage);
+      }
+      last = tailOf(last, d);
+    }
+    if (pos < known || (!checked && !seen.equals(tail))) return false;
+    large.decoded = pos;
+    large.decodedTail = last;
+    large.state = now;
+    large.bytes = now.size;
+    return true;
   }
 
   /** The file of a large view changed on disk. */
@@ -368,6 +430,12 @@ export class ViewerSession implements vscode.Disposable {
       return;
     }
     if (how === 'same') return;
+    // A compressed file is read again to know whether only its end changed (see appendCompressed).
+    if (large.gzip) {
+      if (large.follow) await this.appendNew();
+      else this.post({ type: 'notice', message: t('The file changed on disk.'), action: 'append' });
+      return;
+    }
     if (how === 'grew') {
       if (large.follow) await this.appendNew();
       else this.post({ type: 'notice', message: t('New lines were added to the file.'), action: 'append' });
@@ -390,12 +458,18 @@ export class ViewerSession implements vscode.Disposable {
         const large = this.large;
         const uri = this.uri;
         if (!large?.state || !uri || this.disposed) return;
+        if (large.gzip) {
+          if (!(await this.appendCompressed(large, uri))) await this.reload();
+          continue;
+        }
         if ((await compare(uri.fsPath, large.state)) !== 'grew') return;
         const generation = this.generation;
         const now = await fileState(uri.fsPath);
         for await (const piece of readUtf8(uri, { gzip: false, encoding: large.encoding, from: large.state.size, to: now.size })) {
           if (this.disposed || generation !== this.generation || this.large !== large) return;
           if (piece.data.length) await this.panel.webview.postMessage({ type: 'append', version: generation, data: piece.data } satisfies HostMessage);
+          large.decoded = (large.decoded ?? 0) + piece.data.length;
+          large.decodedTail = tailOf(large.decodedTail ?? Buffer.alloc(0), piece.data);
         }
         large.state = now;
         large.bytes = now.size;
@@ -688,13 +762,16 @@ export class ViewerSession implements vscode.Disposable {
     const large = this.large;
     const uri = this.uri;
     if (!large || !uri) return;
-    if (this.readOnly) return fail(t('This file is read-only here (compressed, not UTF-8, or not on this computer).'));
+    if (this.readOnly) return fail(t('This file is read-only here: it is not on this computer.'));
     if (!large.state || (await compare(uri.fsPath, large.state)) !== 'same') return fail(t('The file changed on disk. Reload it, then edit again.'));
     try {
-      large.state = await replaceLine(uri.fsPath, line, original, text);
+      large.state = await replaceLine(uri.fsPath, line, original, text, { gzip: large.gzip, encoding: large.encoding });
       large.bytes = large.state.size;
+      // The text the view has changed in the middle: a compressed file is read again when it changes next.
+      if (large.gzip) large.decodedTail = undefined;
+      else if (large.decoded !== undefined) large.decoded += Buffer.byteLength(text, 'utf8') - Buffer.byteLength(original, 'utf8');
     } catch (e) {
-      return fail(e instanceof LineConflict ? t('Line {0} changed after the edit started. Nothing was written.', line + 1) : errorMessage(e));
+      return fail(e instanceof LineConflict ? t('Line {0} changed after the edit started. Nothing was written.', line + 1) : e instanceof EncodeError ? t('Nothing was written: {0}.', errorMessage(e)) : errorMessage(e));
     }
     this.post({ type: 'editResult', ok: true, line, text });
   }

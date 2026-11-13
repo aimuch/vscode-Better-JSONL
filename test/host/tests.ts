@@ -644,10 +644,20 @@ describe('Better JSONL · extension host', () => {
       };
       let { s, r } = await open(utf8);
       assert.deepStrictEqual([r.isJsonl, r.stats.lines, r.stats.valid, r.activeText], [true, 3, 3, '{"n":"名字"}']);
-      const before = fs.readFileSync(utf8.fsPath);
+      // Follow mode on a compressed log: a new gzip member at its end comes in without reading again.
+      await s.handle({ type: 'follow', on: true });
+      const inits = s.sentKinds.filter((k) => k === 'init').length;
+      fs.appendFileSync(utf8.fsPath, zlib.gzipSync(Buffer.from('{"n":4}\n')));
+      r = await s.waitForReport((x) => x.stats.lines === 4 && parsed(x), 20000);
+      assert.deepStrictEqual([r.stats.valid, s.sentKinds.filter((k) => k === 'init').length], [4, inits]);
+      // A record of a compressed file is edited: the file is compressed again.
       await s.handle({ type: 'editLine', line: 1, original: '{"n":2}', text: '{"n":20}', exact: true });
-      await settle(300);
-      assert.ok(fs.readFileSync(utf8.fsPath).equals(before), 'a compressed file is not written');
+      await waitFor(() => zlib.gunzipSync(fs.readFileSync(utf8.fsPath)).toString('utf8').includes('{"n":20}'), 'the compressed file written');
+      assert.strictEqual(zlib.gunzipSync(fs.readFileSync(utf8.fsPath)).toString('utf8'), '{"n":"名字"}\n{"n":20}\n{"n":3}\n{"n":4}\n');
+      // The file written again from the start: read again.
+      fs.writeFileSync(utf8.fsPath, zlib.gzipSync(Buffer.from('{"other":1}\n')));
+      r = await s.waitForReport((x) => x.stats.lines === 1 && !x.loading && parsed(x), 20000);
+      assert.strictEqual(r.activeText, '{"other":1}');
       ({ r } = await open(utf16));
       assert.deepStrictEqual([r.stats.valid, r.activeText], [2, '{"n":"ünï 😀"}'], 'a UTF-16 byte order mark is read');
       await files.update('encoding', 'iso88591', vscode.ConfigurationTarget.Global);

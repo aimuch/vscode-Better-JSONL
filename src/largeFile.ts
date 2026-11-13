@@ -1,8 +1,6 @@
 // Reading and writing files that VS Code does not give to extensions: files above 50 MB, and
 // compressed files (.jsonl.gz). The webview always gets UTF-8.
-import { randomBytes } from 'crypto';
 import * as fs from 'fs';
-import * as path from 'path';
 import { Readable } from 'stream';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
@@ -84,7 +82,8 @@ export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncG
   const raw = await rawStream(uri, options.from ?? 0, options.to);
   let read = 0;
   raw.on('data', (b: Buffer) => (read += b.length));
-  const source: Readable = options.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 })) : raw;
+  // A file that is still being written (a compressed log) ends in the middle: the output so far is used.
+  const source: Readable = options.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH })) : raw;
   raw.on('error', (e) => source.destroy(e));
   let decoder: TextDecoder | null | undefined;
   const parts: Buffer[] = [];
@@ -139,120 +138,4 @@ function concat(parts: Buffer[], size: number): Uint8Array {
   return out;
 }
 
-export interface FileState {
-  size: number;
-  mtimeMs: number;
-  /** The last bytes up to `size` (at most TAIL): a file that only grew still ends with them there. */
-  tail: Buffer;
-}
-
-const TAIL = 4096;
-
-export async function fileState(fsPath: string): Promise<FileState> {
-  const fh = await fs.promises.open(fsPath, 'r');
-  try {
-    const st = await fh.stat();
-    const n = Math.min(TAIL, st.size);
-    const tail = Buffer.alloc(n);
-    if (n) await fh.read(tail, 0, n, st.size - n);
-    return { size: st.size, mtimeMs: st.mtimeMs, tail };
-  } finally {
-    await fh.close();
-  }
-}
-
-/** How the file on disk relates to the state read before. */
-export async function compare(fsPath: string, known: FileState): Promise<'same' | 'grew' | 'changed'> {
-  const st = await fs.promises.stat(fsPath);
-  if (st.size === known.size && st.mtimeMs === known.mtimeMs) return 'same';
-  if (st.size <= known.size) return 'changed';
-  const fh = await fs.promises.open(fsPath, 'r');
-  try {
-    const n = known.tail.length;
-    const now = Buffer.alloc(n);
-    if (n) await fh.read(now, 0, n, known.size - n);
-    return now.equals(known.tail) ? 'grew' : 'changed';
-  } finally {
-    await fh.close();
-  }
-}
-
-export class LineConflict extends Error {}
-
-/**
- * Replaces line `line` (0-based) of a UTF-8 file. The line must still read `original`; its
- * line end (LF or CR LF) stays. The file is written to a new file next to it, which then
- * takes its place, so a failure leaves the file as it was.
- */
-export async function replaceLine(fsPath: string, line: number, original: string, text: string): Promise<FileState> {
-  const fh = await fs.promises.open(fsPath, 'r');
-  let start = -1;
-  let end = -1;
-  let size = 0;
-  let mode = 0o644;
-  try {
-    const st = await fh.stat();
-    size = st.size;
-    mode = st.mode;
-    const buf = Buffer.allocUnsafe(1024 * 1024);
-    let lineStart = 0;
-    let index = 0;
-    // A UTF-8 byte order mark is not part of the first line.
-    const head = Buffer.alloc(3);
-    await fh.read(head, 0, 3, 0);
-    if (head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) lineStart = 3;
-    if (index === line) start = lineStart;
-    for (let pos = 0; pos < size && end < 0; ) {
-      const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
-      if (!bytesRead) break;
-      for (let j = buf.indexOf(10); j >= 0 && j < bytesRead; j = buf.indexOf(10, j + 1)) {
-        if (index === line) {
-          end = pos + j;
-          break;
-        }
-        index++;
-        lineStart = pos + j + 1;
-        if (index === line) start = lineStart;
-      }
-      pos += bytesRead;
-    }
-    if (start >= 0 && end < 0) end = size;
-    if (start < 0 || start > size) throw new LineConflict(`line ${line + 1} is not in the file`);
-    const old = Buffer.alloc(end - start);
-    if (old.length) await fh.read(old, 0, old.length, start);
-    const cr = old.length > 0 && old[old.length - 1] === 13;
-    if (!old.subarray(0, cr ? old.length - 1 : old.length).equals(Buffer.from(original, 'utf8'))) throw new LineConflict(`line ${line + 1} changed on disk`);
-    if (cr) end--;
-  } finally {
-    await fh.close();
-  }
-  const tmp = path.join(path.dirname(fsPath), `.${path.basename(fsPath)}.${randomBytes(4).toString('hex')}.tmp`);
-  const out = await fs.promises.open(tmp, 'w', mode & 0o777);
-  try {
-    const src = await fs.promises.open(fsPath, 'r');
-    try {
-      await copyRange(src, out, 0, start);
-      await out.write(Buffer.from(text, 'utf8'));
-      await copyRange(src, out, end, size);
-    } finally {
-      await src.close();
-    }
-    await out.close();
-    await fs.promises.rename(tmp, fsPath);
-  } catch (e) {
-    await out.close().catch(() => undefined);
-    await fs.promises.rm(tmp, { force: true });
-    throw e;
-  }
-  return fileState(fsPath);
-}
-
-async function copyRange(src: fs.promises.FileHandle, out: fs.promises.FileHandle, from: number, to: number): Promise<void> {
-  const buf = Buffer.allocUnsafe(Math.min(CHUNK, Math.max(1, to - from)));
-  for (let pos = from; pos < to; ) {
-    const { bytesRead } = await src.read(buf, 0, Math.min(buf.length, to - pos), pos);
-    if (!bytesRead) break;
-    await out.write(buf, 0, bytesRead);
-    pos += bytesRead;
-  }
-}
+export { compare, fileState, LineConflict, replaceLine, type FileState } from './fileEdit';

@@ -491,11 +491,41 @@ export function compileJsonPath(src: string): Program {
 
 // ---------- jq ----------
 
-type Tok = { t: 'num' | 'str' | 'id' | 'field' | 'op' | 'eof'; v: string | number; pos: number };
-type F = (inp: Out) => Out[];
+type Tok = { t: 'num' | 'str' | 'id' | 'field' | 'op' | 'var' | 'eof'; v: string | number; pos: number };
 
-const KEYWORDS = new Set(['and', 'or', 'if', 'then', 'elif', 'else', 'end']);
-const UNSUPPORTED = new Set(['as', 'reduce', 'foreach', 'def', 'try', 'catch', 'label', 'import', 'include']);
+/** Variables and functions a filter can see (lexical scope: a linked list from the innermost). */
+interface Env {
+  vars: VarScope;
+  funcs: FuncScope;
+}
+type VarScope = { readonly name: string; readonly v: JVal; readonly up: VarScope } | null;
+type FuncScope = { readonly key: string; fn: FuncDef; readonly up: FuncScope } | null;
+/** A function from `def`, or a filter argument (a closure over the caller's scope). */
+type FuncDef = { params: string[]; body: F; env: Env } | { closure: F; env: Env };
+type F = (inp: Out, env: Env) => Out[];
+
+const EMPTY_ENV: Env = { vars: { name: 'ENV', v: {}, up: null }, funcs: null };
+
+const KEYWORDS = new Set(['and', 'or', 'if', 'then', 'elif', 'else', 'end', 'as', 'reduce', 'foreach', 'def', 'try', 'catch', 'label', 'break']);
+const UNSUPPORTED = new Set(['import', 'include']);
+const ASSIGN = ['=', '|=', '+=', '-=', '*=', '/=', '%=', '//='];
+
+/** error(value): `try … catch` gets the value. */
+class JqError extends QueryError {
+  constructor(readonly value: JVal) {
+    super(typeof value === 'string' ? value : compactJson(value));
+  }
+}
+
+/** break $label: carries the outputs made before it, so `label` can still emit them. */
+class BreakSignal extends Error {
+  constructor(
+    readonly label: symbol,
+    public partial: Out[],
+  ) {
+    super('break');
+  }
+}
 
 function lex(s: string): Tok[] {
   const out: Tok[] = [];
@@ -562,15 +592,29 @@ function lex(s: string): Tok[] {
       i += id[0].length;
       continue;
     }
-    if (c === '$') fail('variables are not supported');
-    const two = s.slice(i, i + 3) === '//=' ? '//=' : s.slice(i, i + 2);
-    if (['|=', '+=', '-=', '*=', '/=', '%=', '//='].includes(two)) fail('assignment is not supported');
-    if (['//', '==', '!=', '<=', '>='].includes(two)) {
+    if (c === '$') {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(s.slice(i));
+      if (!m) return fail('a variable name is expected');
+      if (m[1] === '__loc__') return fail('$__loc__ is not supported');
+      out.push({ t: 'var', v: m[1], pos });
+      i += m[0].length;
+      continue;
+    }
+    if (c === '@') fail('format strings (@base64, @csv, …) are not supported');
+    const three = s.slice(i, i + 3);
+    if (three === '?//') fail('?// is not supported');
+    if (three === '//=') {
+      out.push({ t: 'op', v: three, pos });
+      i += 3;
+      continue;
+    }
+    const two = s.slice(i, i + 2);
+    if (['//', '==', '!=', '<=', '>=', '|=', '+=', '-=', '*=', '/=', '%='].includes(two)) {
       out.push({ t: 'op', v: two, pos });
       i += 2;
       continue;
     }
-    if ('|,()[]{}:;?<>+-*/%'.includes(c)) {
+    if ('|,()[]{}:;?<>+-*/%='.includes(c)) {
       out.push({ t: 'op', v: c, pos });
       i++;
       continue;
@@ -585,7 +629,7 @@ const jqFail = (msg: string): never => {
   throw new QueryError(msg);
 };
 
-function field(name: string): F {
+function field(name: string): (o: Out) => Out[] {
   return (o) => {
     const v = o.v;
     if (v === null) return [child(o, name, null)];
@@ -669,9 +713,9 @@ function cmpOp(op: string, a: JVal, b: JVal): boolean {
 }
 
 /** Every pair of a and b outputs; a varies fastest (as in jq). */
-function product(a: F, b: F, inp: Out, fn: (x: JVal, y: JVal) => JVal): Out[] {
-  const L = a(inp);
-  const R = b(inp);
+function product(a: F, b: F, inp: Out, env: Env, fn: (x: JVal, y: JVal) => JVal): Out[] {
+  const L = a(inp, env);
+  const R = b(inp, env);
   const out: Out[] = [];
   for (const r of R) for (const l of L) out.push(val(fn(l.v, r.v)));
   return out;
@@ -681,8 +725,113 @@ function stringArg(v: JVal, name: string): string {
   return typeof v === 'string' ? v : jqFail(`${name} needs a string`);
 }
 
+// ---------- paths for assignment ----------
+
+const setKey = (o: JObj, k: string, v: JVal) => {
+  if (k === '__proto__') Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+  else o[k] = v;
+};
+
+function getPath(v: JVal, path: (string | number)[]): JVal {
+  for (const k of path) {
+    if (v === null) return null;
+    if (typeof k === 'number') {
+      if (!Array.isArray(v)) return jqFail(`cannot index ${typeName(v)} with a number`);
+      v = v[k < 0 ? v.length + k : k] ?? null;
+    } else {
+      if (!isContainer(v) || Array.isArray(v)) return jqFail(`cannot index ${typeName(v)} with "${k}"`);
+      v = Object.prototype.hasOwnProperty.call(v, k) ? (v as JObj)[k] : null;
+    }
+  }
+  return v;
+}
+
+/** A copy of `v` with `x` at `path` (containers on the way are copied; null becomes one). */
+function setPath(v: JVal, path: (string | number)[], x: JVal, i = 0): JVal {
+  if (i === path.length) return x;
+  const k = path[i];
+  if (typeof k === 'number') {
+    if (v !== null && !Array.isArray(v)) return jqFail(`cannot index ${typeName(v)} with a number`);
+    const arr = v === null ? [] : (v as JVal[]).slice();
+    const at = k < 0 ? arr.length + k : k;
+    if (at < 0) return jqFail('out of bounds negative array index');
+    while (arr.length < at) arr.push(null);
+    arr[at] = setPath(at < arr.length ? arr[at] : null, path, x, i + 1);
+    return arr;
+  }
+  if (v !== null && (!isContainer(v) || Array.isArray(v))) return jqFail(`cannot index ${typeName(v)} with "${k}"`);
+  const obj: JObj = {};
+  if (v !== null) for (const key of Object.keys(v)) setKey(obj, key, (v as JObj)[key]);
+  setKey(obj, k, setPath(Object.prototype.hasOwnProperty.call(obj, k) ? obj[k] : null, path, x, i + 1));
+  return obj;
+}
+
+/** A copy of `v` without the values at `paths` (deepest and last first, so indexes stay right). */
+function delPaths(v: JVal, paths: (string | number)[][]): JVal {
+  const sorted = [...paths].sort((a, b) => compareValues(b, a));
+  for (const p of sorted) {
+    if (!p.length) return null;
+    const parent = getPath(v, p.slice(0, -1));
+    const k = p[p.length - 1];
+    if (parent === null) continue;
+    let next: JVal;
+    if (Array.isArray(parent)) {
+      if (typeof k !== 'number') return jqFail('cannot delete a string key from an array');
+      const at = k < 0 ? parent.length + k : k;
+      next = parent.filter((_, i) => i !== at);
+    } else if (isContainer(parent)) {
+      const o: JObj = {};
+      for (const key of Object.keys(parent)) if (key !== k) setKey(o, key, (parent as JObj)[key]);
+      next = o;
+    } else return jqFail(`cannot delete from ${typeName(parent)}`);
+    v = setPath(v, p.slice(0, -1), next);
+  }
+  return v;
+}
+
+/** The paths a filter points at, relative to its input. A computed value has none: an error. */
+function pathsOf(f: F, inp: Out, env: Env): (string | number)[][] {
+  return f({ v: inp.v, p: null }, env).map((o) => (o.p === undefined ? jqFail('invalid path expression') : pathOf(o.p)));
+}
+
+function lookupVar(env: Env, name: string): JVal {
+  for (let s = env.vars; s; s = s.up) if (s.name === name) return s.v;
+  return jqFail(`$${name} is not defined`);
+}
+
+function lookupFunc(env: Env, key: string): FuncDef {
+  for (let s = env.funcs; s; s = s.up) if (s.key === key) return s.fn;
+  return jqFail(`${key} is not defined`);
+}
+
+function callUser(def: FuncDef, args: F[], inp: Out, caller: Env): Out[] {
+  if ('closure' in def) return def.closure(inp, def.env);
+  // Each argument: a filter (a closure over the caller's scope), or $name: one call per value.
+  let envs: Env[] = [def.env];
+  def.params.forEach((p, i) => {
+    const a = args[i];
+    if (p.startsWith('$')) {
+      const name = p.slice(1);
+      const values = a(inp, caller);
+      envs = envs.flatMap((e) =>
+        values.map((o) => ({
+          vars: { name, v: o.v, up: e.vars },
+          funcs: { key: `${name}/0`, fn: { closure: () => [val(o.v)], env: e }, up: e.funcs },
+        })),
+      );
+    } else envs = envs.map((e) => ({ vars: e.vars, funcs: { key: `${p}/0`, fn: { closure: a, env: caller }, up: e.funcs } }));
+  });
+  return envs.flatMap((e) => def.body(inp, e));
+}
+
+type Pattern = (v: JVal, vars: VarScope) => VarScope;
+
 class JqParser {
   i = 0;
+  /** Names the query defines, innermost last: functions ("name/arity") and variables. */
+  private funcs: string[] = [];
+  private vars: string[] = ['ENV'];
+
   constructor(private readonly toks: Tok[]) {}
 
   peek(o = 0): Tok {
@@ -707,12 +856,94 @@ class JqParser {
     this.i++;
   }
 
+  private keyword(v: string): void {
+    if (!this.is('id', v)) this.fail(`'${v}' is expected`);
+    this.i++;
+  }
+
+  /** Runs `parse` with more names in scope. */
+  private scoped<T>(vars: string[], funcs: string[], parse: () => T): T {
+    const nv = this.vars.length;
+    const nf = this.funcs.length;
+    this.vars.push(...vars);
+    this.funcs.push(...funcs);
+    try {
+      return parse();
+    } finally {
+      this.vars.length = nv;
+      this.funcs.length = nf;
+    }
+  }
+
   pipe(): F {
+    if (this.is('id', 'def')) return this.def();
+    if (this.is('id', 'label')) {
+      this.i++;
+      if (!this.is('var')) this.fail('a label name ($name) is expected');
+      const name = `*label*${this.peek().v}`;
+      this.i++;
+      this.expect('|');
+      const body = this.scoped([name], [], () => this.pipe());
+      return (inp, env) => {
+        const id = Symbol(name);
+        try {
+          return body(inp, { vars: { name, v: id as unknown as JVal, up: env.vars }, funcs: env.funcs });
+        } catch (e) {
+          if (e instanceof BreakSignal && e.label === id) return e.partial;
+          throw e;
+        }
+      };
+    }
     const l = this.comma();
     if (!this.op('|')) return l;
     this.i++;
     const r = this.pipe();
-    return (inp) => l(inp).flatMap(r);
+    return (inp, env) => {
+      const out: Out[] = [];
+      for (const x of l(inp, env)) {
+        try {
+          for (const y of r(x, env)) out.push(y);
+        } catch (e) {
+          if (e instanceof BreakSignal) e.partial = [...out, ...e.partial];
+          throw e;
+        }
+      }
+      return out;
+    };
+  }
+
+  /** def name: body;  def name(f; $x): body;  — then the rest of the pipe sees it. */
+  private def(): F {
+    this.i++;
+    if (!this.is('id')) this.fail('a function name is expected');
+    const name = this.peek().v as string;
+    this.i++;
+    const params: string[] = [];
+    if (this.op('(')) {
+      this.i++;
+      for (;;) {
+        if (this.is('id')) params.push(this.peek().v as string);
+        else if (this.is('var')) params.push(`$${this.peek().v}`);
+        else this.fail('a parameter name is expected');
+        this.i++;
+        if (!this.op(';')) break;
+        this.i++;
+      }
+      this.expect(')');
+    }
+    this.expect(':');
+    const key = `${name}/${params.length}`;
+    const paramFuncs = params.map((p) => `${p.replace(/^\$/, '')}/0`);
+    const paramVars = params.filter((p) => p.startsWith('$')).map((p) => p.slice(1));
+    const body = this.scoped(paramVars, [key, ...paramFuncs], () => this.pipe());
+    this.expect(';');
+    const rest = this.scoped([], [key], () => this.pipe());
+    return (inp, env) => {
+      const scope: { key: string; fn: FuncDef; up: FuncScope } = { key, fn: { closure: () => [], env }, up: env.funcs };
+      const inner: Env = { vars: env.vars, funcs: scope };
+      scope.fn = { params, body, env: inner };
+      return rest(inp, inner);
+    };
   }
 
   private comma(): F {
@@ -721,29 +952,66 @@ class JqParser {
       this.i++;
       const a = f;
       const b = this.alt();
-      f = (inp) => [...a(inp), ...b(inp)];
+      f = (inp, env) => {
+        const first = a(inp, env);
+        try {
+          return [...first, ...b(inp, env)];
+        } catch (e) {
+          if (e instanceof BreakSignal) e.partial = [...first, ...e.partial];
+          throw e;
+        }
+      };
     }
     return f;
   }
 
   alt(): F {
-    let f = this.or();
+    let f = this.assign();
     while (this.op('//')) {
       this.i++;
       const a = f;
-      const b = this.or();
-      f = (inp) => {
+      const b = this.assign();
+      f = (inp, env) => {
         let outs: Out[];
         try {
-          outs = a(inp).filter((o) => truthy(o.v));
+          outs = a(inp, env).filter((o) => truthy(o.v));
         } catch (e) {
-          if (e instanceof LimitError) throw e;
+          if (e instanceof LimitError || e instanceof BreakSignal) throw e;
           outs = [];
         }
-        return outs.length ? outs : b(inp);
+        return outs.length ? outs : b(inp, env);
       };
     }
     return f;
+  }
+
+  /** lhs = rhs, lhs |= f, lhs += rhs, …  (not associative). */
+  private assign(): F {
+    const lhs = this.or();
+    const op = ASSIGN.find((o) => this.op(o));
+    if (!op) return lhs;
+    this.i++;
+    const rhs = this.or();
+    if (op === '|=') {
+      return (inp, env) => {
+        let v = inp.v;
+        for (const p of pathsOf(lhs, inp, env)) {
+          const outs = rhs(val(getPath(v, p)), env);
+          v = outs.length ? setPath(v, p, outs[0].v) : delPaths(v, [p]);
+        }
+        return [val(v)];
+      };
+    }
+    return (inp, env) =>
+      rhs(inp, env).map((r) => {
+        let v = inp.v;
+        for (const p of pathsOf(lhs, inp, env)) {
+          const cur = getPath(v, p);
+          const next = op === '=' ? r.v : op === '//=' ? (truthy(cur) ? cur : r.v) : arith(op.slice(0, -1), cur, r.v);
+          v = setPath(v, p, next);
+        }
+        return val(v);
+      });
   }
 
   private or(): F {
@@ -752,7 +1020,7 @@ class JqParser {
       this.i++;
       const a = f;
       const b = this.and();
-      f = (inp) => a(inp).flatMap((x) => (truthy(x.v) ? [val(true)] : b(inp).map((y) => val(truthy(y.v)))));
+      f = (inp, env) => a(inp, env).flatMap((x) => (truthy(x.v) ? [val(true)] : b(inp, env).map((y) => val(truthy(y.v)))));
     }
     return f;
   }
@@ -763,7 +1031,7 @@ class JqParser {
       this.i++;
       const a = f;
       const b = this.cmp();
-      f = (inp) => a(inp).flatMap((x) => (!truthy(x.v) ? [val(false)] : b(inp).map((y) => val(truthy(y.v)))));
+      f = (inp, env) => a(inp, env).flatMap((x) => (!truthy(x.v) ? [val(false)] : b(inp, env).map((y) => val(truthy(y.v)))));
     }
     return f;
   }
@@ -774,7 +1042,7 @@ class JqParser {
     if (!op) return l;
     this.i++;
     const r = this.add();
-    return (inp) => product(l, r, inp, (a, b) => cmpOp(op, a, b));
+    return (inp, env) => product(l, r, inp, env, (a, b) => cmpOp(op, a, b));
   }
 
   private add(): F {
@@ -784,7 +1052,7 @@ class JqParser {
       this.i++;
       const a = f;
       const b = this.mul();
-      f = (inp) => product(a, b, inp, (x, y) => arith(op, x, y));
+      f = (inp, env) => product(a, b, inp, env, (x, y) => arith(op, x, y));
     }
     return f;
   }
@@ -796,7 +1064,7 @@ class JqParser {
       this.i++;
       const a = f;
       const b = this.unary();
-      f = (inp) => product(a, b, inp, (x, y) => arith(op, x, y));
+      f = (inp, env) => product(a, b, inp, env, (x, y) => arith(op, x, y));
     }
     return f;
   }
@@ -805,38 +1073,102 @@ class JqParser {
     if (!this.op('-')) return this.postfix();
     this.i++;
     const f = this.postfix();
-    return (inp) => f(inp).map((o) => (typeName(o.v) === 'number' ? val(-num(o.v)) : jqFail(`${typeName(o.v)} cannot be negated`)));
+    return (inp, env) => f(inp, env).map((o) => (typeName(o.v) === 'number' ? val(-num(o.v)) : jqFail(`${typeName(o.v)} cannot be negated`)));
   }
 
-  private postfix(): F {
+  /** A term with its suffixes. `allowAs`: `Term as $x | body` binds here (not after reduce/foreach sources). */
+  private postfix(allowAs = true): F {
     let f = this.term();
     for (;;) {
       if (this.is('field')) {
         const g = field(this.peek().v as string);
         this.i++;
         const base = f;
-        f = (inp) => base(inp).flatMap(g);
+        f = (inp, env) => base(inp, env).flatMap(g);
       } else if (this.op('.') && this.peek(1).t === 'str') {
         this.i++;
         const g = field(this.peek().v as string);
         this.i++;
         const base = f;
-        f = (inp) => base(inp).flatMap(g);
+        f = (inp, env) => base(inp, env).flatMap(g);
       } else if (this.op('[')) {
         f = this.bracket(f);
       } else if (this.op('?')) {
         this.i++;
         const g = f;
-        f = (inp) => {
+        f = (inp, env) => {
           try {
-            return g(inp);
+            return g(inp, env);
           } catch (e) {
-            if (e instanceof LimitError) throw e;
+            if (e instanceof LimitError || e instanceof BreakSignal) throw e;
             return [];
           }
         };
+      } else if (allowAs && this.is('id', 'as')) {
+        this.i++;
+        const names: string[] = [];
+        const pattern = this.pattern(names);
+        this.expect('|');
+        const body = this.scoped(names, [], () => this.pipe());
+        const source = f;
+        return (inp, env) => source(inp, env).flatMap((o) => body(inp, { vars: pattern(o.v, env.vars), funcs: env.funcs }));
       } else return f;
     }
+  }
+
+  /** $x, [$a, $b], {a: $x, $b, "c": [$d]} */
+  private pattern(names: string[]): Pattern {
+    if (this.is('var')) {
+      const name = this.peek().v as string;
+      this.i++;
+      names.push(name);
+      return (v, vars) => ({ name, v, up: vars });
+    }
+    if (this.op('[')) {
+      this.i++;
+      const items: Pattern[] = [];
+      for (;;) {
+        items.push(this.pattern(names));
+        if (!this.op(',')) break;
+        this.i++;
+      }
+      this.expect(']');
+      return (v, vars) => {
+        if (v !== null && !Array.isArray(v)) return jqFail(`cannot index ${typeName(v)} with a number`);
+        return items.reduce<VarScope>((acc, p, k) => p(v === null ? null : ((v as JVal[])[k] ?? null), acc), vars);
+      };
+    }
+    if (this.op('{')) {
+      this.i++;
+      const entries: { key: string; p: Pattern }[] = [];
+      for (;;) {
+        const k = this.peek();
+        if (k.t === 'var') {
+          // {$name} or {$name: pattern}: $name gets the value of "name" (and the pattern matches it too).
+          this.i++;
+          const name = k.v as string;
+          names.push(name);
+          const own: Pattern = (v, vars) => ({ name, v, up: vars });
+          if (this.op(':')) {
+            this.i++;
+            const inner = this.pattern(names);
+            entries.push({ key: name, p: (v, vars) => inner(v, own(v, vars)) });
+          } else entries.push({ key: name, p: own });
+        } else if (k.t === 'id' || k.t === 'str') {
+          this.i++;
+          this.expect(':');
+          entries.push({ key: k.v as string, p: this.pattern(names) });
+        } else this.fail('an object key is expected in the pattern');
+        if (!this.op(',')) break;
+        this.i++;
+      }
+      this.expect('}');
+      return (v, vars) => {
+        if (v !== null && (!isContainer(v) || Array.isArray(v))) return jqFail(`cannot index ${typeName(v)} with a key`);
+        return entries.reduce<VarScope>((acc, e) => e.p(v === null || !Object.prototype.hasOwnProperty.call(v, e.key) ? null : (v as JObj)[e.key], acc), vars);
+      };
+    }
+    this.fail('a pattern ($name, [...] or {...}) is expected');
   }
 
   /** `[]`, `[e]`, `[a:b]` after a term. The index is computed from the same input as the term. */
@@ -844,18 +1176,18 @@ class JqParser {
     this.expect('[');
     if (this.op(']')) {
       this.i++;
-      return (inp) => base(inp).flatMap(iterate);
+      return (inp, env) => base(inp, env).flatMap(iterate);
     }
     const lo = this.op(':') ? null : this.pipe();
     if (this.op(':')) {
       this.i++;
       const hi = this.op(']') ? null : this.pipe();
       this.expect(']');
-      const bound = (g: F | null, inp: Out) => (g ? g(inp).map((o) => (o.v === null ? null : num(o.v))) : [null]);
-      return (inp) =>
-        base(inp).flatMap((b) =>
-          bound(lo, inp).flatMap((x) =>
-            bound(hi, inp).map((y) => {
+      const bound = (g: F | null, inp: Out, env: Env) => (g ? g(inp, env).map((o) => (o.v === null ? null : num(o.v))) : [null]);
+      return (inp, env) =>
+        base(inp, env).flatMap((b) =>
+          bound(lo, inp, env).flatMap((x) =>
+            bound(hi, inp, env).map((y) => {
               const v = b.v;
               if (v === null) return val(null);
               if (typeof v !== 'string' && !Array.isArray(v)) return jqFail(`cannot slice ${typeName(v)}`);
@@ -869,9 +1201,9 @@ class JqParser {
     }
     this.expect(']');
     const key = lo as F;
-    return (inp) => {
-      const bases = base(inp);
-      return key(inp).flatMap((k) => bases.flatMap((b) => indexBy(b, k.v)));
+    return (inp, env) => {
+      const bases = base(inp, env);
+      return key(inp, env).flatMap((k) => bases.flatMap((b) => indexBy(b, k.v)));
     };
   }
 
@@ -884,6 +1216,12 @@ class JqParser {
     if (k.t === 'field') {
       this.i++;
       return field(k.v as string);
+    }
+    if (k.t === 'var') {
+      this.i++;
+      const name = k.v as string;
+      if (!this.vars.includes(name)) this.fail(`$${name} is not defined`);
+      return (_inp, env) => [val(lookupVar(env, name))];
     }
     if (k.t === 'op') {
       switch (k.v) {
@@ -912,7 +1250,7 @@ class JqParser {
           }
           const f = this.pipe();
           this.expect(']');
-          return (inp) => [val(f(inp).map((o) => o.v))];
+          return (inp, env) => [val(f(inp, env).map((o) => o.v))];
         }
         case '{':
           return this.object();
@@ -926,6 +1264,18 @@ class JqParser {
         return () => [val(v)];
       }
       if (name === 'if') return this.ifThen();
+      if (name === 'reduce' || name === 'foreach') return this.fold(name);
+      if (name === 'try') return this.tryCatch();
+      if (name === 'def') return this.def();
+      if (name === 'break') {
+        this.i++;
+        const label = `*label*${this.peek().v}`;
+        if (!this.is('var') || !this.vars.includes(label)) this.fail('break needs a $label in scope');
+        this.i++;
+        return (_inp, env) => {
+          throw new BreakSignal(lookupVar(env, label) as unknown as symbol, []);
+        };
+      }
       if (UNSUPPORTED.has(name)) this.fail(`${name} is not supported`);
       if (KEYWORDS.has(name)) this.fail(`unexpected '${name}'`);
       this.i++;
@@ -939,30 +1289,93 @@ class JqParser {
         }
         this.expect(')');
       }
+      const key = `${name}/${args.length}`;
+      // A function the query defined (or a filter parameter) wins over a builtin.
+      if (this.funcs.includes(key)) return (inp, env) => callUser(lookupFunc(env, key), args, inp, env);
       return builtin(name, args, (msg) => this.fail(msg));
     }
     this.fail(k.t === 'eof' ? 'the query ends too soon' : `unexpected '${k.v}'`);
   }
 
+  /** reduce SOURCE as $x (INIT; UPDATE)  ·  foreach SOURCE as $x (INIT; UPDATE; EXTRACT) */
+  private fold(kind: 'reduce' | 'foreach'): F {
+    this.i++;
+    const source = this.postfix(false);
+    this.keyword('as');
+    const names: string[] = [];
+    const pattern = this.pattern(names);
+    this.expect('(');
+    const init = this.pipe();
+    this.expect(';');
+    const update = this.scoped(names, [], () => this.pipe());
+    let extract: F | null = null;
+    if (kind === 'foreach' && this.op(';')) {
+      this.i++;
+      extract = this.scoped(names, [], () => this.pipe());
+    }
+    this.expect(')');
+    if (kind === 'reduce') {
+      return (inp, env) =>
+        init(inp, env).map((start) => {
+          let acc: JVal = start.v;
+          for (const x of source(inp, env)) {
+            const outs = update(val(acc), { vars: pattern(x.v, env.vars), funcs: env.funcs });
+            acc = outs.length ? outs[outs.length - 1].v : null;
+          }
+          return val(acc);
+        });
+    }
+    return (inp, env) =>
+      init(inp, env).flatMap((start) => {
+        const out: Out[] = [];
+        let state: JVal = start.v;
+        for (const x of source(inp, env)) {
+          const e2: Env = { vars: pattern(x.v, env.vars), funcs: env.funcs };
+          for (const u of update(val(state), e2)) {
+            state = u.v;
+            for (const o of extract ? extract(val(state), e2) : [val(state)]) out.push(o);
+          }
+        }
+        return out;
+      });
+  }
+
+  /** try E  ·  try E catch F  (F gets the error message, or the value given to error) */
+  private tryCatch(): F {
+    this.i++;
+    const body = this.postfix();
+    let handler: F | null = null;
+    if (this.is('id', 'catch')) {
+      this.i++;
+      handler = this.postfix();
+    }
+    return (inp, env) => {
+      try {
+        return body(inp, env);
+      } catch (e) {
+        if (e instanceof LimitError || e instanceof BreakSignal || !(e instanceof QueryError)) throw e;
+        return handler ? handler(val(e instanceof JqError ? e.value : e.message), env) : [];
+      }
+    };
+  }
+
   private ifThen(): F {
     this.i++;
     const cond = this.pipe();
-    if (!this.is('id', 'then')) this.fail("'then' is expected");
-    this.i++;
+    this.keyword('then');
     const yes = this.pipe();
     let no: F = (inp) => [inp];
     if (this.is('id', 'elif')) {
       this.toks[this.i] = { ...this.peek(), v: 'if' };
       no = this.ifThen();
-      return (inp) => cond(inp).flatMap((c) => (truthy(c.v) ? yes(inp) : no(inp)));
+      return (inp, env) => cond(inp, env).flatMap((c) => (truthy(c.v) ? yes(inp, env) : no(inp, env)));
     }
     if (this.is('id', 'else')) {
       this.i++;
       no = this.pipe();
     }
-    if (!this.is('id', 'end')) this.fail("'end' is expected");
-    this.i++;
-    return (inp) => cond(inp).flatMap((c) => (truthy(c.v) ? yes(inp) : no(inp)));
+    this.keyword('end');
+    return (inp, env) => cond(inp, env).flatMap((c) => (truthy(c.v) ? yes(inp, env) : no(inp, env)));
   }
 
   private object(): F {
@@ -971,37 +1384,48 @@ class JqParser {
     while (!this.op('}')) {
       const k = this.peek();
       let key: F;
-      let name: string | null = null;
-      if (k.t === 'id' || k.t === 'str') {
+      let value: F | null = null;
+      if (k.t === 'var') {
+        // {$x}: the key "x" with the value of $x
         this.i++;
-        name = k.v as string;
+        const name = k.v as string;
+        if (!this.vars.includes(name)) this.fail(`$${name} is not defined`);
         key = () => [val(name)];
+        value = (_inp, env) => [val(lookupVar(env, name))];
+      } else if (k.t === 'id' || k.t === 'str') {
+        this.i++;
+        const name = k.v as string;
+        key = () => [val(name)];
+        value = field(name);
       } else if (this.op('(')) {
         this.i++;
         key = this.pipe();
         this.expect(')');
       } else this.fail('an object key is expected');
-      let value: F;
       if (this.op(':')) {
         this.i++;
         value = this.alt();
-      } else if (name !== null) value = field(name);
-      else this.fail("':' is expected");
-      entries.push({ key, value });
+      } else if (!value) this.fail("':' is expected");
+      entries.push({ key, value: value as F });
       if (!this.op(',')) break;
       this.i++;
     }
     this.expect('}');
-    return (inp) => {
+    return (inp, env) => {
       let acc: JObj[] = [{}];
       for (const e of entries) {
         const next: JObj[] = [];
-        const keys = e.key(inp);
-        const values = e.value(inp);
+        const keys = e.key(inp, env);
+        const values = e.value(inp, env);
         for (const o of acc) {
           for (const kk of keys) {
             const key = typeof kk.v === 'string' ? kk.v : jqFail('an object key must be a string');
-            for (const vv of values) next.push({ ...o, [key]: vv.v });
+            for (const vv of values) {
+              const copy: JObj = {};
+              for (const ok of Object.keys(o)) setKey(copy, ok, o[ok]);
+              setKey(copy, key, vv.v);
+              next.push(copy);
+            }
           }
         }
         spend(next.length);
@@ -1019,17 +1443,17 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
   };
   const map1 = (fn: (v: JVal) => JVal): F => {
     want(0);
-    return (inp) => [val(fn(inp.v))];
+    return (inp, env) => [val(fn(inp.v))];
   };
   const withArg = (fn: (v: JVal, a: JVal) => JVal): F => {
     want(1);
-    return (inp) => args[0](inp).map((a) => val(fn(inp.v, a.v)));
+    return (inp, env) => args[0](inp, env).map((a) => val(fn(inp.v, a.v)));
   };
   const arr = (v: JVal, what: string): JVal[] => (Array.isArray(v) ? v : jqFail(`${what} needs an array`));
   const byType = (t: string | string[]): F => {
     want(0);
     const ts = Array.isArray(t) ? t : [t];
-    return (inp) => (ts.includes(typeName(inp.v)) ? [inp] : []);
+    return (inp, env) => (ts.includes(typeName(inp.v)) ? [inp] : []);
   };
   switch (name) {
     case 'empty':
@@ -1057,10 +1481,10 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       });
     case 'select':
       want(1);
-      return (inp) => args[0](inp).filter((o) => truthy(o.v)).map(() => inp);
+      return (inp, env) => args[0](inp, env).filter((o) => truthy(o.v)).map(() => inp);
     case 'values':
       want(0);
-      return (inp) => (inp.v === null ? [] : [inp]);
+      return (inp, env) => (inp.v === null ? [] : [inp]);
     case 'nulls':
       return byType('null');
     case 'booleans':
@@ -1079,16 +1503,16 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       return byType(['null', 'boolean', 'number', 'string']);
     case 'map':
       want(1);
-      return (inp) => [val(iterate(inp).flatMap(args[0]).map((o) => o.v))];
+      return (inp, env) => [val(iterate(inp).flatMap((c) => args[0](c, env)).map((o) => o.v))];
     case 'map_values':
       want(1);
-      return (inp) => {
+      return (inp, env) => {
         const v = inp.v;
-        if (Array.isArray(v)) return [val(v.flatMap((x) => args[0](val(x)).slice(0, 1).map((o) => o.v)))];
+        if (Array.isArray(v)) return [val(v.flatMap((x) => args[0](val(x), env).slice(0, 1).map((o) => o.v)))];
         if (!isContainer(v)) return jqFail(`cannot iterate over ${typeName(v)}`);
         const out: JObj = {};
         for (const k of Object.keys(v)) {
-          const r = args[0](val((v as JObj)[k]));
+          const r = args[0](val((v as JObj)[k]), env);
           if (r.length) out[k] = r[0].v;
         }
         return [val(out)];
@@ -1103,9 +1527,9 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       const every = name === 'all';
       if (n === 0) return map1((v) => (every ? arr(v, name).every(truthy) : arr(v, name).some(truthy)));
       want(1);
-      return (inp) => {
+      return (inp, env) => {
         const kids = iterate(inp);
-        const ok = (c: Out) => args[0](c).some((o) => truthy(o.v));
+        const ok = (c: Out) => args[0](c, env).some((o) => truthy(o.v));
         return [val(every ? kids.every(ok) : kids.some(ok))];
       };
     }
@@ -1124,9 +1548,9 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
     case 'min_by':
     case 'max_by': {
       want(1);
-      return (inp) => {
+      return (inp, env) => {
         const xs = iterate(inp);
-        const keyed = xs.map((x) => ({ x: x.v, k: args[0](x).map((o) => o.v) as JVal }));
+        const keyed = xs.map((x) => ({ x: x.v, k: args[0](x, env).map((o) => o.v) as JVal }));
         keyed.sort((a, b) => compareValues(a.k, b.k));
         if (name === 'sort_by') return [val(keyed.map((e) => e.x))];
         if (name === 'min_by') return [val(keyed.length ? keyed[0].x : null)];
@@ -1147,7 +1571,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
     case 'first':
     case 'last':
       if (n === 0) {
-        return (inp) => {
+        return (inp, env) => {
           const v = inp.v;
           if (v === null) return [val(null)];
           const xs = arr(v, name);
@@ -1155,17 +1579,17 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
         };
       }
       want(1);
-      return (inp) => {
-        const outs = args[0](inp);
+      return (inp, env) => {
+        const outs = args[0](inp, env);
         return outs.length ? [name === 'first' ? outs[0] : outs[outs.length - 1]] : [];
       };
     case 'limit':
       want(2);
-      return (inp) => args[0](inp).flatMap((k) => args[1](inp).slice(0, Math.max(0, num(k.v))));
+      return (inp, env) => args[0](inp, env).flatMap((k) => args[1](inp, env).slice(0, Math.max(0, num(k.v))));
     case 'range':
       if (n !== 1 && n !== 2) fail(`unknown function range/${n}`);
-      return (inp) => {
-        const [lo, hi] = n === 1 ? [0, num(args[0](inp)[0]?.v ?? 0)] : [num(args[0](inp)[0]?.v ?? 0), num(args[1](inp)[0]?.v ?? 0)];
+      return (inp, env) => {
+        const [lo, hi] = n === 1 ? [0, num(args[0](inp, env)[0]?.v ?? 0)] : [num(args[0](inp, env)[0]?.v ?? 0), num(args[1](inp, env)[0]?.v ?? 0)];
         const out: Out[] = [];
         for (let i = lo; i < hi; i++) out.push(val(i));
         return out;
@@ -1228,7 +1652,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
     case 'split':
       if (n === 1) return withArg((v, a) => stringArg(v, 'split').split(stringArg(a, 'split')));
       want(2);
-      return (inp) => args[0](inp).flatMap((re) => args[1](inp).map((fl) => val(stringArg(inp.v, 'split').split(regex(re.v, fl.v)))));
+      return (inp, env) => args[0](inp, env).flatMap((re) => args[1](inp, env).map((fl) => val(stringArg(inp.v, 'split').split(regex(re.v, fl.v)))));
     case 'join':
       return withArg((v, a) => {
         const sep = stringArg(a, 'join');
@@ -1238,10 +1662,10 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       });
     case 'test':
       if (n !== 1 && n !== 2) fail(`unknown function test/${n}`);
-      return (inp) => {
+      return (inp, env) => {
         const s = stringArg(inp.v, 'test');
-        const flags = n === 2 ? args[1](inp) : [val(null)];
-        return args[0](inp).flatMap((re) => flags.map((fl) => val(regex(re.v, fl.v).test(s))));
+        const flags = n === 2 ? args[1](inp, env) : [val(null)];
+        return args[0](inp, env).flatMap((re) => flags.map((fl) => val(regex(re.v, fl.v).test(s))));
       };
     case 'contains':
       return withArg((v, a) => contains(v, a));
@@ -1263,29 +1687,75 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
         }
         return out;
       });
-    case 'paths':
+    case 'del':
+      want(1);
+      return (inp, env) => [val(delPaths(inp.v, pathsOf(args[0], inp, env)))];
+    case 'delpaths':
+      want(1);
+      return (inp, env) => args[0](inp, env).map((ps) => val(delPaths(inp.v, arr(ps.v, 'delpaths').map((p) => arr(p, 'delpaths') as (string | number)[]))));
+    case 'getpath':
+      want(1);
+      return (inp, env) =>
+        args[0](inp, env).map((p) => {
+          try {
+            return val(getPath(inp.v, arr(p.v, 'getpath') as (string | number)[]));
+          } catch {
+            return val(null);
+          }
+        });
+    case 'setpath':
+      want(2);
+      return (inp, env) => args[1](inp, env).flatMap((x) => args[0](inp, env).map((p) => val(setPath(inp.v, arr(p.v, 'setpath') as (string | number)[], x.v))));
+    case 'with_entries':
+      want(1);
+      return (inp, env) => {
+        const v = inp.v;
+        if (!isContainer(v) || Array.isArray(v)) return jqFail(`${typeName(v)} has no entries`);
+        const out: JObj = {};
+        for (const k of Object.keys(v)) {
+          for (const e of args[0](val({ key: k, value: (v as JObj)[k] }), env)) {
+            const o = e.v as JObj;
+            if (!isContainer(o) || Array.isArray(o)) return jqFail('with_entries needs objects');
+            const key = o.key ?? o.k ?? o.name ?? null;
+            setKey(out, typeof key === 'string' ? key : compactJson(key), (o.value ?? o.v ?? null) as JVal);
+          }
+        }
+        return [val(out)];
+      };
+    case 'leaf_paths':
       want(0);
-      return (inp) => descend({ v: inp.v, p: null }).slice(1).map((o) => val(pathOf(o.p as PathLink)));
+      return (inp) => descend({ v: inp.v, p: null }).filter((o) => o.p !== null && !isContainer(o.v)).map((o) => val(pathOf(o.p as PathLink)));
+    case 'paths':
+      if (n === 1)
+        return (inp, env) =>
+          descend({ v: inp.v, p: null })
+            .slice(1)
+            .filter((o) => args[0](val(o.v), env).some((x) => truthy(x.v)))
+            .map((o) => val(pathOf(o.p as PathLink)));
+      want(0);
+      return (inp, env) => descend({ v: inp.v, p: null }).slice(1).map((o) => val(pathOf(o.p as PathLink)));
     case 'path':
       want(1);
-      return (inp) => args[0]({ v: inp.v, p: null }).map((o) => (o.p === undefined ? jqFail('invalid path expression') : val(pathOf(o.p))));
+      return (inp, env) => args[0]({ v: inp.v, p: null }, env).map((o) => (o.p === undefined ? jqFail('invalid path expression') : val(pathOf(o.p))));
     case 'recurse':
       if (n === 0) return descend;
       want(1);
-      return (inp) => {
+      return (inp, env) => {
         const out: Out[] = [];
         const stack: Out[] = [inp];
         while (stack.length) {
           const x = stack.pop() as Out;
           out.push(x);
-          const next = args[0](x);
+          const next = args[0](x, env);
           for (let i = next.length - 1; i >= 0; i--) stack.push(next[i]);
         }
         return out;
       };
     case 'error':
       want(n === 0 ? 0 : 1);
-      return (inp) => jqFail(n === 0 ? compactJson(inp.v) : compactJson(args[0](inp)[0]?.v ?? null));
+      return (inp, env) => {
+        throw new JqError(n === 0 ? inp.v : (args[0](inp, env)[0]?.v ?? null));
+      };
   }
   return fail(`unknown function ${name}/${n}`);
 }
@@ -1318,7 +1788,7 @@ export function compileJq(src: string): Program {
     matches(record) {
       budget = MAX_RECORD;
       try {
-        return f({ v: record, p: null }).some((o) => truthy(o.v));
+        return f({ v: record, p: null }, EMPTY_ENV).some((o) => truthy(o.v));
       } catch {
         return false;
       }
@@ -1326,7 +1796,7 @@ export function compileJq(src: string): Program {
     run(root) {
       budget = MAX_OUT;
       try {
-        return { outs: f({ v: root, p: null }), capped: false };
+        return { outs: f({ v: root, p: null }, EMPTY_ENV), capped: false };
       } catch (e) {
         if (e instanceof LimitError) return { outs: [], capped: true };
         throw e;

@@ -203,7 +203,7 @@ export class FormattedView implements View {
     const m = app.model;
     let expanded = 0;
     if (!m.isJsonl) expanded = m.kind(0) === K_VALUE ? 1 : 0;
-    else if (app.state.expandMode === 'all' && m.keepsAll) {
+    else if (app.expandAll) {
       if (!this.recs) expanded = m.valid;
       else for (const r of this.recs) if (m.kind(r) === K_VALUE) expanded++;
     } else {
@@ -234,7 +234,7 @@ export class FormattedView implements View {
 
   private isExpanded(r: number): boolean {
     const app = this.app;
-    return !app.model.isJsonl || (app.state.expandMode === 'all' && app.model.keepsAll) || app.state.selected.has(r);
+    return !app.model.isJsonl || app.expandAll || app.state.selected.has(r);
   }
 
   /**
@@ -598,7 +598,7 @@ export class FormattedView implements View {
     if (act) {
       if (act.classList.contains('a-edit')) app.openEditor(r);
       else if (act.classList.contains('a-copy')) app.post({ type: 'copy', text: app.model.line(r) });
-      else app.post({ type: 'reveal', line: r, path: [] });
+      else app.reveal(r, []);
       return;
     }
     const foldEl = target.closest('[data-k]') as HTMLElement | null;
@@ -629,6 +629,6 @@ export class FormattedView implements View {
     const r = Number(rowEl.dataset.r);
     const path = rowEl.dataset.p ? decodeKey(rowEl.dataset.p) : [];
     window.getSelection()?.removeAllRanges();
-    this.app.post({ type: 'reveal', line: this.app.model.isJsonl ? r : 0, path });
+    this.app.reveal(r, path);
   }
 }

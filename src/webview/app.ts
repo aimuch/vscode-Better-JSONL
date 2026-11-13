@@ -4,6 +4,7 @@ import type { DocInfo, ExpandMode, HostMessage, RenderReport, TextChange, Viewer
 import { errorMessage } from '../shared/jsonText';
 import { valueSpan } from '../locate';
 import { ByteJsonError, parseJsonBytes } from './byteJson';
+import { indexItems, ItemStore } from './items';
 import { diffValues, type Difference } from './diff';
 import { csvRow } from './exporter';
 import { childKey, esc, formatBytes, isContainer, isObj, pathToString, type JVal } from './json';
@@ -173,6 +174,8 @@ export class App {
   private loadRead = 0;
   /** A cell edit waits for the host. */
   private cellPending = false;
+  /** The user confirmed Expand all for this file over 50 MB. */
+  private bigExpandOK = false;
   /** Ends the document listeners of the shell when it is built again. */
   private shellGone = new AbortController();
   private nextExport = 1;
@@ -229,7 +232,13 @@ export class App {
   }
 
   get readOnly(): boolean {
-    return !!this.doc.readOnly;
+    return !!this.doc.readOnly || !!this.model?.items;
+  }
+
+  /** Asks the host to show record `r` (at `path`) in the text editor: at its line in the file. */
+  reveal(r: number, path: (string | number)[]): void {
+    const m = this.model;
+    this.post({ type: 'reveal', line: m.isJsonl ? m.fileLine(r) : 0, path });
   }
 
   folds(r: number): Set<string> {
@@ -340,6 +349,8 @@ export class App {
     const last = Math.max(0, model.count - 1);
     const within = (r: number) => Number.isInteger(r) && r >= 0 && (r < model.count || model.loading);
     let expandMode = old.expandMode || prev?.expandMode || config.expandMode;
+    // A new file over 50 MB asks again before it expands every line.
+    this.bigExpandOK = false;
     if (expandMode === 'all' && !model.keepsAll) expandMode = 'focus';
     this.state = {
       view: old.view || prev?.view || config.defaultView,
@@ -451,8 +462,11 @@ export class App {
       this.loadStore = undefined;
       let model: DocModel;
       try {
-        // Too long for one string: read the value from the bytes.
-        model = store.total >= BYTE_JSON_AT ? DocModel.fromValue(parseJsonBytes(store.chunkList()), store.total) : new DocModel(store.takeText(), false, store.total);
+        // Too long for one string. An array (or an object that is mostly one array): its items
+        // become records, read when needed. Another shape is parsed from the bytes as a whole.
+        const items = store.total >= BYTE_JSON_AT ? indexItems(store) : undefined;
+        if (items) model = new DocModel(new ItemStore(store, items), true);
+        else model = store.total >= BYTE_JSON_AT ? DocModel.fromValue(parseJsonBytes(store.chunkList()), store.total) : new DocModel(store.takeText(), false, store.total);
       } catch (e) {
         const why = e instanceof ByteJsonError ? t('not valid JSON: {0}', e.message) : errorMessage(e);
         this.paintBoot(t('This file cannot be shown as one JSON value ({0}).', why));
@@ -513,7 +527,7 @@ export class App {
     s.anchor = move(s.anchor) >= 0 ? move(s.anchor) : s.active;
     if (model.isJsonl && !s.selected.size && n) s.selected.add(s.active);
     if (!model.isJsonl) s.selected.clear();
-    if (s.expandMode === 'all' && !model.keepsAll) s.expandMode = 'focus';
+    if (s.expandMode === 'all' && !model.keepsAll && !this.bigExpandOK) s.expandMode = 'focus';
     let painted = false;
     this.startSearch(() => painted && this.repaint());
     this.startBackground();
@@ -607,10 +621,32 @@ export class App {
     this.stateChanged();
   }
 
+  /** Expand all is on. In a file over 50 MB only after the user confirmed it (it parses every record). */
+  get expandAll(): boolean {
+    return this.state.expandMode === 'all' && (this.model.keepsAll || this.bigExpandOK);
+  }
+
   setExpandMode(m: ExpandMode): void {
     if (this.state.expandMode === m) return;
-    if (m === 'all' && !this.model.keepsAll) {
-      this.showBanner(t('Expand all is off for files over {0}. Only the selected lines are expanded.', formatBytes(KEEP_ALL_BYTES)));
+    if (m === 'all' && !this.model.keepsAll && !this.bigExpandOK) {
+      // Every record is parsed and measured, and the row heights of all of them are kept.
+      this.showBanner(t('This file is {0}. Expand all parses every line: it can take a while and use a lot of memory.', formatBytes(this.model.bytes)), undefined, [
+        {
+          label: t('Expand all'),
+          run: () => {
+            this.bigExpandOK = true;
+            this.showBanner(t('Expanding all lines…'));
+            // Let the text paint before the long layout.
+            defer(() => {
+              if (!this.model.keepsAll && this.bigExpandOK) {
+                this.setExpandMode('all');
+                this.banner.hidden = true;
+              }
+            }, 30);
+          },
+        },
+        { label: t('Cancel'), run: () => undefined },
+      ]);
       return;
     }
     this.state.expandMode = m;
@@ -990,7 +1026,12 @@ export class App {
       v.hide();
     }
     this.activeView.show();
-    if (this.model.detectedJsonl) this.showBanner(t('This .json file holds one JSON value per line. It is shown as JSON Lines.'));
+    const items = this.model.items;
+    if (items)
+      this.showBanner(
+        t('This JSON value is too large to keep in memory as a whole. The {0} items of {1} are shown as records, numbered from 1, and read when needed. Edit them as text.', items.count.toLocaleString(), pathToString(items.path)),
+      );
+    else if (this.model.detectedJsonl) this.showBanner(t('This .json file holds one JSON value per line. It is shown as JSON Lines.'));
     else if (this.model.jsonc) this.showBanner(t('Parsed as JSON with Comments (comments or trailing commas found).'));
   }
 
@@ -1217,12 +1258,22 @@ export class App {
   }
 
   /** A line under the toolbar. `action: 'reload'` adds a button that asks the host to read the file again. */
-  showBanner(text: string, action?: 'reload' | 'append'): void {
+  showBanner(text: string, action?: 'reload' | 'append', buttons: { label: string; run: () => void }[] = []): void {
     const b = this.banner;
     b.textContent = '';
     const span = document.createElement('span');
     span.textContent = text;
     b.appendChild(span);
+    buttons.forEach((x, i) => {
+      const btn = document.createElement('button');
+      btn.className = i === 0 ? 'btn primary banner-act' : 'btn banner-act';
+      btn.textContent = x.label;
+      btn.addEventListener('click', () => {
+        b.hidden = true;
+        x.run();
+      });
+      b.appendChild(btn);
+    });
     if (action === 'reload' || action === 'append') {
       const btn = document.createElement('button');
       btn.className = 'btn banner-act';
@@ -1266,12 +1317,11 @@ export class App {
     });
     (tb.querySelector('.mode') as HTMLElement).hidden = !(s.view === 'formatted' && m.isJsonl);
     const allBtn = tb.querySelector('[data-mode="all"]') as HTMLButtonElement;
-    allBtn.disabled = !m.keepsAll;
-    allBtn.title = m.keepsAll ? t('All lines are pretty-printed') : t('Expand all is off for files over {0}. Only the selected lines are expanded.', formatBytes(KEEP_ALL_BYTES));
+    allBtn.title = m.keepsAll || this.bigExpandOK ? t('All lines are pretty-printed') : t('All lines are pretty-printed. This file is over {0}: you confirm first.', formatBytes(KEEP_ALL_BYTES));
     (tb.querySelector('.foldall') as HTMLElement).hidden = !(s.view === 'formatted' && !m.isJsonl);
     (tb.querySelector('.linesel') as HTMLElement).hidden = !(s.view === 'graph' && m.isJsonl);
     const followBtn = tb.querySelector('.follow-btn') as HTMLButtonElement;
-    followBtn.hidden = !m.isJsonl;
+    followBtn.hidden = !m.isJsonl || !!m.items;
     followBtn.classList.toggle('on', s.follow);
     followBtn.setAttribute('aria-pressed', String(s.follow));
     (tb.querySelector('.compare-btn') as HTMLButtonElement).hidden = !(m.isJsonl && s.selected.size === 2 && s.view !== 'graph');

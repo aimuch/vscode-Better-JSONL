@@ -1240,14 +1240,35 @@ await scenario('W47', 'Graph overview: shows when the graph is larger than the v
   check.ok('hidden when the whole graph is in view', await mini.isHidden());
 });
 
-await scenario('W48', 'One JSON value read from bytes (as for a file over 512 MB); a compressed file is read-only', [], async ({ page, check }) => {
+await scenario('W48', 'One JSON value over the string limit: an array is read item by item, another value from the bytes; a compressed file', [], async ({ page, check, shot }) => {
   await page.addInitScript(() => (window.__betterJsonlByteJsonAt = 1000));
   await openBlank(page);
-  const doc = { rows: Array.from({ length: 2000 }, (_, i) => ({ id: i, name: 'n' + i + 'é😀' })), big: 12345678901234567890 };
-  const text = JSON.stringify(doc).replace('"big":12345678901234567000', '"big":12345678901234567890');
-  await page.evaluate((t) => window.harness.loadLarge('doc.json', new TextEncoder().encode(t), { chunk: 777 }), text);
-  let r = await report(page, (x) => x.large && x.fileName === 'doc.json' && x.formatted, 20000);
-  check.eq('parsed from the bytes: one value', [r.isJsonl, r.stats.valid, r.formatted.totalRows], [false, 1, 2000 * 4 + 5]);
+  // An object that is mostly one array: its items become records, read when needed.
+  const doc = { meta: { n: 1 }, rows: Array.from({ length: 2000 }, (_, i) => ({ id: i, name: 'n' + i + 'é😀' })) };
+  await page.evaluate((t) => window.harness.loadLarge('doc.json', new TextEncoder().encode(t), { chunk: 777 }), JSON.stringify(doc, null, 1));
+  let r = await report(page, (x) => x.large && x.fileName === 'doc.json' && x.stats.parsed >= x.stats.lines && x.stats.lines > 0, 20000);
+  check.eq('the 2 000 items of $.rows are records', [r.isJsonl, r.stats.lines, r.stats.valid], [true, 2000, 2000]);
+  check.ok('the banner says so', (await page.locator('.banner').innerText()).includes('2,000 items of $.rows'));
+  check.eq('one line per record (made compact)', r.activeText, '{"id":0,"name":"n0é😀"}');
+  check.eq('read-only: no Edit button', await page.locator('.a-edit').count(), 0);
+  await shot('A huge JSON array read item by item');
+  await send(page, { type: 'selection', lines: [1999], active: 1999 });
+  await report(page, (x) => x.active === 1999);
+  await page.locator('.formatted .row.first[data-r="1999"] .a-goto').click();
+  // Pretty-printed with one space: "{", "meta" (3 lines), "rows": [, then each item takes 4 lines from line 5 (0-based).
+  check.eq('Source goes to the line of the item in the file', (await posted(page, 'reveal')).at(-1).line, 5 + 1999 * 4);
+  await page.fill('.search input', '.id == 1500');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('jq on the items', r.matches, 1);
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid');
+  check.eq('the grid has a row per item', [r.grid.rows, r.grid.columns], [1, ['id', 'name']]);
+  // A value that is not mostly one array: parsed from the bytes as a whole.
+  await openBlank(page);
+  const text = '{"big":12345678901234567890,"s":"' + 'x'.repeat(2000) + '"}';
+  await page.evaluate((t) => window.harness.loadLarge('one.json', new TextEncoder().encode(t), { chunk: 333 }), text);
+  r = await report(page, (x) => x.large && x.fileName === 'one.json' && x.formatted, 20000);
+  check.eq('one value', [r.isJsonl, r.stats.valid], [false, 1]);
   await page.fill('.search input', '.big');
   r = await report(page, (x) => x.matches === 1);
   await page.press('.search input', 'Enter');
@@ -1257,11 +1278,33 @@ await scenario('W48', 'One JSON value read from bytes (as for a file over 512 MB
   await page.evaluate(() => window.harness.loadLarge('bad.json', new TextEncoder().encode('{"a": [1, 2,, 3]}' + ' '.repeat(2000))));
   await page.waitForFunction(() => document.querySelector('.boot')?.textContent.includes('not valid JSON'));
   check.ok('an error says where', (await page.locator('.boot').innerText()).includes('byte 13'), await page.locator('.boot').innerText());
+  // A compressed file can be edited record by record; it has no text view.
   await openBlank(page);
-  await page.evaluate(() => window.harness.loadLarge('logs.jsonl.gz', new TextEncoder().encode('{"a":1}\n{"a":2}\n')));
+  await page.evaluate(() => window.harness.loadLarge('logs.jsonl.gz', new TextEncoder().encode('{"a":1}\n{"a":2}\n'), { readOnly: false }));
   r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
   check.eq('a .jsonl.gz file is JSON Lines', [r.isJsonl, r.stats.valid], [true, 2]);
-  check.eq('read-only: no Edit, no Open as Text', [await page.locator('.a-edit').count(), await page.locator('.open-text').isHidden()], [0, true]);
+  check.eq('Edit, but no Open as Text', [await page.locator('.a-edit').count() > 0, await page.locator('.open-text').isHidden()], [true, true]);
+});
+
+await scenario('W49', 'Expand all on a file over 50 MB asks first; Cancel keeps Focus, Expand all expands every line', [], async ({ page, check, shot }) => {
+  await openBlank(page);
+  await page.evaluate(() => window.harness.loadLarge('big.jsonl', new TextEncoder().encode('{"a":1}\n{"b":{"c":2}}\n{"d":[1,2]}\n'), { readOnly: false }));
+  let r = await report(page, (x) => x.large && !x.loading && x.stats.parsed >= x.stats.lines);
+  await page.click('.toolbar [data-mode="all"]');
+  await page.waitForFunction(() => document.querySelector('.banner:not([hidden])')?.textContent.includes('Expand all parses every line'));
+  await shot('Expand all on a large file asks first');
+  await page.locator('.banner .banner-act', { hasText: 'Cancel' }).click();
+  await page.waitForTimeout(150);
+  r = await report(page);
+  check.eq('Cancel: still Focus', [r.expandMode, r.formatted.expandedRecords], ['focus', 1]);
+  await page.click('.toolbar [data-mode="all"]');
+  await page.locator('.banner .banner-act', { hasText: 'Expand all' }).click();
+  r = await report(page, (x) => x.expandMode === 'all');
+  check.eq('confirmed: every line is expanded', r.formatted.expandedRecords, 3);
+  await page.click('.toolbar [data-mode="focus"]');
+  await page.click('.toolbar [data-mode="all"]');
+  r = await report(page, (x) => x.expandMode === 'all');
+  check.eq('asked once per file', r.formatted.expandedRecords, 3);
 });
 
 await scenario('W36', 'The background scan and search do not wait for timers (a window in the background slows timers down)', [], async ({ page, check }) => {

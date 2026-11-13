@@ -1,6 +1,7 @@
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { errorMessage, errorOffset, stripBom } from '../shared/jsonText';
 import type { JsonPath, TextChange } from '../shared/protocol';
+import type { ItemStore } from './items';
 import { compileQuery, type Program } from './query';
 import { childKey, getAt, isContainer, isObj, parseJson, parsePath, plainText, primText, RawNum, stringifyPretty, type JObj, type JVal } from './json';
 
@@ -149,6 +150,15 @@ export class ByteStore implements LineStore {
     return this.done && this.starts[this.nStarts - 1] < this.total;
   }
 
+  /** Bytes [a, b) of what was received. */
+  slice(a: number, b: number): Uint8Array {
+    return this.bytes(a, b);
+  }
+
+  byteAt(pos: number): number {
+    return pos < this.total ? this.bytes(pos, pos + 1)[0] : -1;
+  }
+
   /** The pieces received, in order (for a parser that reads bytes). */
   chunkList(): readonly Uint8Array[] {
     return this.chunks;
@@ -272,7 +282,7 @@ export class DocModel {
   errorsVersion = 0;
 
   /** `src`: the text, the byte store of a large file, or the records of a JSON Lines document (with `endsWithEol`). */
-  constructor(src: string | ByteStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false) {
+  constructor(src: string | ByteStore | ItemStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false) {
     this.isJsonl = isJsonl;
     if (Array.isArray(src)) {
       this.large = false;
@@ -375,6 +385,18 @@ export class DocModel {
     const last = store.count - 1;
     store.append(data, true);
     if (open && last >= 0) this.forget(last);
+  }
+
+  /** One JSON value too large for memory, shown as the items of its array (see items.ts). */
+  get items(): { path: (string | number)[]; count: number } | undefined {
+    const s = this.store as Partial<ItemStore>;
+    return s.index ? { path: s.index.path, count: s.index.count } : undefined;
+  }
+
+  /** The line in the file where record i starts. */
+  fileLine(i: number): number {
+    const s = this.store as Partial<ItemStore>;
+    return s.fileLine ? s.fileLine(i) : i;
   }
 
   /** True while a byte store still receives data. */

@@ -57,12 +57,13 @@ VS Code does not give extensions the text of a file above 50 MB, and has no text
 
 - A JSON Lines file shows while it loads: the first rows are there at once, and you can scroll, select and search as the rest arrives. A 300 MB file with 3.4 million lines takes about 8 seconds to load and scan on a recent laptop.
 - Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress. In the Grid, sorting and column filters first read the columns they need (the status bar shows the progress).
-- **Edit a record** of a large UTF-8 JSON Lines file (the record editor or a grid cell): the line is replaced on disk. The edit is refused when the file or the line changed since it was read.
-- **Follow**: when a file only grows at its end (a log), the new lines are added to the view without reading the file again. Without follow mode, a **Load new lines** button appears. Other changes show a **Reload** button.
-- **Compressed files**: `.jsonl.gz`, `.ndjson.gz` and `.json.gz` open in Better JSONL when you open them in VS Code. They are read-only.
-- **Encodings**: a UTF-16 byte order mark is read, and so is the `files.encoding` setting (for example `gbk`, `shiftjis`, `windows1252`). Files that are not UTF-8 are read-only.
-- One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded. A value above about 512 MB (too long for one JavaScript string) is parsed from the bytes; it needs enough memory for the parsed value.
-- What is different: no cursor sync; **Expand all** is off above 50 MB. **Source** opens the file in VS Code at that line.
+- **Edit a record** of a large JSON Lines file (the record editor or a grid cell), also of a compressed file and in other encodings: the line is replaced on disk (a compressed file is compressed again). The edit is refused when the file or the line changed since it was read, or when a character cannot be written in the file's encoding.
+- **Follow**: when a file only grows at its end (a log), the new lines are added to the view without reading the file again. A compressed file is decompressed again, and only what follows the text the view has is added. Without follow mode, a **Load new lines** button appears. Other changes show a **Reload** button.
+- **Compressed files**: `.jsonl.gz`, `.ndjson.gz` and `.json.gz` open in Better JSONL when you open them in VS Code.
+- **Encodings**: a UTF-16 byte order mark is read, and so is the `files.encoding` setting (for example `gbk`, `shiftjis`, `windows1252`).
+- One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded.
+- **Above about 512 MB** (too long for one JavaScript string): an array, or an object that is mostly one array, is read item by item. Its items are shown as records (as JSON Lines, read-only) and only their byte ranges are kept: a 600 MB array of 4.4 million items opens in about 9 seconds with about 1 GB of memory. Another value is parsed from the bytes as a whole and needs memory for all of it.
+- **Expand all** above 50 MB asks first: it parses every line and keeps the height of each one. No cursor sync. **Source** opens the file in VS Code at that line.
 
 ### Search and filter
 
@@ -77,9 +78,10 @@ Type plain text, a path query, or a jq or JSONPath query:
 | `level!=info` | Not equal |
 | `.level == "warn" and .ms > 100` | **jq** (a search that starts with `.`): records for which the filter gives something other than `false` or `null` |
 | `select(.tags \| index("x"))` … `.user.name \| test("^a"; "i")` | jq functions: `select`, `map`, `has`, `length`, `keys`, `type`, `test`, `contains`, `startswith`, `endswith`, `any`, `all`, `sort_by`, `group_by`, `unique`, `min`, `max`, `add`, `to_entries`, `paths`, `path`, `if … then … else … end`, `//`, `?` and more |
+| `.ms as $t \| select($t > 100)`, `reduce .items[] as $i (0; . + $i.n)`, `def big: .ms > 100; select(big)` | jq variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `reduce`, `foreach`, `def` (with filter and `$value` parameters, recursion), `try … catch`, `label` / `break`, and assignment (`=`, `\|=`, `+=`, `//=`, …) on a copy of the value |
 | `$..user[?@.name == "Ada"]` | **JSONPath** (RFC 9535, a search that starts with `$`): filters, `..`, `*`, slices, unions, `length()`, `count()`, `match()`, `search()`. On JSON Lines, `$[?…]` tests each record |
 
-The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why. jq here has no variables (`as $x`), `reduce` or assignment.
+The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why. Not in this jq: string interpolation, format strings (`@csv`), `?//`, `import` and `input`.
 
 In the Formatted view, the filter button shows only the matching lines.
 
@@ -140,7 +142,7 @@ Both commands are in the right-click menu and the Command Palette for JSON and J
 
 ## Limits
 
-- Files above 50 MB can be edited record by record when they are UTF-8 JSON Lines; other large and compressed files are read-only (see "Large and compressed files").
+- Files above 50 MB and compressed files can be edited record by record when they are JSON Lines on this computer (see "Large and compressed files").
 - A limit that hides data (300 grid columns, 10 lines in one graph, 2 000 selected lines) is named in the status bar when it applies.
 - `.json` files with comments or trailing commas are parsed as JSON with Comments.
 - A `.json` file with one JSON value per line is shown as JSON Lines.

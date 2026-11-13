@@ -4,7 +4,14 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { compactText, minifyJson, prettyJson, splitJsonValues } from '../../src/shared/jsonText';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as zlib from 'node:zlib';
+import { EncodeError, encodeText } from '../../src/encoding';
+import { compare, fileState, LineConflict, replaceLine } from '../../src/fileEdit';
 import { locatePath, valueSpan } from '../../src/locate';
+import { indexItems, ItemStore } from '../../src/webview/items';
 import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
 import { diffValues } from '../../src/webview/diff';
 import { csvField, csvRow } from '../../src/webview/exporter';
@@ -443,8 +450,8 @@ test('jq: errors, the ? operator, and record matching', () => {
   assert.throws(() => compileJq('.store.book[0].title.x').run(DOC), /cannot index string/);
   assert.deepEqual(jq('[.store.book[].title.x?]'), ['[]']);
   assert.throws(() => compileJq('.a |'), /ends too soon/);
-  assert.throws(() => compileJq('.a as $x | $x'), /not supported/);
-  assert.throws(() => compileJq('.a |= 1'), /assignment/);
+  assert.throws(() => compileJq('$x'), /\$x is not defined/);
+  assert.throws(() => compileJq('import "a" as a; .'), /not supported/);
   assert.throws(() => compileJq('nosuch(1)'), /unknown function nosuch\/1/);
   const p = compileJq('.level == "warn" and .ms > 100');
   assert.deepEqual([p.matches({ level: 'warn', ms: 200 }), p.matches({ level: 'warn', ms: 50 }), p.matches('text')], [true, false, false]);
@@ -555,4 +562,143 @@ test('DocModel.fromValue: one JSON value parsed from bytes', () => {
   const m = DocModel.fromValue({ rows: [1, 2] }, 1234);
   assert.deepEqual([m.isJsonl, m.count, m.valid, m.blank, m.bytes, m.complete], [false, 1, 1, 0, 1234, true]);
   assert.deepEqual(m.value(0), { rows: [1, 2] });
+});
+
+test('jq: variables, destructuring, def, reduce, foreach, assignment, try/catch, label/break', () => {
+  const one = (src: string, doc: JVal = DOC) => jq(src, doc);
+  // Variables and patterns.
+  assert.deepEqual(one('.store.bicycle.price as $p | .store.book[] | select(.price * 40 > $p) | .title'), ['"Sword of Honour"', '"The Lord of the Rings"']);
+  assert.deepEqual(one('[1, [2, 3]] as [$a, [$b, $c]] | $a + $b + $c'), ['6']);
+  assert.deepEqual(one('{"a": 1, "b": {"c": 2}} as {a: $x, $b, b: {c: $y}} | [$x, $b, $y]'), ['[1,{"c":2},2]']);
+  assert.deepEqual(one('1 as $x | {$x, y: 2}'), ['{"x":1,"y":2}']);
+  assert.deepEqual(one('$ENV | type'), ['"object"']);
+  // def: filter and $value parameters, recursion, closures over the caller's scope.
+  assert.deepEqual(one('def inc(f): f + 1; [.store.book[].price | inc(.)] | length'), ['4']);
+  assert.deepEqual(one('def fac: if . <= 1 then 1 else . * (. - 1 | fac) end; 5 | fac'), ['120']);
+  assert.deepEqual(one('def add2($a; $b): $a + $b; add2(1; 2, 3)'), ['3', '4']);
+  assert.deepEqual(one('10 as $k | def addk(f): f + $k; 1 | addk(.)'), ['11']);
+  assert.deepEqual(one('def f: def g: 3; g * 2; f'), ['6']);
+  // reduce and foreach.
+  assert.deepEqual(one('reduce .store.book[] as $b (0; . + $b.price)'), ['53.92']);
+  assert.deepEqual(one('reduce range(5) as $i ([]; . + [$i * $i])'), ['[0,1,4,9,16]']);
+  assert.deepEqual(one('[foreach (1, 2, 3) as $x (0; . + $x)]'), ['[1,3,6]']);
+  assert.deepEqual(one('[foreach (1, 2, 3) as $x (0; . + $x; [$x, .])]'), ['[[1,1],[2,3],[3,6]]']);
+  // Assignment (the value is changed in a copy; the document stays as it is).
+  assert.deepEqual(one('.a.b = 1', {}), ['{"a":{"b":1}}']);
+  assert.deepEqual(one('.store.book[].price |= . * 2 | [.store.book[].price]'), ['[17.9,25.98,17.98,45.98]']);
+  assert.deepEqual(one('.n += 1 | .n', { n: 1 }), ['2']);
+  assert.deepEqual(one('.xs[1] -= 10 | .xs', { xs: [1, 20] }), ['[1,10]']);
+  assert.deepEqual(one('.a //= "d" | .b //= "d"', { a: 'x', b: null }), ['{"a":"x","b":"d"}']);
+  assert.deepEqual(one('.a = (1, 2) | .a', {}), ['1', '2']);
+  assert.deepEqual(one('.xs[] |= empty', { xs: [1, 2, 3] }), ['{"xs":[2]}'], 'jq 1.7: an empty update deletes (indexes move)');
+  assert.deepEqual(one('del(.a, .c) | keys', { a: 1, b: 2, c: 3 }), ['["b"]']);
+  assert.deepEqual(one('to_entries | map(.value += 1) | from_entries', { a: 1 }), ['{"a":2}']);
+  assert.deepEqual(one('with_entries(.key |= ascii_upcase)', { a: 1 }), ['{"A":1}']);
+  assert.deepEqual(one('setpath(["a", 0]; 7)', null), ['{"a":[7]}']);
+  assert.deepEqual(one('getpath(["store", "bicycle", "color"])'), ['"red"']);
+  assert.deepEqual(one('[paths(type == "number")] | length'), ['9']);
+  assert.throws(() => compileJq('(1 + 1) = 3').run({}), /invalid path expression/);
+  assert.equal(compileJq('.["__proto__"] = 1').run({}).outs[0].v && Object.getPrototypeOf(compileJq('.["__proto__"] = 1').run({}).outs[0].v), Object.prototype);
+  // try/catch and error values.
+  assert.deepEqual(one('try error("bad") catch .'), ['"bad"']);
+  assert.deepEqual(one('try error({"code": 7}) catch .code'), ['7']);
+  assert.deepEqual(one('[.[] | try (if . > 1 then error("x") else . end)]', [1, 2, 3]), ['[1]']);
+  assert.deepEqual(one('try (1 / 0) catch "div"'), ['"div"']);
+  // label and break keep the outputs made before the break.
+  assert.deepEqual(one('[label $out | 1, 2, break $out, 3]'), ['[1,2]']);
+  assert.deepEqual(one('[label $f | range(10) | ., (select(. == 2) | break $f)]'), ['[0,1,2]']);
+  assert.throws(() => compileJq('break $nope'), /label/);
+  // Matching records still works with all of it.
+  assert.equal(compileJq('def big: .ms > 100; select(big)').matches({ ms: 200 }), true);
+  assert.equal(compileJq('reduce .tags[] as $t (false; . or ($t == "db"))').matches({ tags: ['x', 'db'] }), true);
+});
+
+test('encodeText: UTF-8, UTF-16, single-byte and two-byte encodings; a character with no bytes is refused', () => {
+  const back = (b: Buffer, label: string) => new TextDecoder(label).decode(b);
+  for (const [label, text] of [
+    ['utf-8', '{"名":"ünï 😀"}'],
+    ['utf-16le', '{"n":"ünï 😀"}'],
+    ['utf-16be', '{"n":"ünï"}'],
+    ['windows-1252', '{"city":"Montréal €"}'],
+    ['gbk', '{"名字":"测试"}'],
+    ['shift_jis', '{"名前":"テスト"}'],
+    ['big5', '{"名字":"測試"}'],
+    ['euc-kr', '{"이름":"테스트"}'],
+  ] as const) {
+    assert.equal(back(encodeText(text, label), label), text, label);
+  }
+  assert.deepEqual([...encodeText('é', 'windows-1252')], [0xe9]);
+  assert.throws(() => encodeText('名', 'windows-1252'), EncodeError);
+  assert.throws(() => encodeText('😀', 'gbk'), EncodeError);
+});
+
+test('replaceLine: plain and gzip files, UTF-8 / UTF-16 / GBK, byte order marks, CR LF, the last line', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bj-unit-'));
+  try {
+    const cases: { name: string; bytes: Buffer; gzip: boolean; encoding: string; read: (b: Buffer) => string }[] = [
+      { name: 'a.jsonl', bytes: Buffer.from('﻿{"a":1}\r\n{"b":"名"}\r\n{"c":3}', 'utf8'), gzip: false, encoding: 'utf-8', read: (b) => b.toString('utf8') },
+      { name: 'b.jsonl', bytes: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"a":1}\n{"b":"名"}\n{"c":3}\n', 'utf16le')]), gzip: false, encoding: 'utf-8', read: (b) => new TextDecoder('utf-16le').decode(b) },
+      { name: 'c.jsonl', bytes: encodeText('{"a":1}\n{"b":"名"}\n{"c":3}\n', 'gbk'), gzip: false, encoding: 'gbk', read: (b) => new TextDecoder('gbk').decode(b) },
+      { name: 'd.jsonl.gz', bytes: zlib.gzipSync(Buffer.from('{"a":1}\n{"b":"名"}\n{"c":3}\n')), gzip: true, encoding: 'utf-8', read: (b) => zlib.gunzipSync(b).toString('utf8') },
+      { name: 'e.jsonl.gz', bytes: zlib.gzipSync(Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from('{"a":1}\r\n{"b":"名"}\r\n{"c":3}', 'utf16le').swap16()])), gzip: true, encoding: 'utf-8', read: (b) => new TextDecoder('utf-16be').decode(zlib.gunzipSync(b)) },
+    ];
+    for (const c of cases) {
+      const file = path.join(dir, c.name);
+      fs.writeFileSync(file, c.bytes);
+      const before = c.read(fs.readFileSync(file));
+      await replaceLine(file, 1, '{"b":"名"}', '{"b":"新的"}', { gzip: c.gzip, encoding: c.encoding });
+      assert.equal(c.read(fs.readFileSync(file)), before.replace('{"b":"名"}', '{"b":"新的"}'), c.name);
+      await replaceLine(file, 2, '{"c":3}', '{"c":4}', { gzip: c.gzip, encoding: c.encoding });
+      await replaceLine(file, 0, '{"a":1}', '{"a":0}', { gzip: c.gzip, encoding: c.encoding });
+      assert.equal(c.read(fs.readFileSync(file)), before.replace('{"b":"名"}', '{"b":"新的"}').replace('{"c":3}', '{"c":4}').replace('{"a":1}', '{"a":0}'), `${c.name}: first and last lines, line ends and byte order mark kept`);
+      const now = fs.readFileSync(file);
+      await assert.rejects(replaceLine(file, 1, '{"b":"old"}', '{}', { gzip: c.gzip, encoding: c.encoding }), LineConflict);
+      await assert.rejects(replaceLine(file, 9, '', '{}', { gzip: c.gzip, encoding: c.encoding }), LineConflict);
+      assert.ok(fs.readFileSync(file).equals(now), `${c.name}: a refused edit changes nothing`);
+    }
+    await assert.rejects(replaceLine(path.join(dir, 'c.jsonl'), 0, '{"a":0}', '{"a":"😀"}', { gzip: false, encoding: 'gbk' }), EncodeError);
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], 'no temporary files are left');
+    // A file that only grew, and one that changed.
+    const log = path.join(dir, 'log.jsonl');
+    fs.writeFileSync(log, '{"a":1}\n');
+    const st = await fileState(log);
+    fs.appendFileSync(log, '{"a":2}\n');
+    assert.equal(await compare(log, st), 'grew');
+    fs.writeFileSync(log, '{"x":1}\n{"a":2}\n');
+    assert.equal(await compare(log, st), 'changed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('indexItems: the items of a huge array are records, for any cuts between pieces', () => {
+  const r = rng(31);
+  for (let i = 0; i < 300; i++) {
+    const items = Array.from({ length: Math.floor(r() * 12) }, () => randomJson(r));
+    const pretty = r() < 0.5;
+    const text = `${r() < 0.3 ? '﻿' : ''}${pretty ? '[\n  ' : '['}${items.join(pretty ? ',\n  ' : ',')}${pretty ? '\n]\n' : ']'}`;
+    const store = storeOf(text, r, 1 + Math.floor(r() * 50));
+    const idx = indexItems(store);
+    assert.ok(idx, text);
+    const s = new ItemStore(store, idx);
+    assert.equal(s.count, items.length);
+    for (let k = 0; k < items.length; k++) {
+      assert.deepEqual(parseJson(s.text(k)), parseJson(items[k]), `item ${k} of ${JSON.stringify(text)}`);
+      assert.equal(s.text(k).includes('\n'), false, 'one line per record');
+    }
+    if (pretty) for (let k = 0; k < items.length; k++) assert.ok(s.fileLine(k) >= k + 1, 'items start on their own lines');
+  }
+  // An object that is mostly one array: that array's items.
+  const big = JSON.stringify({ meta: { n: 3 }, data: [{ a: 1 }, { a: 2 }, { a: '3,]}' }, { long: 'x'.repeat(100) }], tail: 1 });
+  const idx = indexItems(storeOf(big, r, 5)) as NonNullable<ReturnType<typeof indexItems>>;
+  assert.deepEqual([idx.path, idx.count], [['data'], 4]);
+  assert.equal(new ItemStore(storeOf(big, r, 5), idx).text(2), '{"a":"3,]}"}');
+  // Other shapes are parsed as one value.
+  assert.equal(indexItems(storeOf('{"a": 1, "b": [1]}', r, 3)), undefined, 'the array is not most of the bytes');
+  assert.equal(indexItems(storeOf('"just a string"', r, 3)), undefined);
+  assert.equal(indexItems(storeOf('[1, 2', r, 3)), undefined, 'an array without its end');
+  // The model on top: records read when needed.
+  const m = new DocModel(new ItemStore(storeOf('[{"x":1},\n{"x":2,"y":[1]},\n"z"]', r, 4), indexItems(storeOf('[{"x":1},\n{"x":2,"y":[1]},\n"z"]', r, 4)) as NonNullable<ReturnType<typeof indexItems>>), true);
+  m.parseSome(1000);
+  assert.deepEqual([m.count, m.valid, m.columns, m.hasNonObject, m.items?.count, m.fileLine(2)], [3, 3, ['x', 'y'], true, 3, 2]);
 });

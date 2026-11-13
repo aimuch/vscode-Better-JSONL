@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **jq**: variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `def` with filter and `$value` parameters (and recursion), `reduce`, `foreach`, `try … catch`, `label` / `break`, and assignment (`=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`), plus `del`, `getpath`, `setpath`, `delpaths`, `with_entries`, `paths(f)` and `leaf_paths`.
+- **Compressed files and other encodings can be edited** record by record: the line is written in the file's encoding (UTF-16, gbk, shift_jis, windows-1252, …) and a compressed file is compressed again.
+- **Follow mode for compressed files**: the file is decompressed again and only the new part is added to the view.
+- **One JSON value above about 512 MB**: an array (or an object that is mostly one array) is read item by item; its items are records, and only their byte ranges stay in memory. 600 MB with 4.4 million items opens in about 9 seconds with about 1 GB of memory.
+- **Expand all** on a file over 50 MB asks first (it parses every line), instead of being off.
+
 ## 0.5.0
 
 - **jq and JSONPath** in the search box: a search that starts with `.` is a jq filter, one that starts with `$` is a JSONPath (RFC 9535). On JSON Lines they select records; in one JSON document `Enter` goes to each result, and a computed result shows in the status bar.

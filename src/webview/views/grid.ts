@@ -824,7 +824,7 @@ export class GridView implements View {
     if (cellEl && col && this.startEdit(id, col, cellEl)) return;
     const rel = col && col !== NUM ? this.cellPath(id, col) : '';
     const path = this.recordPath(id, rel);
-    this.app.post({ type: 'reveal', line: this.app.model.isJsonl ? id : 0, path });
+    this.app.reveal(id, path);
   }
 
   // ---------- cell editing ----------
