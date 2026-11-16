@@ -189,6 +189,11 @@ export class GraphView implements View {
     r.matches = this.app.model.isJsonl ? r.matches : this.matchNodes.length;
   }
 
+  /** Number of matches in the current single-JSON graph, and the 0-based active match index. */
+  matchProgress(): { count: number; index: number } {
+    return { count: this.matchNodes.length, index: this.matchIdx };
+  }
+
   // ---------- build ----------
 
   private sources(): Source[] {
@@ -360,13 +365,27 @@ export class GraphView implements View {
   }
 
   private markSearch(): void {
-    const q = isTextQuery(this.app.query) ? this.app.query.text : '';
+    const app = this.app;
+    const q = isTextQuery(app.query) ? app.query.text : '';
+    const treeHits = !app.model.isJsonl && app.query.program ? new Set(app.treeMatches) : null;
     this.matchNodes = [];
     for (const n of this.nodes) {
       n.hit = false;
-      if (!q) continue;
-      if (n.title.toLowerCase().includes(q)) n.hit = true;
-      for (const r of n.rows) if (`${r.label} ${r.text}`.toLowerCase().includes(q)) n.hit = true;
+      if (treeHits) {
+        const nodePath = n.path.reduce<string>((acc, seg) => childKey(acc, seg), '');
+        if (treeHits.has(nodePath)) n.hit = true;
+        else {
+          for (const r of n.rows) {
+            if (!r.note && r.label && treeHits.has(childKey(nodePath, r.isIdx ? Number(r.label) : r.label))) {
+              n.hit = true;
+              break;
+            }
+          }
+        }
+      } else if (q) {
+        if (n.title.toLowerCase().includes(q)) n.hit = true;
+        for (const r of n.rows) if (`${r.label} ${r.text}`.toLowerCase().includes(q)) n.hit = true;
+      }
       if (n.hit) this.matchNodes.push(n);
     }
     this.matchIdx = -1;
@@ -707,22 +726,30 @@ export class GraphView implements View {
     const w = Math.ceil(b.w + pad * 2);
     const h = Math.ceil(b.h + pad * 2);
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="${b.x - pad} ${b.y - pad} ${w} ${h}"><style>${style}</style><rect x="${b.x - pad}" y="${b.y - pad}" width="${w}" height="${h}" fill="${bg}"/>${body}</svg>`;
-    const name = this.app.model.isJsonl ? `${this.app.doc.fileName.replace(/\.[^.]+$/, '')}-line${this.app.state.active + 1}` : this.app.doc.fileName.replace(/\.[^.]+$/, '');
+    const stem = this.app.doc.fileName.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '');
+    const name = this.app.model.isJsonl ? `${stem}-line${this.app.state.active + 1}` : stem;
     if (format === 'svg') {
       this.app.post({ type: 'export', format, data: svg, name });
       return;
     }
-    const scale = Math.min(2, 16000 / Math.max(w, h));
+    const maxArea = 67_108_864;
+    const scale = Math.min(2, 16000 / Math.max(1, w, h), Math.sqrt(maxArea / Math.max(1, w * h)));
     const img = new Image();
+    img.onerror = () => this.app.showBanner(t('The export failed: {0}', 'SVG image failed to load'));
     img.onload = () => {
       const c = document.createElement('canvas');
-      c.width = Math.ceil(w * scale);
-      c.height = Math.ceil(h * scale);
+      c.width = Math.max(1, Math.ceil(w * scale));
+      c.height = Math.max(1, Math.ceil(h * scale));
       const ctx = c.getContext('2d');
       if (!ctx) return;
       ctx.scale(scale, scale);
       ctx.drawImage(img, 0, 0);
-      this.app.post({ type: 'export', format, data: c.toDataURL('image/png'), name });
+      const url = c.toDataURL('image/png');
+      if (!url.startsWith('data:image/png;base64,')) {
+        this.app.showBanner(t('The export failed: {0}', 'the graph image is too large'));
+        return;
+      }
+      this.app.post({ type: 'export', format, data: url, name });
     };
     img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }

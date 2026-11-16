@@ -2,7 +2,7 @@
   "name": "better-jsonl",
   "displayName": "Better JSONL",
   "description": "%description%",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "andy",
   "license": "MIT",
   "repository": {
@@ -158,22 +158,22 @@
       "editor/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .jsonlines",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
           "group": "0_betterJsonl@1"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .jsonlines",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
           "group": "0_betterJsonl@2"
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson",
+          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@3"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson",
+          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@4"
         }
       ],
@@ -196,11 +196,11 @@
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson"
+          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonlines || resourceExtname == .ndjson"
+          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         }
       ]
     },
@@ -209,12 +209,12 @@
         "command": "betterJsonl.openPreviewToSide",
         "key": "ctrl+k j",
         "mac": "cmd+k j",
-        "when": "editorTextFocus && editorLangId == json || editorTextFocus && editorLangId == jsonc || editorTextFocus && editorLangId == jsonl || editorTextFocus && resourceExtname == .jsonlines"
+        "when": "editorTextFocus && editorLangId == json || editorTextFocus && editorLangId == jsonc || editorTextFocus && editorLangId == jsonl || editorTextFocus && resourceExtname == .jsonl || editorTextFocus && resourceExtname == .ndjson || editorTextFocus && resourceExtname == .jsonlines"
       },
       {
         "command": "betterJsonl.toggleWordWrap",
         "key": "alt+z",
-        "when": "activeWebviewPanelId == 'betterJsonl.preview' || activeCustomEditorId == 'betterJsonl.viewer'"
+        "when": "activeWebviewPanelId == 'betterJsonl.preview' || activeCustomEditorId == 'betterJsonl.viewer' || activeCustomEditorId == 'betterJsonl.compressed'"
       }
     ],
     "configuration": {

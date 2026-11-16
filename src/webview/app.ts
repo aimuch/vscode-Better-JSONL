@@ -194,6 +194,7 @@ export class App {
   private banner!: HTMLElement;
   private views!: Record<ViewKind, View>;
   private stopScan: (() => void) | undefined;
+  private stopExpand: (() => void) | undefined;
   private reportTimer: ReturnType<typeof setTimeout> | undefined;
   private searchTimer: ReturnType<typeof setTimeout> | undefined;
   private editRecord = -1;
@@ -289,7 +290,7 @@ export class App {
       case 'update':
         if (!this.model || !this.views || this.doc.large) break;
         this.chars = m.text.length;
-        this.swap(new DocModel(m.text, this.doc.isJsonl, m.bytes), m.version);
+        this.swap(new DocModel(m.text, this.doc.isJsonl, m.bytes, false, this.model.detectedJsonl), m.version);
         break;
       case 'edit':
         this.applyEdit(m.base, m.version, m.changes, m.eol, m.lineCount, m.chars);
@@ -321,8 +322,11 @@ export class App {
       case 'toggleExpandMode':
         if (this.views) this.setExpandMode(this.state.expandMode === 'focus' ? 'all' : 'focus');
         break;
+      case 'exportRows':
+        if (this.views && this.model) this.exportRows(m.which, m.format);
+        break;
       case 'editResult':
-        this.onEditResult(m.ok, m.message, m.line, m.text);
+        this.onEditResult(m.ok, m.message, m.line, m.text, m.cell);
         break;
       case 'notice':
         // While a large file loads there is no banner yet: the message takes the place of the progress text.
@@ -489,7 +493,7 @@ export class App {
    */
   private applyEdit(base: number, version: number, changes: TextChange[], eol: number, lineCount: number, chars: number): void {
     const old = this.model;
-    const lines = old && this.views && this.doc.isJsonl && base === this.version ? old.editorLines() : undefined;
+    const lines = old && this.views && old.isJsonl && base === this.version ? old.editorLines() : undefined;
     const grown = lines && patchLines(lines, changes, eol);
     if (!lines || !grown || lines.length !== lineCount || this.chars + grown.chars !== chars) {
       this.post({ type: 'resync' });
@@ -497,7 +501,9 @@ export class App {
     }
     this.chars = chars;
     const endsWithEol = dropLastEmpty(lines);
-    this.swap(new DocModel(lines, true, old.bytes + grown.bytes, endsWithEol), version);
+    const next = new DocModel(lines, true, old.bytes + grown.bytes, endsWithEol);
+    next.detectedJsonl = old.detectedJsonl;
+    this.swap(next, version);
   }
 
   /** The document changed: `model` takes the place of the one on screen. */
@@ -591,6 +597,12 @@ export class App {
   private stopJobs(): void {
     this.stopScan?.();
     this.stopSearch?.();
+    this.stopExpand?.();
+    this.stopExpand = undefined;
+    if (this.exporting) {
+      this.post({ type: 'exportData', id: this.exporting.id, data: '', done: false, cancel: true });
+      this.exporting = undefined;
+    }
     // A save that is still waiting belongs to the document before this one.
     clearTimeout(this.persistTimer);
     this.searching = false;
@@ -670,6 +682,10 @@ export class App {
 
   setExpandMode(m: ExpandMode): void {
     if (this.state.expandMode === m) return;
+    if (m === 'focus') {
+      this.stopExpand?.();
+      this.stopExpand = undefined;
+    }
     if (m === 'all' && !this.model.keepsAll && !this.bigExpandOK) {
       // Every record is parsed and measured, and the row heights of all of them are kept.
       this.showBanner(t('This file is {0}. Expand all parses every line: it can take a while and use a lot of memory.', formatBytes(this.model.bytes)), undefined, [
@@ -678,13 +694,17 @@ export class App {
           run: () => {
             this.bigExpandOK = true;
             this.showBanner(t('Expanding all lines…'));
-            // Let the text paint before the long layout.
-            defer(() => {
-              if (!this.model.keepsAll && this.bigExpandOK) {
-                this.setExpandMode('all');
-                this.banner.hidden = true;
-              }
-            }, 30);
+            this.stopExpand?.();
+            this.stopExpand = (this.views.formatted as FormattedView).prepareExpandAll(
+              (pct) => this.showBanner(t('Expanding all lines… {0}%', pct)),
+              () => {
+                this.stopExpand = undefined;
+                if (!this.model.keepsAll && this.bigExpandOK) {
+                  this.setExpandMode('all');
+                  this.banner.hidden = true;
+                }
+              },
+            );
           },
         },
         { label: t('Cancel'), run: () => undefined },
@@ -744,7 +764,7 @@ export class App {
 
   openEditor(r: number): void {
     if (this.readOnly) {
-      this.showBanner(t('This file is read-only here: it is too large for VS Code to edit through an extension.'));
+      this.showBanner(this.model.items ? t('This file is read-only here: open it as text to edit it.') : t('This file is read-only here: it is not on this computer.'));
       return;
     }
     if (!this.model.isJsonl) {
@@ -782,10 +802,10 @@ export class App {
       return;
     }
     err.textContent = t('Saving…');
-    this.post({ type: 'editLine', line: this.editRecord, original: this.editOriginal, text: ta.value });
+    this.post({ type: 'editLine', line: this.editRecord, original: this.editOriginal, text: ta.value, cell: false });
   }
 
-  private onEditResult(ok: boolean, message?: string, line?: number, text?: string): void {
+  private onEditResult(ok: boolean, message?: string, line?: number, text?: string, cell?: boolean): void {
     // A large file: the host wrote the line on disk; the view shows it at once.
     if (ok && line !== undefined && text !== undefined && this.model?.large && line < this.model.count) {
       this.model.replaceLine(line, text);
@@ -795,7 +815,8 @@ export class App {
       this.paintChrome();
       this.stateChanged();
     }
-    if (this.cellPending) {
+    const isCell = cell !== undefined ? cell : this.cellPending;
+    if (isCell) {
       this.cellPending = false;
       if (!ok) this.showBanner(message ?? t('The edit failed.'));
       return;
@@ -821,7 +842,7 @@ export class App {
     const m = this.model;
     this.cellPending = true;
     if (!m.isJsonl) {
-      this.post({ type: 'editValue', path, version: this.version, text: json });
+      this.post({ type: 'editValue', path, version: this.version, text: json, cell: true });
       return;
     }
     const line = m.line(record);
@@ -832,7 +853,7 @@ export class App {
       return;
     }
     const text = line.slice(0, span.offset) + json + line.slice(span.offset + span.length);
-    this.post({ type: 'editLine', line: record, original: line, text, exact: true });
+    this.post({ type: 'editLine', line: record, original: line, text, exact: true, cell: true });
   }
 
   // ---------- follow ----------
@@ -1441,10 +1462,13 @@ export class App {
     const kind = this.query.program ? `${this.query.program.kind === 'jq' ? 'jq' : 'JSONPath'} · ` : '';
     if (!this.query.text) count.textContent = '';
     else if (!m.isJsonl) {
-      // One JSON document: the Formatted view steps through the matches in the value.
-      if (this.state.view !== 'formatted' || this.query.path) count.textContent = '';
+      // One JSON document: the Formatted and Graph views step through the matches.
+      if (this.query.path || this.state.view === 'grid') count.textContent = '';
       else if (this.searching) count.textContent = t('Searching…');
-      else count.textContent = `${kind}${this.treeIndex >= 0 ? this.treeIndex + 1 : '–'} / ${this.treeMatches.length.toLocaleString()}${this.treeCapped ? '+' : ''}`;
+      else if (this.state.view === 'graph') {
+        const gp = (this.views.graph as GraphView).matchProgress();
+        count.textContent = `${kind}${gp.index >= 0 ? gp.index + 1 : '–'} / ${gp.count.toLocaleString()}`;
+      } else count.textContent = `${kind}${this.treeIndex >= 0 ? this.treeIndex + 1 : '–'} / ${this.treeMatches.length.toLocaleString()}${this.treeCapped ? '+' : ''}`;
     } else if (this.searching) count.textContent = kind + t('searching {0}%', this.searchPct);
     else {
       const ri = this.matchSet.has(this.state.active) ? lowerBound(this.matches, this.state.active) : -1;
@@ -1536,8 +1560,13 @@ export class App {
       const recs = this.state.filterOnly && this.query.text ? this.matches : null;
       let r: number;
       if (recs) {
-        const i = recs.indexOf(this.state.active);
-        r = recs[Math.min(recs.length - 1, Math.max(0, (i < 0 ? 0 : i + d)))];
+        if (!recs.length) return;
+        const lb = lowerBound(recs, this.state.active);
+        if (lb < recs.length && recs[lb] === this.state.active) {
+          r = recs[Math.min(recs.length - 1, Math.max(0, lb + d))];
+        } else {
+          r = recs[d > 0 ? Math.min(recs.length - 1, lb) : Math.max(0, lb - 1)];
+        }
       } else r = Math.min(this.model.count - 1, Math.max(0, this.state.active + d));
       if (r === undefined) return;
       this.selectRecord(r, e.shiftKey ? 'range' : 'set');

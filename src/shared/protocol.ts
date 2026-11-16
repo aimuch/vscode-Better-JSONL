@@ -70,7 +70,7 @@ export interface DocInfo {
    * and sends it as "chunk" messages (UTF-8 bytes). `bytes` is the file size.
    */
   large?: { bytes: number; gzip?: boolean };
-  /** The view cannot write to the file (compressed files, files that are not UTF-8). */
+  /** The view cannot write to the file (for example a remote large or compressed file). */
   readOnly?: boolean;
 }
 
@@ -124,8 +124,9 @@ export type HostMessage =
   | { type: 'setView'; view: ViewKind }
   | { type: 'toggleExpandMode' }
   | { type: 'toggleWrap' }
+  | { type: 'exportRows'; which: 'rows' | 'selected'; format: 'jsonl' | 'csv' }
   /** `line` and `text`: a large file, where the view shows the written line itself. */
-  | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string }
+  | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string; cell?: boolean }
   /** jq module files, by "jq:path" or "json:path": their text, or null when there is none. */
   | { type: 'modules'; files: Record<string, string | null> }
   | { type: 'exportReady'; id: number; ok: boolean }
@@ -145,15 +146,15 @@ export type WebviewMessage =
   | { type: 'select'; line: number }
   | { type: 'reveal'; line: number; path: JsonPath }
   /** `exact`: write the text as it is (a cell edit); otherwise it is made compact. */
-  | { type: 'editLine'; line: number; original: string; text: string; exact?: boolean }
+  | { type: 'editLine'; line: number; original: string; text: string; exact?: boolean; cell?: boolean }
   /** One JSON document: replace the value at `path` with the JSON `text`. `version` is the version the view has. */
-  | { type: 'editValue'; path: JsonPath; version: number; text: string }
+  | { type: 'editValue'; path: JsonPath; version: number; text: string; cell?: boolean }
   /** Large files: follow the end of the file (new bytes are added to the view as they come). */
   | { type: 'follow'; on: boolean }
   | { type: 'loadAppended' }
   /** Export rows: the host asks where to save, then the view sends the text in pieces. */
   | { type: 'exportStart'; id: number; format: 'jsonl' | 'csv'; name: string; rows: number }
-  | { type: 'exportData'; id: number; data: string; done: boolean }
+  | { type: 'exportData'; id: number; data: string; done: boolean; cancel?: boolean }
   /** Open two records side by side in the VS Code diff editor. */
   | { type: 'diff'; left: { title: string; text: string }; right: { title: string; text: string } }
   | { type: 'copy'; text: string }

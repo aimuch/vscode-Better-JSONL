@@ -68,11 +68,24 @@ function layoutOf(head: Buffer, configured: string): Layout {
   return { label: bom ? 'utf-8' : configured, unit: 1, bom, lf: Buffer.from([10]), cr: Buffer.from([13]) };
 }
 
-/** The offset of the next line end in `buf` from `from` (aligned to the unit), or -1. */
-function nextLineEnd(buf: Buffer, from: number, l: Layout): number {
-  if (l.unit === 1) return buf.indexOf(10, from);
-  for (let i = from; i + 1 < buf.length; i += 2) if (buf[i] === l.lf[0] && buf[i + 1] === l.lf[1]) return i;
-  return -1;
+/** The next line break (LF, CR LF, or a standalone CR) in `buf` from `from` (aligned to `l.unit`), or null. */
+function nextLineBreak(buf: Buffer, from: number, l: Layout): { at: number; len: number } | null {
+  if (l.unit === 1) {
+    for (let i = from; i < buf.length; i++) {
+      const b = buf[i];
+      if (b === 10) return { at: i, len: 1 };
+      if (b === 13) return { at: i, len: i + 1 < buf.length && buf[i + 1] === 10 ? 2 : 1 };
+    }
+    return null;
+  }
+  for (let i = from; i + 1 < buf.length; i += 2) {
+    if (buf[i] === l.lf[0] && buf[i + 1] === l.lf[1]) return { at: i, len: 2 };
+    if (buf[i] === l.cr[0] && buf[i + 1] === l.cr[1]) {
+      const crlf = i + 3 < buf.length && buf[i + 2] === l.lf[0] && buf[i + 3] === l.lf[1];
+      return { at: i, len: crlf ? 4 : 2 };
+    }
+  }
+  return null;
 }
 
 async function write(stream: NodeJS.WritableStream, data: Uint8Array, seen?: (d: Uint8Array) => void): Promise<void> {
@@ -81,13 +94,6 @@ async function write(stream: NodeJS.WritableStream, data: Uint8Array, seen?: (d:
   if (!stream.write(data)) await new Promise<void>((resolve) => stream.once('drain', resolve));
 }
 
-/**
- * Replaces line `line` (0-based) of a file: plain or gzip-compressed, in its encoding
- * (`encoding`, or the one a UTF-16 byte order mark says). The line must still read
- * `original`; its line end (LF or CR LF) stays. The file is written to a new file next to it
- * (compressed again for a .gz file), which then takes its place: a failure leaves the file
- * as it was.
- */
 /** What replaceLine wrote (before compression): its size, its last bytes, and how its text is encoded. */
 export interface Written {
   total: number;
@@ -98,6 +104,13 @@ export interface Written {
 
 const WRITTEN_TAIL = 16 * 1024;
 
+/**
+ * Replaces line `line` (0-based) of a file: plain or gzip-compressed, in its encoding
+ * (`encoding`, or the one a UTF-16/UTF-8 byte order mark says). The line must still read
+ * `original`; its line end (LF, CR LF, or CR) stays. Symbolic links are resolved first so the
+ * target file is updated rather than replacing the link. The file is written to a temporary
+ * file next to the target and renamed into place: a failure leaves the file as it was.
+ */
 export async function replaceLine(
   fsPath: string,
   line: number,
@@ -105,9 +118,10 @@ export async function replaceLine(
   text: string,
   opts: { gzip: boolean; encoding: string },
 ): Promise<FileState & { written: Written }> {
-  const mode = (await fs.promises.stat(fsPath)).mode & 0o777;
-  const tmp = path.join(path.dirname(fsPath), `.${path.basename(fsPath)}.${randomBytes(4).toString('hex')}.tmp`);
-  const raw = fs.createReadStream(fsPath, { highWaterMark: 1024 * 1024 });
+  const realPath = await fs.promises.realpath(fsPath);
+  const mode = (await fs.promises.stat(realPath)).mode & 0o777;
+  const tmp = path.join(path.dirname(realPath), `.${path.basename(realPath)}.${randomBytes(4).toString('hex')}.tmp`);
+  const raw = fs.createReadStream(realPath, { highWaterMark: 1024 * 1024 });
   const source: Readable = opts.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 })) : raw;
   raw.on('error', (e) => source.destroy(e));
   const file = fs.createWriteStream(tmp, { mode });
@@ -133,7 +147,7 @@ export async function replaceLine(
     let target: Buffer[] | null = line === 0 ? [] : null;
     let done = false;
     let carry: Buffer = Buffer.alloc(0);
-    const finish = async (hasLf: boolean) => {
+    const finish = async (eolBytes: Buffer) => {
       const lay = l as Layout;
       let old = Buffer.concat(target as Buffer[]);
       let bom = Buffer.alloc(0);
@@ -141,12 +155,28 @@ export async function replaceLine(
         bom = old.subarray(0, lay.bom);
         old = old.subarray(lay.bom);
       }
-      const cr = old.length >= lay.unit && old.subarray(old.length - lay.unit).equals(lay.cr);
-      if (cr) old = old.subarray(0, old.length - lay.unit);
-      if (new TextDecoder(lay.label).decode(old) !== original) throw new LineConflict(`line ${line + 1} changed on disk`);
-      await write(sink, Buffer.concat([bom, encodeText(text, lay.label), cr ? lay.cr : Buffer.alloc(0), hasLf ? lay.lf : Buffer.alloc(0)]), seen);
+      if (new TextDecoder(lay.label, { ignoreBOM: true }).decode(old) !== original) throw new LineConflict(`line ${line + 1} changed on disk`);
+      await write(sink, Buffer.concat([bom, encodeText(text, lay.label), eolBytes]), seen);
       target = null;
       done = true;
+    };
+    const scanChunk = async (buf: Buffer) => {
+      const lay = l as Layout;
+      let at = 0;
+      while (!done) {
+        const brk = nextLineBreak(buf, at, lay);
+        const stop = brk ? brk.at : buf.length;
+        if (target) target.push(Buffer.from(buf.subarray(at, stop)));
+        else await write(sink, buf.subarray(at, stop), seen);
+        if (!brk) break;
+        const eolBytes = buf.subarray(brk.at, brk.at + brk.len);
+        if (target) await finish(eolBytes);
+        else await write(sink, eolBytes, seen);
+        at = brk.at + brk.len;
+        index++;
+        if (index === line) target = [];
+      }
+      if (done && at < buf.length) await write(sink, buf.subarray(at), seen);
     };
     for await (const piece of source as AsyncIterable<Buffer>) {
       if (done) {
@@ -161,35 +191,23 @@ export async function replaceLine(
         }
         l = layoutOf(buf, opts.encoding);
       }
-      // UTF-16: an odd last byte waits for the next piece.
-      const usable = l.unit === 2 ? buf.length - (buf.length % 2) : buf.length;
+      // UTF-16: an odd last byte waits for the next piece. A trailing CR also waits so CR LF is not split.
+      let usable = l.unit === 2 ? buf.length - (buf.length % 2) : buf.length;
+      if (usable >= l.unit && buf.subarray(usable - l.unit, usable).equals(l.cr)) usable -= l.unit;
       carry = Buffer.from(buf.subarray(usable));
       buf = buf.subarray(0, usable);
-      let at = 0;
-      while (!done) {
-        const end = nextLineEnd(buf, at, l);
-        const stop = end < 0 ? buf.length : end;
-        if (target) target.push(Buffer.from(buf.subarray(at, stop)));
-        else await write(sink, buf.subarray(at, stop), seen);
-        if (end < 0) break;
-        if (target) await finish(true);
-        else await write(sink, l.lf, seen);
-        at = end + l.unit;
-        index++;
-        if (index === line) target = [];
-      }
-      if (done && at < buf.length) await write(sink, buf.subarray(at), seen);
-    }
-    if (!done && carry.length) {
-      if (target) target.push(carry);
-      else await write(sink, carry, seen);
+      if (buf.length) await scanChunk(buf);
     }
     if (!l) l = layoutOf(carry, opts.encoding);
-    if (target) await finish(false);
+    if (carry.length) {
+      if (done) await write(sink, carry, seen);
+      else await scanChunk(carry);
+    }
+    if (target) await finish(Buffer.alloc(0));
     if (!done) throw new LineConflict(`line ${line + 1} is not in the file`);
     sink.end();
     await closed;
-    await fs.promises.rename(tmp, fsPath);
+    await fs.promises.rename(tmp, realPath);
   } catch (e) {
     raw.destroy();
     if (opts.gzip) {

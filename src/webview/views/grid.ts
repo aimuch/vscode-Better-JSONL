@@ -1,10 +1,30 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
 import { defer, type App, type ColFilter, type View } from '../app';
-import { childKey, decodeKey, entriesHead, esc, isArr, isContainer, isObj, kindOf, pathToString, plainText, primClass, RawNum, sizeOf, summary, type JObj, type JVal } from '../json';
+import {
+  childKey,
+  compareNumbers,
+  decodeKey,
+  entriesHead,
+  esc,
+  isArr,
+  isContainer,
+  isObj,
+  kindOf,
+  pathToString,
+  plainText,
+  primClass,
+  RawNum,
+  sizeOf,
+  summary,
+  type JObj,
+  type JVal,
+} from '../json';
 import { icon } from '../icons';
-import type { Parsed } from '../model';
+import { lowerBound, type Parsed } from '../model';
 
+/** Browsers cap element height near 33.5M px. Above this the scroll space is scaled. */
+const MAX_SCROLL_PX = 30_000_000;
 const MAX_COLUMNS = 300;
 const NESTED_ROWS = 200;
 const NESTED_COLS = 50;
@@ -77,12 +97,17 @@ export class GridView implements View {
   private mode: Mode = 'records';
   private cols: string[] = [];
   private rowIds: number[] = [];
+  private sorted = false;
+  private idToRow: Map<number, number> | null = null;
   private offsets = new Float64Array(1);
+  private ratio = 1;
   private readonly heights = new Map<number, number>();
   private readonly rowH: number;
   private dragging: { col: string; startX: number; startW: number } | null = null;
+  private dragRaf = 0;
   private jsonActive = -1;
   private modelRef: unknown;
+  private structCached = false;
   /** Rows after the search, before the column filters. */
   private baseIds: number[] = [];
   /** What baseIds and rowIds were computed from. They are computed again only when this changes. */
@@ -123,7 +148,10 @@ export class GridView implements View {
     this.bodyEl = this.el.querySelector('.gbody') as HTMLElement;
     this.rowsEl = this.el.querySelector('.grows') as HTMLElement;
     this.scroll.addEventListener('scroll', () => this.paint(), { passive: true });
-    this.resizes = new ResizeObserver(() => this.paint());
+    this.resizes = new ResizeObserver(() => {
+      if (this.ratio < 1) this.applyScrollHeight();
+      this.paint();
+    });
     this.resizes.observe(this.scroll);
     // Listeners outside this view go away with it (dispose).
     const signal = this.gone.signal;
@@ -184,6 +212,7 @@ export class GridView implements View {
 
   dispose(): void {
     clearTimeout(this.ftimer);
+    cancelAnimationFrame(this.dragRaf);
     this.colJob?.stop();
     this.resizes.disconnect();
     this.gone.abort();
@@ -294,15 +323,31 @@ export class GridView implements View {
     this.heights.clear();
   }
 
+  private rowIndexOf(id: number): number {
+    if (!this.rowIds.length) return -1;
+    if (!this.sorted) {
+      const i = lowerBound(this.rowIds, id);
+      return i < this.rowIds.length && this.rowIds[i] === id ? i : -1;
+    }
+    if (!this.idToRow) {
+      const map = new Map<number, number>();
+      for (let i = 0; i < this.rowIds.length; i++) map.set(this.rowIds[i], i);
+      this.idToRow = map;
+    }
+    return this.idToRow.get(id) ?? -1;
+  }
+
   onActiveChanged(scroll: boolean): void {
     if (this.el.hidden) return;
     if (scroll && this.app.model.isJsonl) {
-      const i = this.rowIds.indexOf(this.app.state.active);
+      const i = this.rowIndexOf(this.app.state.active);
       if (i >= 0) {
         const top = this.offsets[i];
-        const vh = this.scroll.clientHeight - this.rowH;
-        const st = this.scroll.scrollTop;
-        if (top < st || top + this.rowH > st + vh) this.scroll.scrollTop = Math.max(0, top - vh / 3);
+        const vh = (this.scroll.clientHeight || 600) - this.rowH;
+        const vt = this.scroll.scrollTop / this.ratio;
+        if (top < vt || top + this.rowH > vt + vh) {
+          this.scroll.scrollTop = this.toScrollTop(top - vh / 3);
+        }
       }
     }
     // The rows stay: only their marks change. (New rows would end a double-click that started on the old ones.)
@@ -324,7 +369,7 @@ export class GridView implements View {
   stepMatch(dir: 1 | -1): void {
     const app = this.app;
     if (!app.model.isJsonl || !this.rowIds.length) return;
-    const i = this.rowIds.indexOf(app.state.active);
+    const i = this.rowIndexOf(app.state.active);
     const next = this.rowIds[(i + dir + this.rowIds.length) % this.rowIds.length];
     app.selectRecord(next);
     this.onActiveChanged(true);
@@ -379,6 +424,7 @@ export class GridView implements View {
       this.modelRef = m;
       this.heights.clear();
       this.baseSig = '';
+      this.structCached = false;
     }
     const root = this.rootValue();
     const q = app.query.text;
@@ -392,9 +438,25 @@ export class GridView implements View {
       if (m.hasNonObject || !this.cols.length) this.cols.unshift(VALUE_COL);
     } else if (root !== undefined && isArr(root)) {
       this.mode = 'records';
+      if (!this.structCached) {
+        const keys = new Set<string>();
+        let nonObj = false;
+        for (const item of root) {
+          if (!isObj(item)) nonObj = true;
+          else if (keys.size <= MAX_COLUMNS) for (const k in item) keys.add(k);
+        }
+        this.arrayCols = [...keys].slice(0, MAX_COLUMNS).map(colId);
+        this.arrayColsCut = keys.size > MAX_COLUMNS;
+        if (nonObj || !this.arrayCols.length) this.arrayCols.push(VALUE_COL);
+        this.structCached = true;
+      }
     } else if (root !== undefined && isObj(root)) {
       this.mode = 'object';
       this.cols = [OKEY, OVAL];
+      if (!this.structCached) {
+        this.objKeys = Object.keys(root);
+        this.structCached = true;
+      }
     } else {
       this.mode = 'scalar';
       this.cols = [VALUE_COL];
@@ -415,22 +477,12 @@ export class GridView implements View {
           for (let i = 0; i < m.count; i++) if (!m.isBlank(i)) ids.push(i);
         }
       } else if (root !== undefined && isArr(root)) {
-        const keys = new Set<string>();
-        let nonObj = false;
-        for (const item of root) {
-          if (!isObj(item)) nonObj = true;
-          else if (keys.size <= MAX_COLUMNS) for (const k in item) keys.add(k);
-        }
-        this.arrayCols = [...keys].slice(0, MAX_COLUMNS).map(colId);
-        this.arrayColsCut = keys.size > MAX_COLUMNS;
-        if (nonObj || !this.arrayCols.length) this.arrayCols.push(VALUE_COL);
         for (let i = 0; i < root.length; i++) {
-          if (hits ? hits.has(i) : !q || JSON.stringify(root[i] instanceof RawNum ? (root[i] as RawNum).src : root[i]).toLowerCase().includes(q)) ids.push(i);
+          if (hits ? hits.has(i) : !q || compact(root[i]).toLowerCase().includes(q)) ids.push(i);
         }
       } else if (root !== undefined && isObj(root)) {
-        this.objKeys = Object.keys(root);
         for (let i = 0; i < this.objKeys.length; i++) {
-          if (hits ? hits.has(this.objKeys[i]) : !q || (this.objKeys[i] + ' ' + JSON.stringify(root[this.objKeys[i]])).toLowerCase().includes(q)) ids.push(i);
+          if (hits ? hits.has(this.objKeys[i]) : !q || (this.objKeys[i] + ' ' + compact(root[this.objKeys[i]])).toLowerCase().includes(q)) ids.push(i);
         }
       } else if (root !== undefined) ids.push(0);
       this.baseIds = ids;
@@ -482,6 +534,8 @@ export class GridView implements View {
         ids = order.map((k) => ids[k]);
       }
       this.rowIds = ids;
+      this.sorted = !!sort;
+      this.idToRow = null;
     }
     this.computeOffsets();
     this.paintHead();
@@ -492,7 +546,25 @@ export class GridView implements View {
     const off = new Float64Array(n + 1);
     for (let i = 0; i < n; i++) off[i + 1] = off[i] + (this.heights.get(this.rowIds[i]) ?? this.rowH);
     this.offsets = off;
-    this.bodyEl.style.height = `${off[n]}px`;
+    this.applyScrollHeight();
+  }
+
+  private applyScrollHeight(): void {
+    const full = this.offsets[this.rowIds.length] ?? 0;
+    const vh = Math.max(1, (this.scroll.clientHeight || 600) - 28);
+    if (full > MAX_SCROLL_PX && full > vh) {
+      this.ratio = (MAX_SCROLL_PX - vh) / (full - vh);
+      this.bodyEl.style.height = `${MAX_SCROLL_PX}px`;
+    } else {
+      this.ratio = 1;
+      this.bodyEl.style.height = `${full}px`;
+    }
+  }
+
+  private toScrollTop(virtY: number): number {
+    const full = this.offsets[this.rowIds.length] ?? 0;
+    const vh = Math.max(1, (this.scroll.clientHeight || 600) - 28);
+    return Math.max(0, Math.min(Math.max(0, full - vh), virtY)) * this.ratio;
   }
 
   private width(col: string): number {
@@ -559,28 +631,30 @@ export class GridView implements View {
       return;
     }
     const vh = this.scroll.clientHeight || 600;
-    const st = Math.max(0, this.scroll.scrollTop - this.rowH);
+    const st = this.scroll.scrollTop;
+    const virtTop = st / this.ratio;
+    const searchTop = Math.max(0, virtTop - this.rowH);
     let lo = 0;
     let hi = this.rowIds.length - 1;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (this.offsets[mid] <= st) lo = mid;
+      if (this.offsets[mid] <= searchTop) lo = mid;
       else hi = mid - 1;
     }
     const first = Math.max(0, lo - 3);
     const html: string[] = [];
     let i = first;
-    while (i < this.rowIds.length && this.offsets[i] < st + vh + this.rowH * 4) {
+    while (i < this.rowIds.length && this.offsets[i] < virtTop + vh + this.rowH * 4) {
       html.push(this.rowHtml(this.rowIds[i]));
       i++;
     }
-    this.rowsEl.style.transform = `translateY(${this.offsets[first]}px)`;
+    this.rowsEl.style.transform = `translateY(${st + this.offsets[first] - virtTop}px)`;
     this.rowsEl.innerHTML = html.join('');
-    this.measure();
+    this.measure(first);
   }
 
   /** Rows with open sub-grids are taller. Measure them and lay out again when needed. */
-  private measure(): void {
+  private measure(firstIdx: number): void {
     let changed = false;
     this.rowsEl.querySelectorAll<HTMLElement>('.grow').forEach((el) => {
       const id = Number(el.dataset.id);
@@ -594,10 +668,10 @@ export class GridView implements View {
     });
     if (changed) {
       this.computeOffsets();
-      const first = this.rowsEl.firstElementChild as HTMLElement | null;
-      if (first) {
-        const idx = this.rowIds.indexOf(Number(first.dataset.id));
-        if (idx >= 0) this.rowsEl.style.transform = `translateY(${this.offsets[idx]}px)`;
+      const st = this.scroll.scrollTop;
+      const virtTop = st / this.ratio;
+      if (firstIdx >= 0 && firstIdx < this.offsets.length) {
+        this.rowsEl.style.transform = `translateY(${st + this.offsets[firstIdx] - virtTop}px)`;
       }
     }
   }
@@ -719,14 +793,18 @@ export class GridView implements View {
         const o = item as JObj;
         const base = childKey(rel, i);
         rows.push(
-          `<tr><td class="num dim">${i}</td>${keys.map((k) => (k in o ? `<td>${inner(o[k], childKey(base, k))}</td>` : '<td class="miss"></td>')).join('')}</tr>`,
+          `<tr><td class="num dim" data-p="${esc(base)}">${i}</td>${keys.map((k) => {
+            const pk = childKey(base, k);
+            return k in o ? `<td data-p="${esc(pk)}">${inner(o[k], pk)}</td>` : '<td class="miss"></td>';
+          }).join('')}</tr>`,
         );
       });
     } else {
       rows.push(`<tr><th>${isArr(v) ? '#' : t('key')}</th><th>${t('value')}</th></tr>`);
       entriesHead(v, NESTED_ROWS).forEach(([k, child]) => {
-          const label = typeof k === 'number' ? `<td class="num dim">${k}</td>` : `<td class="tk">${esc(k)}</td>`;
-        rows.push(`<tr>${label}<td>${inner(child, childKey(rel, k))}</td></tr>`);
+        const pk = childKey(rel, k);
+        const label = typeof k === 'number' ? `<td class="num dim" data-p="${esc(pk)}">${k}</td>` : `<td class="tk" data-p="${esc(pk)}">${esc(k)}</td>`;
+        rows.push(`<tr>${label}<td data-p="${esc(pk)}">${inner(child, pk)}</td></tr>`);
       });
     }
     const cut: string[] = [];
@@ -752,11 +830,16 @@ export class GridView implements View {
     const w = Math.max(40, Math.round(d.startW + e.clientX - d.startX));
     this.app.state.grid.widths[d.col] = w;
     this.applyWidths();
-    if (this.app.state.wrap) {
-      // Wrapped cells change height with the column width.
-      this.heights.clear();
-      this.computeOffsets();
-      this.paint();
+    if (this.app.state.wrap && !this.dragRaf) {
+      // Wrapped cells change height with the column width: coalesce reflows to animation frames.
+      this.dragRaf = requestAnimationFrame(() => {
+        this.dragRaf = 0;
+        if (!this.el.hidden) {
+          this.heights.clear();
+          this.computeOffsets();
+          this.paint();
+        }
+      });
     }
   }
 
@@ -817,6 +900,12 @@ export class GridView implements View {
     const rowEl = t.closest('.grow') as HTMLElement | null;
     if (!rowEl || t.closest('[data-c]')) return;
     const id = Number(rowEl.dataset.id);
+    const subTd = t.closest('.ng td[data-p]') as HTMLElement | null;
+    if (subTd) {
+      window.getSelection()?.removeAllRanges();
+      this.app.reveal(id, this.recordPath(id, subTd.dataset.p as string));
+      return;
+    }
     const cellEl = t.closest('.gc') as HTMLElement | null;
     const idx = cellEl ? Array.from(cellEl.parentElement!.children).indexOf(cellEl) : -1;
     const col = idx >= 0 ? this.allCols()[idx] : undefined;
@@ -1224,7 +1313,7 @@ function compare(a: Cell, b: Cell): number {
   const ra = rank(a);
   const rb = rank(b);
   if (ra !== rb) return ra - rb;
-  if (ra === 0) return Number(a instanceof RawNum ? a.src : a) - Number(b instanceof RawNum ? b.src : b);
+  if (ra === 0) return compareNumbers(a as number | RawNum, b as number | RawNum);
   if (ra === 1) return (a as string).localeCompare(b as string);
   if (ra === 2) return Number(a) - Number(b);
   if (ra === 3) return (a instanceof Shape ? a.size : sizeOf(a as JObj)) - (b instanceof Shape ? b.size : sizeOf(b as JObj));

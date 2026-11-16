@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { formatDocumentEnabled, isSupportedDocument, setTestMode, uiLanguage } from './config';
+import { formatDocumentEnabled, isSupportedDocument, isSupportedPath, setTestMode, uiLanguage } from './config';
 import { setLang, t } from './shared/i18n';
 import { randomBytes } from 'crypto';
 import { COMPRESSED_VIEW_TYPE, CompressedEditorProvider, ViewerEditorProvider, VIEWER_VIEW_TYPE } from './customEditor';
@@ -73,7 +73,10 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
   let formatter: vscode.Disposable | undefined;
   const syncFormatter = () => {
     if (formatDocumentEnabled() && !formatter) {
-      formatter = vscode.languages.registerDocumentFormattingEditProvider({ language: 'jsonl' }, { provideDocumentFormattingEdits: formatJsonl });
+      formatter = vscode.languages.registerDocumentFormattingEditProvider(
+        [{ language: 'jsonl' }, { pattern: '**/*.{jsonl,ndjson,jsonlines}' }],
+        { provideDocumentFormattingEdits: formatJsonl },
+      );
     } else if (!formatDocumentEnabled() && formatter) {
       formatter.dispose();
       formatter = undefined;
@@ -92,16 +95,21 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
     try {
       if (uri instanceof vscode.Uri) {
         if (/\.gz$/i.test(uri.path) && !isGzipPath(uri.path)) {
-          void vscode.window.showWarningMessage(t('Better JSONL opens compressed files named .json.gz, .jsonl.gz or .ndjson.gz.'));
+          void vscode.window.showWarningMessage(t('Better JSONL opens compressed files named .json.gz, .jsonl.gz, .ndjson.gz or .jsonlines.gz.'));
           return undefined;
         }
         return await resolveTarget(uri);
       }
       const editor = vscode.window.activeTextEditor;
-      if (editor && isSupportedDocument(editor.document)) return { doc: editor.document };
-      // VS Code shows a file above 50 MB in a tab, but extensions get no text editor for it.
-      const tab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
-      if (tab instanceof vscode.TabInputText || tab instanceof vscode.TabInputCustom) return await resolveTarget(tab.uri);
+      if (editor) {
+        if (isSupportedDocument(editor.document)) return { doc: editor.document };
+      } else {
+        // VS Code shows a file above 50 MB in a tab, but extensions get no text editor for it.
+        const tab = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        if (tab instanceof vscode.TabInputText || tab instanceof vscode.TabInputCustom) {
+          if (isSupportedPath(tab.uri.path) || isGzipPath(tab.uri.path)) return await resolveTarget(tab.uri);
+        }
+      }
     } catch (e) {
       void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', e instanceof Error ? e.message : String(e)));
       return undefined;

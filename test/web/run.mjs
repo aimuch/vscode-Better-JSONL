@@ -1180,7 +1180,7 @@ await scenario('W45', 'Grid: edit a cell (JSON Lines: the line with only that va
   await input.fill('signed in "now"');
   await input.press('Enter');
   const sent = (await posted(page, 'editLine')).at(-1);
-  check.eq('the line is sent with only that value changed', sent, { type: 'editLine', line: 0, original: line0, text: line0.replace('"login ok"', '"signed in \\"now\\""'), exact: true });
+  check.eq('the line is sent with only that value changed', sent, { type: 'editLine', line: 0, original: line0, text: line0.replace('"login ok"', '"signed in \\"now\\""'), exact: true, cell: true });
   await send(page, { type: 'editResult', ok: false, message: 'Line 1 changed after the edit started. Nothing was written.' });
   await page.waitForFunction(() => document.querySelector('.banner:not([hidden])')?.textContent.includes('changed after'));
   check.ok('a refused edit shows in the banner', true);
@@ -1197,7 +1197,7 @@ await scenario('W45', 'Grid: edit a cell (JSON Lines: the line with only that va
   await page.locator('.grow[data-id="1"] .gc').nth(1).dblclick();
   await input.fill('y');
   await input.press('Enter');
-  check.eq('a JSON document sends the path and its version', (await posted(page, 'editValue')).at(-1), { type: 'editValue', path: ['b'], version: 1, text: '"y"' });
+  check.eq('a JSON document sends the path and its version', (await posted(page, 'editValue')).at(-1), { type: 'editValue', path: ['b'], version: 1, text: '"y"', cell: true });
   await page.locator('.grow[data-id="2"] .vchip').dblclick();
   check.eq('objects are not edited in a cell', await page.locator('.gedit').count(), 0);
 });
@@ -1356,6 +1356,61 @@ await scenario('W36', 'The background scan and search do not wait for timers (a 
   await page.fill('.search input', 'level=warn');
   const r = await report(page, (x) => x.matches > 0 && !x.searching, 20000);
   check.eq('the sliced search finishes too', r.matches, Math.ceil(200000 / 7));
+});
+
+await scenario('W51', 'Grid scales past 1.5M rows (>33.5M px); cross-token marks, nested sub-grid reveal, and Graph jq search', [], async ({ page, check }) => {
+  // 1. Cross-token plain-text <mark> in Formatted view, and nested sub-grid double-click reveal in Grid.
+  await open(page, 'events.jsonl');
+  await complete(page);
+  await page.fill('.search input', '"id": 1001');
+  await report(page, (x) => x.matches >= 0);
+  await page.fill('.search input', '"id":1001');
+  await report(page, (x) => x.matches === 1);
+  // Expand record 0 (active) shows `"id": 1001`; check cross-span mark on `"id": 1001` in single JSON too.
+  await open(page, 'sample.json');
+  await complete(page);
+  await page.fill('.search input', '"name": "Lin"');
+  let r = await report(page, (x) => x.matches === 1);
+  await page.press('.search input', 'Enter');
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .row.hit mark').length >= 2);
+  check.ok('cross-token plain-text search marks across key, colon and value spans', true);
+
+  // 2. Graph view highlights jq / JSONPath matches on a single JSON document and updates the counter.
+  await tabBtn(page, 'graph').click();
+  r = await report(page, (x) => x.view === 'graph');
+  await page.fill('.search input', '$.maintainers[1].name');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('graph counter shows JSONPath match count', await page.locator('.search .count').innerText(), 'JSONPath · – / 1');
+  await page.press('.search input', 'Enter');
+  r = await report(page, (x) => x.graph?.selectedPath === '$.maintainers[1]');
+  check.eq('Enter in Graph selects the node containing the matched member', r.graph.selectedPath, '$.maintainers[1]');
+
+  // 3. Nested sub-grid double-click reveals the nested member path.
+  await open(page, 'events.jsonl', { config: { defaultView: 'grid' } });
+  await complete(page);
+  await page.locator('.grow[data-id="0"] .vchip').first().click();
+  await report(page, (x) => x.grid.openCells === 1);
+  await page.locator('.grow[data-id="0"] .ng td.tk', { hasText: 'name' }).dblclick();
+  await page.waitForFunction(() => window.harness.posted('reveal').length > 0);
+  check.eq('double-clicking a nested sub-grid cell reveals its nested path', (await posted(page, 'reveal')).at(-1), { type: 'reveal', line: 0, path: ['user', 'name'] });
+
+  // 4. Grid with 1 500 000 rows (>40M unscaled px, above Chromium's 33.5M px CSS limit): last row is reachable.
+  await openBlank(page);
+  await page.evaluate(() => {
+    const chunk = new TextEncoder().encode('{"a":1}\n'.repeat(100000));
+    window.harness.send({
+      type: 'init',
+      doc: { uri: 'file:///fixtures/huge.jsonl', fileName: 'huge.jsonl', languageId: 'jsonl', isJsonl: true, host: 'preview', large: { bytes: chunk.length * 15 }, readOnly: true },
+      text: '',
+      version: 500,
+      config: window.harness.config({ defaultView: 'grid' }),
+    });
+    for (let k = 0; k < 15; k++) window.harness.send({ type: 'chunk', version: 500, data: chunk, done: k === 14 });
+  });
+  r = await report(page, (x) => x.large && !x.loading && x.view === 'grid' && x.grid?.rows === 1500000, 30000);
+  await send(page, { type: 'selection', lines: [1499999], active: 1499999 });
+  await page.waitForFunction(() => document.querySelector('.grow[data-id="1499999"]'), null, { timeout: 10000 });
+  check.ok('row 1,500,000 renders in the Grid past the 33.5M px browser height limit', await page.locator('.grow[data-id="1499999"]').isVisible());
 });
 
 await browser.close();

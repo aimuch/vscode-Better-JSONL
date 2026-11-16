@@ -2,7 +2,7 @@
 // Both read parsed values. Results keep their place in the document when they have one,
 // so the Formatted view can go to them.
 import { splitJsonValues } from '../shared/jsonText';
-import { isContainer, parseJson, RawNum, type JObj, type JVal } from './json';
+import { compareNumbers, isContainer, parseJson, parseNumLiteral, RawNum, type JObj, type JVal } from './json';
 
 /** The place of a value: a chain from the value up to the root (null). */
 export type PathLink = { readonly up: PathLink; readonly k: string | number } | null;
@@ -30,12 +30,29 @@ class LimitError extends Error {}
 
 /** Results (and steps) one query may make. More than this stops it: "too many results". */
 const MAX_OUT = 200_000;
+const MAX_INPUTS_OUT = 20_000_000;
 const MAX_RECORD = 20_000;
-let budget = MAX_OUT;
+
+interface ExecState {
+  budget: number;
+  inputs: Iterator<Out> | null;
+}
+
+let activeExec: ExecState = { budget: MAX_OUT, inputs: null };
+
+function withExec<T>(limit: number, inputs: Iterator<Out> | null, fn: () => T): T {
+  const prev = activeExec;
+  activeExec = { budget: limit, inputs };
+  try {
+    return fn();
+  } finally {
+    activeExec = prev;
+  }
+}
 
 function spend(n = 1): void {
-  budget -= n;
-  if (budget < 0) throw new LimitError();
+  activeExec.budget -= n;
+  if (activeExec.budget < 0) throw new LimitError();
 }
 
 export function pathOf(p: PathLink): (string | number)[] {
@@ -77,12 +94,8 @@ export function compareValues(a: JVal, b: JVal): number {
       return 0;
     case 'boolean':
       return (a ? 1 : 0) - (b ? 1 : 0);
-    case 'number': {
-      if (a instanceof RawNum && b instanceof RawNum && a.src === b.src) return 0;
-      const x = num(a);
-      const y = num(b);
-      return x < y ? -1 : x > y ? 1 : 0;
-    }
+    case 'number':
+      return compareNumbers(a as number | RawNum, b as number | RawNum);
     case 'string':
       return (a as string) < (b as string) ? -1 : (a as string) > (b as string) ? 1 : 0;
     case 'array': {
@@ -363,7 +376,7 @@ class JsonPathParser {
     const n = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(rest);
     if (n) {
       this.i += n[0].length;
-      return constant(Number(n[0]));
+      return constant(parseNumLiteral(n[0]));
     }
     if (rest[0] === "'" || rest[0] === '"') return constant(this.str());
     const lit = /^(true|false|null)\b/.exec(rest);
@@ -475,17 +488,15 @@ export function compileJsonPath(src: string): Program {
   return {
     kind: 'jsonpath',
     matches(record) {
-      budget = MAX_RECORD;
       try {
-        return run(record).length > 0 || (filterFirst && run([record]).length > 0);
+        return withExec(MAX_RECORD, null, () => run(record).length > 0 || (filterFirst && run([record]).length > 0));
       } catch {
         return false;
       }
     },
     run(root) {
-      budget = MAX_OUT;
       try {
-        return { outs: run(root), capped: false };
+        return { outs: withExec(MAX_OUT, null, () => run(root)), capped: false };
       } catch (e) {
         if (e instanceof LimitError) return { outs: [], capped: true };
         throw e;
@@ -498,7 +509,7 @@ export function compileJsonPath(src: string): Program {
 
 /** A part of a string with `\(…)`: literal text, or the source of an expression. */
 type StrPart = string | { src: string; pos: number };
-type Tok = { t: 'num' | 'str' | 'istr' | 'fmt' | 'id' | 'field' | 'op' | 'var' | 'eof'; v: string | number; pos: number; parts?: StrPart[] };
+type Tok = { t: 'num' | 'str' | 'istr' | 'fmt' | 'id' | 'field' | 'op' | 'var' | 'eof'; v: string | number | RawNum; pos: number; parts?: StrPart[] };
 
 /** Variables and functions a filter can see (lexical scope: a linked list from the innermost). */
 interface Env {
@@ -532,8 +543,6 @@ export class NeedModules extends Error {
   }
 }
 
-/** The stream `input` and `inputs` read, while a query runs. */
-let currentInputs: Iterator<Out> | null = null;
 const ASSIGN = ['=', '|=', '+=', '-=', '*=', '/=', '%=', '//='];
 
 /** error(value): `try … catch` gets the value. */
@@ -620,7 +629,7 @@ function lex(s: string): Tok[] {
     }
     const n = /^\d+(\.\d+)?([eE][+-]?\d+)?/.exec(s.slice(i));
     if (n) {
-      out.push({ t: 'num', v: Number(n[0]), pos });
+      out.push({ t: 'num', v: parseNumLiteral(n[0]), pos });
       i += n[0].length;
       continue;
     }
@@ -1262,10 +1271,13 @@ class JqParser {
     if (op === '|=') {
       return (inp, env) => {
         let v = inp.v;
+        const drop: (string | number)[][] = [];
         for (const p of pathsOf(lhs, inp, env)) {
           const outs = rhs(val(getPath(v, p)), env);
-          v = outs.length ? setPath(v, p, outs[0].v) : delPaths(v, [p]);
+          if (outs.length) v = setPath(v, p, outs[0].v);
+          else drop.push(p);
         }
+        if (drop.length) v = delPaths(v, drop);
         return [val(v)];
       };
     }
@@ -1340,7 +1352,11 @@ class JqParser {
     if (!this.op('-')) return this.postfix();
     this.i++;
     const f = this.postfix();
-    return (inp, env) => f(inp, env).map((o) => (typeName(o.v) === 'number' ? val(-num(o.v)) : jqFail(`${typeName(o.v)} cannot be negated`)));
+    return (inp, env) =>
+      f(inp, env).map((o) => {
+        if (o.v instanceof RawNum) return val(parseNumLiteral(o.v.src.startsWith('-') ? o.v.src.slice(1) : '-' + o.v.src));
+        return typeName(o.v) === 'number' ? val(-num(o.v)) : jqFail(`${typeName(o.v)} cannot be negated`);
+      });
   }
 
   /** A term with its suffixes. `allowAs`: `Term as $x | body` binds here (not after reduce/foreach sources). */
@@ -2030,6 +2046,17 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       return withArg((v, a) => contains(v, a));
     case 'inside':
       return withArg((v, a) => contains(a, v));
+    case 'indices':
+    case 'index':
+    case 'rindex':
+      want(1);
+      return (inp, env) =>
+        args[0](inp, env).map((needle) => {
+          const pos = findIndices(inp.v, needle.v);
+          if (name === 'indices') return val(pos);
+          if (!pos.length) return val(null);
+          return val(name === 'index' ? pos[0] : pos[pos.length - 1]);
+        });
     case 'to_entries':
       return map1((v) => {
         if (!isContainer(v) || Array.isArray(v)) return jqFail(`${typeName(v)} has no entries`);
@@ -2113,7 +2140,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
     case 'input':
       want(0);
       return () => {
-        const n = currentInputs?.next();
+        const n = activeExec.inputs?.next();
         if (!n || n.done) return jqFail('No more inputs');
         spend();
         return [n.value];
@@ -2123,7 +2150,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
       return () => {
         const out: Out[] = [];
         for (;;) {
-          const n = currentInputs?.next();
+          const n = activeExec.inputs?.next();
           if (!n || n.done) return out;
           spend();
           out.push(n.value);
@@ -2138,6 +2165,65 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
   return fail(`unknown function ${name}/${n}`);
 }
 
+function findIndices(haystack: JVal, needle: JVal): number[] {
+  if (haystack === null) return [];
+  if (typeof haystack === 'string') {
+    if (typeof needle !== 'string') return jqFail(`cannot search for ${typeName(needle)} in string`);
+    if (!needle.length) return [];
+    const h = [...haystack];
+    const sub = [...needle];
+    const out: number[] = [];
+    outer: for (let i = 0; i <= h.length - sub.length; i++) {
+      for (let k = 0; k < sub.length; k++) if (h[i + k] !== sub[k]) continue outer;
+      out.push(i);
+    }
+    return out;
+  }
+  if (Array.isArray(haystack)) {
+    const out: number[] = [];
+    if (Array.isArray(needle)) {
+      if (!needle.length) return [];
+      outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+        for (let k = 0; k < needle.length; k++) if (compareValues(haystack[i + k], needle[k]) !== 0) continue outer;
+        out.push(i);
+      }
+      return out;
+    }
+    for (let i = 0; i < haystack.length; i++) if (compareValues(haystack[i], needle) === 0) out.push(i);
+    return out;
+  }
+  return jqFail(`${typeName(haystack)} cannot be searched with index`);
+}
+
+/** Strips free-spacing whitespace and # comments for the 'x' regex flag without touching escapes or character classes. */
+function stripExtendedRegex(src: string): string {
+  let out = '';
+  let inClass = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === '\\') {
+      const next = src[i + 1] ?? '';
+      out += next === '#' || /\s/.test(next) ? next : src.slice(i, i + 2);
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (c === ']') inClass = false;
+      out += c;
+      continue;
+    }
+    if (c === '[') {
+      inClass = true;
+      out += c;
+    } else if (c === '#') {
+      while (i < src.length && src[i] !== '\n') i++;
+    } else if (!/\s/.test(c)) {
+      out += c;
+    }
+  }
+  return out;
+}
+
 const regexCache = new Map<string, RegExp>();
 
 function regex(re: JVal, flags: JVal): RegExp {
@@ -2147,7 +2233,7 @@ function regex(re: JVal, flags: JVal): RegExp {
   let r = regexCache.get(key);
   if (!r) {
     try {
-      r = new RegExp(fl.includes('x') ? src.replace(/\s+|#.*$/gm, '') : src, `u${fl.includes('i') ? 'i' : ''}${fl.includes('s') ? 's' : ''}`);
+      r = new RegExp(fl.includes('x') ? stripExtendedRegex(src) : src, `u${fl.includes('i') ? 'i' : ''}${fl.includes('s') ? 's' : ''}`);
     } catch (e) {
       return jqFail(`the regular expression is not valid: ${(e as Error).message}`);
     }
@@ -2165,15 +2251,7 @@ export function compileJq(src: string, modules: Map<string, string | null> = new
   const body = p.pipe();
   if (!p.is('eof')) p.fail(`unexpected '${p.peek().v}'`);
   const f: F = installs.length ? (inp, env) => body(inp, installs.reduce((e, ins) => ins(e), env)) : body;
-  const exec = (root: JVal, inputs: Iterator<Out> | null, limit: number) => {
-    budget = limit;
-    currentInputs = inputs;
-    try {
-      return f({ v: root, p: null }, EMPTY_ENV);
-    } finally {
-      currentInputs = null;
-    }
-  };
+  const exec = (root: JVal, inputs: Iterator<Out> | null, limit: number) => withExec(limit, inputs, () => f({ v: root, p: null }, EMPTY_ENV));
   const capped = (run: () => Out[]) => {
     try {
       return { outs: run(), capped: false };
@@ -2193,13 +2271,13 @@ export function compileJq(src: string, modules: Map<string, string | null> = new
       }
     },
     run: (root) => capped(() => exec(root, null, MAX_OUT)),
-    runWith: (root, inputs) => capped(() => exec(root, inputs[Symbol.iterator](), MAX_OUT)),
+    runWith: (root, inputs) => capped(() => exec(root, inputs[Symbol.iterator](), MAX_INPUTS_OUT)),
   };
 }
 
 /** A search that starts with `.` (or one of these functions) is a jq filter. */
 const JQ_START =
-  /^(?:\.|(?:select|map|has|any|all|test|to_entries|paths|recurse|keys|length|type)\s*\(|(?:if|def|reduce|foreach|import|include|label)\s|try\s|\[\s*inputs\b|inputs?\s*\||@(?:text|json|csv|tsv|html|uri|sh|base64d?|base32d?)\b)/;
+  /^(?:\.|(?:select|map|has|any|all|test|to_entries|paths|recurse|keys|length|type|index|rindex|indices)\s*\(|(?:if|def|reduce|foreach|import|include|label)\s|try\s|\[\s*inputs\b|inputs?\s*\||@(?:text|json|csv|tsv|html|uri|sh|base64d?|base32d?)\b)/;
 
 /**
  * Reads the search text as a query when it looks like one: `$…` is JSONPath, `.…` is jq.

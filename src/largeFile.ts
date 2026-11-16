@@ -60,6 +60,8 @@ export interface SourceOptions {
   from?: number;
   /** Stop before this byte offset. */
   to?: number;
+  /** Check for a byte order mark at the start of the stream (defaults to true when `from` is 0). */
+  detectBom?: boolean;
 }
 
 /** The file as raw bytes, from `from` on. */
@@ -73,37 +75,63 @@ async function rawStream(uri: vscode.Uri, from: number, to: number | undefined):
   return Readable.from([Buffer.from(all.buffer, all.byteOffset + from, Math.max(0, end - from))]);
 }
 
+function detectLabel(head: Buffer, configured: string, detectBom: boolean): string {
+  if (detectBom) {
+    if (head.length >= 2 && head[0] === 0xff && head[1] === 0xfe) return 'utf-16le';
+    if (head.length >= 2 && head[0] === 0xfe && head[1] === 0xff) return 'utf-16be';
+    if (head.length >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) return 'utf-8';
+  }
+  return configured;
+}
+
 /**
  * Reads a file as UTF-8 pieces of about CHUNK bytes. `read` is how many bytes of the file
  * (compressed bytes for a .gz file) were read so far, for the progress.
- * The encoding comes from a byte order mark first (UTF-16), then from `options.encoding`.
+ * The encoding comes from a byte order mark first (when reading from byte 0), then from `options.encoding`.
  */
-export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncGenerator<{ data: Uint8Array; read: number }> {
-  const raw = await rawStream(uri, options.from ?? 0, options.to);
+export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncGenerator<{ data: Uint8Array; read: number; encoding: string }> {
+  const from = options.from ?? 0;
+  const detectBom = options.detectBom ?? from === 0;
+  const raw = await rawStream(uri, from, options.to);
   let read = 0;
   raw.on('data', (b: Buffer) => (read += b.length));
   // A file that is still being written (a compressed log) ends in the middle: the output so far is used.
   const source: Readable = options.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH })) : raw;
   raw.on('error', (e) => source.destroy(e));
   let decoder: TextDecoder | null | undefined;
+  let resolved = options.encoding;
+  let headCarry: Buffer = Buffer.alloc(0);
   const parts: Buffer[] = [];
   let size = 0;
   try {
     for await (const piece of source as AsyncIterable<Buffer>) {
       let b = piece;
       if (decoder === undefined) {
-        // The first bytes decide: a UTF-16 byte order mark, or the configured encoding.
-        const bom16 = b.length >= 2 && ((b[0] === 0xff && b[1] === 0xfe) || (b[0] === 0xfe && b[1] === 0xff));
-        const label = bom16 ? (b[0] === 0xff ? 'utf-16le' : 'utf-16be') : options.encoding;
-        decoder = label === 'utf-8' || label === 'utf8' ? null : makeDecoder(label);
+        b = headCarry.length ? Buffer.concat([headCarry, b]) : b;
+        if (detectBom && b.length < 3) {
+          headCarry = b;
+          continue;
+        }
+        headCarry = Buffer.alloc(0);
+        resolved = detectLabel(b, options.encoding, detectBom);
+        decoder = resolved === 'utf-8' || resolved === 'utf8' ? null : makeDecoder(resolved, !detectBom);
       }
       if (decoder) b = Buffer.from(decoder.decode(b, { stream: true }), 'utf8');
       parts.push(b);
       size += b.length;
       if (size >= CHUNK) {
-        yield { data: concat(parts, size), read };
+        yield { data: concat(parts, size), read, encoding: resolved };
         parts.length = 0;
         size = 0;
+      }
+    }
+    if (decoder === undefined && headCarry.length) {
+      resolved = detectLabel(headCarry, options.encoding, detectBom);
+      decoder = resolved === 'utf-8' || resolved === 'utf8' ? null : makeDecoder(resolved, !detectBom);
+      const first = decoder ? Buffer.from(decoder.decode(headCarry, { stream: true }), 'utf8') : headCarry;
+      if (first.length) {
+        parts.push(first);
+        size += first.length;
       }
     }
     if (decoder) {
@@ -113,15 +141,15 @@ export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncG
         size += rest.length;
       }
     }
-    yield { data: concat(parts, size), read };
+    yield { data: concat(parts, size), read, encoding: resolved };
   } finally {
     raw.destroy();
   }
 }
 
-function makeDecoder(label: string): TextDecoder {
+function makeDecoder(label: string, ignoreBOM: boolean): TextDecoder {
   try {
-    return new TextDecoder(label);
+    return new TextDecoder(label, { ignoreBOM });
   } catch {
     throw new Error(`the encoding "${label}" is not supported`);
   }

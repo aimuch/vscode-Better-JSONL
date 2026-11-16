@@ -16,9 +16,9 @@ import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
 import { diffValues } from '../../src/webview/diff';
 import { csvField, csvRow } from '../../src/webview/exporter';
 import { compactJson, compileJq, compileJsonPath, compileQuery, formatValue, pathOf } from '../../src/webview/query';
-import { ByteStore, DocModel, K_ERROR, K_UNKNOWN, K_VALUE, lowerBound, patchLines, stepIn, TreeSearch } from '../../src/webview/model';
+import { ByteStore, DocModel, K_ERROR, K_UNKNOWN, K_VALUE, lowerBound, matchesRecord, parseQuery, patchLines, stepIn, TreeSearch } from '../../src/webview/model';
 import { buildLines, countLines, lineText } from '../../src/webview/views/lines';
-import { childKey, decodeKey, parseJson, RawNum, type JVal } from '../../src/webview/json';
+import { childKey, compareNumbers, decodeKey, parseJson, parseNumLiteral, RawNum, type JVal } from '../../src/webview/json';
 
 /** A small seeded generator, so a failure can be repeated. */
 function rng(seed: number): () => number {
@@ -456,7 +456,9 @@ test('jq: errors, the ? operator, and record matching', () => {
   const p = compileJq('.level == "warn" and .ms > 100');
   assert.deepEqual([p.matches({ level: 'warn', ms: 200 }), p.matches({ level: 'warn', ms: 50 }), p.matches('text')], [true, false, false]);
   assert.equal(compileJq('select(.user.name | startswith("A"))').matches({ user: { name: 'Ada' } }), true);
-  assert.throws(() => compileJq('.tags | index("x")'), /unknown function index\/1/, 'an unknown function is an error before the search runs');
+  assert.equal(compileJq('select(.tags | index("x"))').matches({ tags: ['a', 'x'] }), true);
+  assert.equal(compileJq('select(.tags | index("x"))').matches({ tags: ['a', 'b'] }), false);
+  assert.throws(() => compileJq('.tags | nosuch("x")'), /unknown function nosuch\/1/, 'an unknown function is an error before the search runs');
 });
 
 test('compileQuery: what is a query, and what is text', () => {
@@ -590,7 +592,8 @@ test('jq: variables, destructuring, def, reduce, foreach, assignment, try/catch,
   assert.deepEqual(one('.xs[1] -= 10 | .xs', { xs: [1, 20] }), ['[1,10]']);
   assert.deepEqual(one('.a //= "d" | .b //= "d"', { a: 'x', b: null }), ['{"a":"x","b":"d"}']);
   assert.deepEqual(one('.a = (1, 2) | .a', {}), ['1', '2']);
-  assert.deepEqual(one('.xs[] |= empty', { xs: [1, 2, 3] }), ['{"xs":[2]}'], 'jq 1.7: an empty update deletes (indexes move)');
+  assert.deepEqual(one('.xs[] |= empty', { xs: [1, 2, 3] }), ['{"xs":[]}'], 'jq 1.7: an empty update deletes all matching elements');
+  assert.deepEqual(one('.xs[] |= select(. % 2 == 0)', { xs: [1, 2, 3, 4] }), ['{"xs":[2,4]}']);
   assert.deepEqual(one('del(.a, .c) | keys', { a: 1, b: 2, c: 3 }), ['["b"]']);
   assert.deepEqual(one('to_entries | map(.value += 1) | from_entries', { a: 1 }), ['{"a":2}']);
   assert.deepEqual(one('with_entries(.key |= ascii_upcase)', { a: 1 }), ['{"A":1}']);
@@ -757,4 +760,100 @@ test('jq: import and include read module files; input and inputs read the stream
   assert.deepEqual(compileJq('input, input | .n').runWith?.(null, stream).outs.map((o) => o.v), [1, 2]);
   assert.throws(() => compileJq('input').runWith?.(null, []), /No more inputs/);
   assert.equal(compileJq('.a').usesInputs, false);
+});
+
+test('exact big integers (>2^53) in compareNumbers, jq, JSONPath, and path queries', () => {
+  const n1 = parseJson('9007199254740992') as number | RawNum;
+  const n2 = parseJson('9007199254740993') as number | RawNum;
+  const n3 = parseJson('12345678901234567891') as number | RawNum;
+  const n4 = parseJson('12345678901234567892') as number | RawNum;
+  assert.equal(compareNumbers(n1, n2), -1);
+  assert.equal(compareNumbers(n2, n1), 1);
+  assert.equal(compareNumbers(n3, n4), -1);
+  assert.equal(compareNumbers(parseNumLiteral('-9007199254740993'), parseNumLiteral('-9007199254740992')), -1);
+  assert.equal(compareNumbers(parseNumLiteral('1e20'), parseNumLiteral('100000000000000000000')), 0);
+  assert.equal(compareNumbers(parseNumLiteral('0.1000000000000000055'), parseNumLiteral('0.1')), 1);
+
+  const rec = parseJson('{"trace":9007199254740993}');
+  assert.equal(compileJq('.trace == 9007199254740992').matches(rec), false);
+  assert.equal(compileJq('.trace == 9007199254740993').matches(rec), true);
+  assert.equal(compileJq('.trace > 9007199254740992').matches(rec), true);
+  assert.equal(compileJsonPath('$[?@.trace == 9007199254740992]').matches(rec), false);
+  assert.equal(compileJsonPath('$[?@.trace == 9007199254740993]').matches(rec), true);
+  const arr = parseJson('[9007199254740993, 9007199254740992, 9007199254740993]');
+  assert.deepEqual(jq('unique', arr), ['[9007199254740992,9007199254740993]']);
+
+  const m = new DocModel('{"trace":9007199254740992}\n{"trace":9007199254740993}\n', true);
+  m.parseSome(1000);
+  const q = parseQuery('trace>9007199254740992', m);
+  assert.deepEqual([matchesRecord(m, 0, q), matchesRecord(m, 1, q)], [false, true]);
+});
+
+test('jq: index, rindex, indices, and extended regex flag x', () => {
+  assert.deepEqual(jq('["a","x","b","x"] | [index("x"), rindex("x"), indices("x")]', null), ['[1,3,[1,3]]']);
+  assert.deepEqual(jq('"ababa" | indices("aba")', null), ['[0,2]']);
+  assert.deepEqual(jq('"abc" | indices("")', null), ['[]']);
+  assert.deepEqual(jq('[1,2,3,1,2] | indices([1,2])', null), ['[0,3]']);
+  assert.deepEqual(jq('[[1,2],[3,4]] | index([1,2])', null), ['null']);
+  assert.deepEqual(jq('"a # b" | test("a \\\\  [ #] \\\\  b # comment"; "x")', null), ['true']);
+});
+
+test('ByteStore standalone CR line ends, DocModel sticky JSONL, hasNonObject reset, gb18030 4-byte, tiny replaceLine and symlinks', async () => {
+  const r = rng(123);
+  const crText = '{"a":1}\r{"b":2}\r\n\r{"c":3}';
+  for (let i = 0; i < 50; i++) {
+    const store = storeOf(crText, r, 1 + (i % 5));
+    assert.equal(store.count, 4);
+    assert.deepEqual([0, 1, 2, 3].map((k) => store.text(k)), ['{"a":1}', '{"b":2}', '', '{"c":3}']);
+  }
+
+  // Sticky JSONL mode on a .json file when one line is temporarily invalid during editing.
+  const brokenLinesJson = new DocModel('{"a":1}\n{"b": \n{"c":3}\n', false, undefined, false, true);
+  brokenLinesJson.parseSome(1000);
+  assert.deepEqual([brokenLinesJson.isJsonl, brokenLinesJson.detectedJsonl, brokenLinesJson.valid, brokenLinesJson.errors], [true, true, 2, 1]);
+
+  // hasNonObject resets once non-object lines are removed; adopt keeps unchanged middle lines on in-place edits.
+  const m1 = new DocModel('{"a":1}\n[1,2]\n{"b":2}\n', true);
+  m1.parseSome(1000);
+  assert.equal(m1.hasNonObject, true);
+  const m2 = new DocModel('{"a":1}\n{"c":3}\n{"b":2}\n', true);
+  m2.adopt(m1);
+  m2.parseSome(1000);
+  assert.equal(m2.hasNonObject, false);
+
+  const mMid1 = new DocModel('{"a":0}\n{"keep":1}\n{"keep":2}\n{"z":0}\n', true);
+  mMid1.parseSome(1000);
+  const mMid2 = new DocModel('{"a":9}\n{"keep":1}\n{"keep":2}\n{"z":9}\n', true);
+  const mapMid = mMid2.adopt(mMid1);
+  assert.deepEqual([mapMid(0), mapMid(1), mapMid(2), mapMid(3)], [-1, 1, 2, -1]);
+
+  // gb18030 4-byte BMP and non-BMP round-trip; euc-jp 3-byte JIS X 0212 round-trip.
+  const gbText = '{"msg":"€ 😀 名字"}';
+  assert.equal(new TextDecoder('gb18030').decode(encodeText(gbText, 'gb18030')), gbText);
+  const euc3 = new TextDecoder('euc-jp').decode(new Uint8Array([0x8f, 0xa2, 0xaf]));
+  if (euc3 && euc3 !== '\ufffd') assert.equal(new TextDecoder('euc-jp').decode(encodeText(euc3, 'euc-jp')), euc3);
+
+  // replaceLine on <3-byte files with line breaks, standalone CR, and symbolic links.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bj-edge-'));
+  try {
+    const tiny = path.join(dir, 'tiny.jsonl');
+    fs.writeFileSync(tiny, '1\n');
+    await replaceLine(tiny, 0, '1', '22', { gzip: false, encoding: 'utf-8' });
+    assert.equal(fs.readFileSync(tiny, 'utf8'), '22\n');
+
+    const tiny2 = path.join(dir, 'tiny2.jsonl');
+    fs.writeFileSync(tiny2, '\n1');
+    await replaceLine(tiny2, 1, '1', '9', { gzip: false, encoding: 'utf-8' });
+    assert.equal(fs.readFileSync(tiny2, 'utf8'), '\n9');
+
+    const crFile = path.join(dir, 'cr.jsonl');
+    fs.writeFileSync(crFile, '{"a":1}\r{"b":2}\r');
+    const link = path.join(dir, 'link.jsonl');
+    fs.symlinkSync(crFile, link);
+    await replaceLine(link, 0, '{"a":1}', '{"a":10}', { gzip: false, encoding: 'utf-8' });
+    assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'symlink preserved');
+    assert.equal(fs.readFileSync(crFile, 'utf8'), '{"a":10}\r{"b":2}\r');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

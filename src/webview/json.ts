@@ -47,6 +47,49 @@ function keepSource(_k: string, v: unknown, ctx?: { source?: string }): unknown 
   return v;
 }
 
+/** Parses a number token and keeps a RawNum when a JavaScript number would lose precision. */
+export function parseNumLiteral(raw: string): number | RawNum {
+  const v = Number(raw);
+  return !Number.isSafeInteger(v) && String(v) !== raw && digitCount(raw) >= 16 ? new RawNum(raw) : v;
+}
+
+function normDecimal(s: string): { neg: boolean; digits: string; exp: number } {
+  let i = 0;
+  const neg = s[0] === '-';
+  if (neg || s[0] === '+') i++;
+  let eIdx = s.indexOf('e', i);
+  if (eIdx < 0) eIdx = s.indexOf('E', i);
+  const mant = eIdx < 0 ? s.slice(i) : s.slice(i, eIdx);
+  const expPart = eIdx < 0 ? 0 : parseInt(s.slice(eIdx + 1), 10);
+  const dot = mant.indexOf('.');
+  const intPart = dot < 0 ? mant : mant.slice(0, dot);
+  const fracPart = dot < 0 ? '' : mant.slice(dot + 1);
+  const raw = intPart + fracPart;
+  let first = 0;
+  while (first < raw.length && raw.charCodeAt(first) === 48) first++;
+  if (first === raw.length) return { neg: false, digits: '', exp: 0 };
+  let last = raw.length;
+  while (last > first && raw.charCodeAt(last - 1) === 48) last--;
+  return { neg, digits: raw.slice(first, last), exp: intPart.length - first + expPart };
+}
+
+/** Exact numerical order for numbers and RawNum values (including >2^53 integers and long decimals). */
+export function compareNumbers(a: number | RawNum, b: number | RawNum): number {
+  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  const sa = a instanceof RawNum ? a.src : String(a);
+  const sb = b instanceof RawNum ? b.src : String(b);
+  if (sa === sb) return 0;
+  const A = normDecimal(sa);
+  const B = normDecimal(sb);
+  if (!A.digits && !B.digits) return 0;
+  if (!A.digits) return B.neg ? 1 : -1;
+  if (!B.digits) return A.neg ? -1 : 1;
+  if (A.neg !== B.neg) return A.neg ? -1 : 1;
+  const sign = A.neg ? -1 : 1;
+  if (A.exp !== B.exp) return A.exp < B.exp ? -sign : sign;
+  return A.digits < B.digits ? -sign : A.digits > B.digits ? sign : 0;
+}
+
 /** JSON.parse that keeps the exact text of numbers that would lose precision. */
 export function parseJson(text: string): JVal {
   if (sourceTextSupported && LONG_NUMBER.test(text)) return JSON.parse(text, keepSource as never) as JVal;

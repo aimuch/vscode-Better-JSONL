@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- **Fixed: Export (CSV / JSON Lines)** now acknowledges every streamed chunk so exports above 2 MB write the full file, close their file handle, and finish cleanly.
+- **Grid above 1.2 million rows**: virtual scroll scaling keeps every row reachable past the browser's 33.5M px height limit.
+- **Faster word wrap and Expand all**: wrapped row heights update in `O(log n)` with a Fenwick tree instead of rebuilding the whole prefix-sum array on each scroll, and **Expand all** on files above 50 MB computes heights in background slices without churning the record cache.
+- **jq**: added `index`, `rindex` and `indices`; fixed `|=` when the update filter returns `empty` on arrays; exact comparison for large integers above `2^53` in jq, JSONPath, path queries and Grid sorting; safer `'x'` regex flag parsing; module imports stay within the document or workspace folder.
+- **Encodings and large files**: 4-byte `gb18030` and 3-byte `euc-jp` support when editing lines; standalone `CR` line endings in byte-streamed files; UTF-16 byte order mark encoding kept across `Follow` appends; symbolic links preserved on line edits; `< 3`-byte files handled in `replaceLine`.
+- **Polish**: cross-token plain-text search highlights in Formatted view, jq/JSONPath search highlights and match counter in Graph view, nested sub-grid double-click source reveal, `Alt+Z` word wrap shortcut in `.gz` viewers, `.jsonlines` Format Document support, sticky JSON Lines mode while editing `.json` files with one value per line, and stricter active-editor checks when opening a preview from the Command Palette.
+
 ## 0.6.0
 
 - **jq**: variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `def` with filter and `$value` parameters (and recursion), `reduce`, `foreach`, `try … catch`, `label` / `break`, and assignment (`=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`), plus `del`, `getpath`, `setpath`, `delpaths`, `with_entries`, `paths(f)` and `leaf_paths`.

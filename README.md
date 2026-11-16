@@ -59,7 +59,7 @@ VS Code does not give extensions the text of a file above 50 MB, and has no text
 - Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress. In the Grid, sorting and column filters first read the columns they need (the status bar shows the progress).
 - **Edit a record** of a large JSON Lines file (the record editor or a grid cell), also of a compressed file and in other encodings: the line is replaced on disk (a compressed file is compressed again). The edit is refused when the file or the line changed since it was read, or when a character cannot be written in the file's encoding.
 - **Follow**: when a file only grows at its end (a log), the new lines are added to the view without reading the file again. A compressed file is decompressed again, and only what follows the text the view has is added. Without follow mode, a **Load new lines** button appears. Other changes show a **Reload** button.
-- **Compressed files**: `.jsonl.gz`, `.ndjson.gz` and `.json.gz` open in Better JSONL when you open them in VS Code.
+- **Compressed files**: `.jsonl.gz`, `.ndjson.gz`, `.jsonlines.gz` and `.json.gz` open in Better JSONL when you open them in VS Code.
 - **Encodings**: a UTF-16 byte order mark is read, and so is the `files.encoding` setting (for example `gbk`, `shiftjis`, `windows1252`).
 - One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded.
 - **Above about 512 MB** (too long for one JavaScript string): an array, or an object that is mostly one array, is read item by item. Its items are shown as records (as JSON Lines, read-only) and only their byte ranges are kept: a 600 MB array of 4.4 million items opens in about 9 seconds with about 1 GB of memory. Another value is parsed from the bytes as a whole and needs memory for all of it.
@@ -77,7 +77,7 @@ Type plain text, a path query, or a jq or JSONPath query:
 | `ms>100` | Numeric compare (`>` or `<`) |
 | `level!=info` | Not equal |
 | `.level == "warn" and .ms > 100` | **jq** (a search that starts with `.`): records for which the filter gives something other than `false` or `null` |
-| `select(.tags \| index("x"))` … `.user.name \| test("^a"; "i")` | jq functions: `select`, `map`, `has`, `length`, `keys`, `type`, `test`, `contains`, `startswith`, `endswith`, `any`, `all`, `sort_by`, `group_by`, `unique`, `min`, `max`, `add`, `to_entries`, `paths`, `path`, `if … then … else … end`, `//`, `?` and more |
+| `select(.tags \| index("x"))` … `.user.name \| test("^a"; "i")` | jq functions: `select`, `map`, `has`, `index`, `rindex`, `indices`, `length`, `keys`, `type`, `test`, `contains`, `startswith`, `endswith`, `any`, `all`, `sort_by`, `group_by`, `unique`, `min`, `max`, `add`, `to_entries`, `paths`, `path`, `if … then … else … end`, `//`, `?` and more |
 | `.ms as $t \| select($t > 100)`, `reduce .items[] as $i (0; . + $i.n)`, `def big: .ms > 100; select(big)` | jq variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `reduce`, `foreach`, `def` (with filter and `$value` parameters, recursion), `try … catch`, `label` / `break`, and assignment (`=`, `\|=`, `+=`, `//=`, …) on a copy of the value |
 | `$..user[?@.name == "Ada"]` | **JSONPath** (RFC 9535, a search that starts with `$`): filters, `..`, `*`, slices, unions, `length()`, `count()`, `match()`, `search()`. On JSON Lines, `$[?…]` tests each record |
 
@@ -179,8 +179,8 @@ The VSIX and the E2E report are uploaded as build artifacts.
 To publish a release, set `version` in `package.json`, commit, then push a matching tag:
 
 ```bash
-git tag v0.6.0
-git push origin v0.6.0
+git tag v0.7.0
+git push origin v0.7.0
 ```
 
 The workflow checks that the tag matches the version, runs the tests (also the host tests on VS Code 1.85, the oldest version `package.json` allows), and attaches the tested VSIX to a new GitHub Release.

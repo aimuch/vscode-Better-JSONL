@@ -3,7 +3,22 @@ import { errorMessage, errorOffset, stripBom } from '../shared/jsonText';
 import type { JsonPath, TextChange } from '../shared/protocol';
 import type { ItemStore } from './items';
 import { compileQuery, type Program } from './query';
-import { childKey, getAt, isContainer, isObj, parseJson, parsePath, plainText, primText, RawNum, stringifyPretty, type JObj, type JVal } from './json';
+import {
+  childKey,
+  compareNumbers,
+  getAt,
+  isContainer,
+  isObj,
+  parseJson,
+  parseNumLiteral,
+  parsePath,
+  plainText,
+  primText,
+  RawNum,
+  stringifyPretty,
+  type JObj,
+  type JVal,
+} from './json';
 
 export type Parsed =
   | { kind: 'value'; value: JVal }
@@ -79,6 +94,8 @@ export class ByteStore implements LineStore {
   private nStarts = 1;
   private lines = 0;
   private bomChecked = false;
+  /** The last chunk ended with CR (13); a leading LF (10) in the next chunk completes CR LF. */
+  private pendingCr = false;
   /** Lines written by the view (record edits of a large file), by line number. */
   private overlay: Map<number, Uint8Array> | undefined;
   /** Bytes the overlay adds to the file (it can be less than 0). */
@@ -92,20 +109,48 @@ export class ByteStore implements LineStore {
     return this.lines;
   }
 
+  private pushStart(pos: number): void {
+    if (this.nStarts === this.starts.length) {
+      const grown = new Float64Array(this.starts.length * 2);
+      grown.set(this.starts);
+      this.starts = grown;
+    }
+    this.starts[this.nStarts++] = pos;
+  }
+
   append(data: Uint8Array, done: boolean): void {
     if (data.length) {
       const base = this.total;
       this.chunks.push(data);
       this.chunkStart.push(base);
-      let p = data.indexOf(10);
-      while (p >= 0) {
-        if (this.nStarts === this.starts.length) {
-          const grown = new Float64Array(this.starts.length * 2);
-          grown.set(this.starts);
-          this.starts = grown;
+      let from = 0;
+      if (this.pendingCr) {
+        this.pendingCr = false;
+        if (data[0] === 10) {
+          this.starts[this.nStarts - 1] = base + 1;
+          from = 1;
         }
-        this.starts[this.nStarts++] = base + p + 1;
-        p = data.indexOf(10, p + 1);
+      }
+      if (data.indexOf(13, from) < 0) {
+        let p = data.indexOf(10, from);
+        while (p >= 0) {
+          this.pushStart(base + p + 1);
+          p = data.indexOf(10, p + 1);
+        }
+      } else {
+        for (let i = from; i < data.length; i++) {
+          const b = data[i];
+          if (b === 10) this.pushStart(base + i + 1);
+          else if (b === 13) {
+            if (i + 1 < data.length) {
+              if (data[i + 1] === 10) i++;
+              this.pushStart(base + i + 1);
+            } else {
+              this.pushStart(base + i + 1);
+              this.pendingCr = true;
+            }
+          }
+        }
       }
       this.total += data.length;
       // A UTF-8 byte order mark is not part of the first line. It can arrive split over two chunks.
@@ -116,7 +161,7 @@ export class ByteStore implements LineStore {
       }
     }
     this.done = done;
-    // The text after the last line feed is a line only when the file is complete.
+    // The text after the last line break is a line only when the file is complete.
     this.lines = this.nStarts - 1 + (done && this.starts[this.nStarts - 1] < this.total ? 1 : 0);
   }
 
@@ -259,7 +304,7 @@ export class DocModel {
   jsonc = false;
   /** The .json file holds one JSON value per line. */
   detectedJsonl = false;
-  /** Bytes-backed: a file too large for VS Code to give to an extension. It is read-only. */
+  /** Bytes-backed: a file streamed from disk (>50 MB, or compressed). */
   readonly large: boolean;
   /** JSON Lines from text: the text ended with a line end (the empty last line is not a record). */
   private readonly endsWithEol: boolean = false;
@@ -277,12 +322,13 @@ export class DocModel {
   private readonly colSet = new Set<string>();
   private scanCols: string[] = [];
   private readonly scanSet = new Set<string>();
+  private scanNonObj = false;
   private colsFinal = false;
   /** Grows when a record turns out to be invalid. The Formatted view gives those records two rows. */
   errorsVersion = 0;
 
   /** `src`: the text, the byte store of a large file, or the records of a JSON Lines document (with `endsWithEol`). */
-  constructor(src: string | ByteStore | ItemStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false) {
+  constructor(src: string | ByteStore | ItemStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false, preferJsonl = false) {
     this.isJsonl = isJsonl;
     if (Array.isArray(src)) {
       this.large = false;
@@ -317,7 +363,7 @@ export class DocModel {
       const lines = text.split(EOL);
       const endsWithEol = dropLastEmpty(lines);
       const nonBlank = lines.filter((l) => /\S/.test(l));
-      if (nonBlank.length > 1 && nonBlank.every((l) => tryParse(l).kind === 'value')) {
+      if (preferJsonl || (nonBlank.length > 1 && nonBlank.every((l) => tryParse(l).kind === 'value'))) {
         this.isJsonl = true;
         this.detectedJsonl = true;
         this.endsWithEol = endsWithEol;
@@ -365,7 +411,13 @@ export class DocModel {
     else if (k === K_VALUE) this.valid--;
     if (i < this.kinds.length) this.kinds[i] = 0;
     this.cache.delete(i);
-    if (this.scanned > i) this.scanned = i;
+    if (this.scanned > i) {
+      this.scanned = 0;
+      this.scanCols = [];
+      this.scanSet.clear();
+      this.scanNonObj = false;
+      this.colsFinal = false;
+    }
     this.errorsVersion++;
   }
 
@@ -476,9 +528,14 @@ export class DocModel {
     return p.kind === 'value' ? p.value : undefined;
   }
 
+  /** Parsed result of record i for a pass over all records: a limited cache is left alone. */
+  scanParsed(i: number): Parsed {
+    return this.cache.get(i) ?? (this.limited ? this.parse(i) : this.get(i));
+  }
+
   /** The value of record i for a pass over all records: a limited cache is left alone. */
   scanValue(i: number): JVal | undefined {
-    const p = this.cache.get(i) ?? (this.limited ? this.parse(i) : this.get(i));
+    const p = this.scanParsed(i);
     return p.kind === 'value' ? p.value : undefined;
   }
 
@@ -490,11 +547,14 @@ export class DocModel {
       const i = this.scanned++;
       // A limited cache is for the records on screen: the scan does not fill it.
       const v = this.scanValue(i);
-      if (v !== undefined && isObj(v)) {
-        for (const k in v) {
-          if (!this.scanSet.has(k)) {
-            this.scanSet.add(k);
-            this.scanCols.push(k);
+      if (v !== undefined) {
+        if (!isObj(v)) this.scanNonObj = true;
+        else {
+          for (const k in v) {
+            if (!this.scanSet.has(k)) {
+              this.scanSet.add(k);
+              this.scanCols.push(k);
+            }
           }
         }
       }
@@ -503,6 +563,7 @@ export class DocModel {
     if (this.complete && !this.colsFinal) {
       this.colsFinal = true;
       this.columns = this.scanCols;
+      this.hasNonObject = this.scanNonObj;
     }
     return this.complete;
   }
@@ -535,11 +596,16 @@ export class DocModel {
     while (tail < max - head && la[la.length - 1 - tail] === lb[lb.length - 1 - tail]) tail++;
     const shift = lb.length - la.length;
     const tailFrom = la.length - tail;
-    const map = (r: number) => (r < head ? r : r >= tailFrom && r < la.length ? r + shift : -1);
+    const map = (r: number) => {
+      if (r < 0 || r >= la.length) return -1;
+      if (r < head) return r;
+      if (r >= tailFrom) return r + shift;
+      return shift === 0 && la[r] === lb[r] ? r : -1;
+    };
     for (let r = 0; r < la.length; r++) {
       const k = old.kinds[r];
-      if (!k || (r >= head && r < tailFrom)) continue;
-      const to = r < head ? r : r + shift;
+      const to = map(r);
+      if (!k || to < 0) continue;
       this.kinds[to] = k;
       if (k === K_BLANK) this.blank++;
       else if (k === K_ERROR) this.errors++;
@@ -779,11 +845,10 @@ export function matchesRecord(model: DocModel, i: number, q: Query): boolean {
       return v === undefined || valueText(v) !== want;
     case '>':
     case '<': {
-      if (v === undefined) return false;
-      const a = typeof v === 'number' ? v : v instanceof RawNum ? Number(v.src) : Number.NaN;
-      const b = Number(want);
-      if (Number.isNaN(a) || Number.isNaN(b)) return false;
-      return q.op === '>' ? a > b : a < b;
+      if (v === undefined || (typeof v !== 'number' && !(v instanceof RawNum))) return false;
+      if (!want || Number.isNaN(Number(want))) return false;
+      const cmp = compareNumbers(v, parseNumLiteral(want));
+      return q.op === '>' ? cmp > 0 : cmp < 0;
     }
   }
   return false;

@@ -3,8 +3,8 @@ import { resolveLang, type LanguageSetting } from './shared/i18n';
 import type { ViewerConfig, WrapSetting } from './shared/protocol';
 
 /**
- * VS Code does not give extensions the text of a file above 50 MB. Better JSONL reads such a
- * file from disk itself and shows it read-only.
+ * VS Code does not give extensions the text of a file above 50 MB. Better JSONL streams such a
+ * file from disk in its own panel.
  */
 export const LARGE_FILE_BYTES = 50 * 1024 * 1024;
 
@@ -64,10 +64,14 @@ export function isJsonlPath(path: string): boolean {
   return JSONL_EXT.test(path);
 }
 
+export function isSupportedPath(path: string): boolean {
+  return JSONL_EXT.test(path) || /\.jsonc?$/i.test(path);
+}
+
 export function isJsonlDocument(doc: vscode.TextDocument): boolean {
   return doc.languageId === 'jsonl' || JSONL_EXT.test(doc.uri.path);
 }
 
 export function isSupportedDocument(doc: vscode.TextDocument): boolean {
-  return isJsonlDocument(doc) || doc.languageId === 'json' || doc.languageId === 'jsonc' || /\.json$/i.test(doc.uri.path);
+  return isJsonlDocument(doc) || doc.languageId === 'json' || doc.languageId === 'jsonc' || /\.jsonc?$/i.test(doc.uri.path);
 }

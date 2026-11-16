@@ -730,8 +730,85 @@ describe('Better JSONL · extension host', () => {
       await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', file);
       const s = await waitFor(() => (api.preview()?.resource?.fsPath === file.fsPath ? api.preview() : undefined), 'preview');
       await s.waitForReport((r) => parsed(r) && r.stats.lines === 1);
-      await s.handle({ type: 'readModules', keys: ['jq:lib/util', 'jq:common', 'json:conf', 'jq:nope'] });
-      assert.deepStrictEqual(s.lastModules, { 'jq:lib/util': 'def double: . * 2;', 'jq:common': 'def one: 1;', 'json:conf': '{"limit": 10}', 'jq:nope': null });
+      const outside = path.join(os.tmpdir(), `outside-${Date.now()}.jq`);
+      fs.writeFileSync(outside, 'def leak: 1;');
+      try {
+        await s.handle({ type: 'readModules', keys: ['jq:lib/util', 'jq:common', 'json:conf', 'jq:nope', `jq:${outside}`, 'jq:../../outside'] });
+        assert.deepStrictEqual(s.lastModules, {
+          'jq:lib/util': 'def double: . * 2;',
+          'jq:common': 'def one: 1;',
+          'json:conf': '{"limit": 10}',
+          'jq:nope': null,
+          [`jq:${outside}`]: null,
+          'jq:../../outside': null,
+        });
+      } finally {
+        fs.rmSync(outside, { force: true });
+      }
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H33 real multi-chunk export handshake, non-JSON tab guard, UTF-16 BOM follow, and sticky JSONL in .json', async function () {
+    this.timeout(60000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-'));
+    try {
+      // 1. Real multi-chunk (>2 MB) Webview <-> Host export handshake without mocking either side.
+      const srcPath = path.join(dir, 'multi.jsonl');
+      const pad = 'x'.repeat(200);
+      const srcLines: string[] = [];
+      for (let i = 0; i < 12000; i++) srcLines.push(`{"id":${i},"pad":"${pad}"}`);
+      fs.writeFileSync(srcPath, srcLines.join('\n') + '\n');
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', vscode.Uri.file(srcPath));
+      const s = await waitFor(
+        () => (api.preview()?.resource?.fsPath === srcPath ? api.preview() : undefined),
+        'preview for multi.jsonl',
+      );
+      await s.waitForReport((r) => r.fileName === 'multi.jsonl' && parsed(r), 20000);
+      const outPath = path.join(dir, 'exported.jsonl');
+      s.testExportTarget = vscode.Uri.file(outPath);
+      s.post({ type: 'exportRows', which: 'rows', format: 'jsonl' });
+      await waitFor(() => fs.existsSync(outPath) && fs.statSync(outPath).size >= fs.statSync(srcPath).size, 'all chunks written and closed', 20000);
+      assert.strictEqual(fs.readFileSync(outPath, 'utf8'), srcLines.join('\n') + '\n');
+
+      // 2. Active Markdown editor with no URI argument does not replace or open as JSON.
+      const md = await vscode.workspace.openTextDocument({ language: 'markdown', content: '# Not JSON\n' });
+      await vscode.window.showTextDocument(md, { viewColumn: vscode.ViewColumn.One });
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide');
+      await settle(250);
+      assert.notStrictEqual(api.preview()?.resource?.toString(), md.uri.toString(), 'markdown document is not opened in Better JSONL');
+
+      // 3. UTF-16LE BOM streamed file keeps its UTF-16LE encoding when followed with appendNew.
+      const u16 = path.join(dir, 'u16.jsonl');
+      fs.writeFileSync(u16, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"n":1}\r\n{"n":2}\r\n', 'utf16le')]));
+      s.bind({ uri: vscode.Uri.file(u16), bytes: fs.statSync(u16).size });
+      let r = await s.waitForReport((x) => x.fileName === 'u16.jsonl' && !x.loading && parsed(x), 15000);
+      assert.strictEqual(r.stats.valid, 2);
+      await s.handle({ type: 'follow', on: true });
+      fs.appendFileSync(u16, Buffer.from('{"n":"名3"}\r\n', 'utf16le'));
+      await s.waitForReport((x) => x.stats.lines === 3 && parsed(x), 15000);
+      s.post({ type: 'selection', lines: [2], active: 2 });
+      r = await s.waitForReport((x) => x.active === 2 && parsed(x), 15000);
+      assert.deepStrictEqual([r.stats.valid, r.activeText], [3, '{"n":"名3"}']);
+      s.panel.dispose();
+
+      // 4. Editing a .json file that holds JSON Lines keeps JSONL mode when one line has a syntax error.
+      const lj = path.join(dir, 'lines-edit.json');
+      fs.writeFileSync(lj, '{"k":1}\n{"k":2}\n{"k":3}\n');
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(lj));
+      await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', doc.uri);
+      await waitFor(() => api.preview()?.document === doc, 'preview for lines-edit.json');
+      const ps = api.preview() as ViewerSession;
+      await ps.waitForReport((x) => x.fileName === 'lines-edit.json' && x.isJsonl && x.stats.valid === 3);
+      const we = new vscode.WorkspaceEdit();
+      we.replace(doc.uri, doc.lineAt(1).range, '{"k": ');
+      await vscode.workspace.applyEdit(we);
+      r = await ps.waitForReport((x) => x.version === doc.version && parsed(x));
+      assert.deepStrictEqual([r.isJsonl, r.stats.valid, r.stats.errors], [true, 2, 1]);
+      await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('workbench.action.files.revert');
     } finally {
       removeDir(dir);
     }

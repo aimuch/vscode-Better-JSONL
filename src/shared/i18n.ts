@@ -223,6 +223,7 @@ const ZH: Record<string, string> = {
   'Parsing {0}…': '正在解析 {0}…',
   'This file is {0}. Expand all parses every line: it can take a while and use a lot of memory.': '此文件有 {0}。全部展开会解析每一行，可能要等一会儿，并占用较多内存。',
   'Expanding all lines…': '正在展开全部行…',
+  'Expanding all lines… {0}%': '正在展开全部行… {0}%',
   'All lines are pretty-printed. This file is over {0}: you confirm first.': '展开全部行。此文件超过 {0}，展开前需要确认。',
   'This file is read-only here: it is too large for VS Code to edit through an extension.': '此文件在这里是只读的：它太大，VS Code 不允许扩展编辑。',
   '↑/↓ move · Shift extends · double-click jumps to source': '↑/↓ 移动 · Shift 扩展选择 · 双击跳到源码',
@@ -233,6 +234,8 @@ const ZH: Record<string, string> = {
   'jq: reading modules {0}…': 'jq：正在读取模块 {0}…',
   Reload: '重新加载',
   'Better JSONL opens compressed files named .json.gz, .jsonl.gz or .ndjson.gz.': 'Better JSONL 只打开名为 .json.gz、.jsonl.gz 或 .ndjson.gz 的压缩文件。',
+  'Better JSONL opens compressed files named .json.gz, .jsonl.gz, .ndjson.gz or .jsonlines.gz.':
+    'Better JSONL 只打开名为 .json.gz、.jsonl.gz、.ndjson.gz 或 .jsonlines.gz 的压缩文件。',
   'New lines were added to the file.': '文件末尾添加了新行。',
   'A record must stay on one line.': '一条记录必须保持在一行内。',
   'This file is read-only here: it is not on this computer.': '此文件在这里是只读的：它不在本机上。',

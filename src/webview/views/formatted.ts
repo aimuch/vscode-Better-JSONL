@@ -1,6 +1,6 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
-import type { App, View } from '../app';
+import { defer, type App, type View } from '../app';
 import { childKey, decodeKey, esc, highlightRaw } from '../json';
 import { icon } from '../icons';
 import { isTextQuery, K_ERROR, K_VALUE, stepIn } from '../model';
@@ -12,6 +12,7 @@ const RAW_PREVIEW_CHARS = 2000;
 /** With word wrap on, more of a long line is shown (it wraps instead of being cut). */
 const WRAP_PREVIEW_CHARS = 20000;
 const LINE_CACHE = 300;
+const MEASURED_CACHE = 20000;
 const WIDE = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]/g;
 
 /** Columns a string takes in a monospace font: CJK and full-width characters take two. */
@@ -25,7 +26,7 @@ function visualColumns(s: string): number {
  * collapsed = 1 row, expanded = its pretty lines, error = 2 rows.
  * Only the rows on screen are in the DOM.
  * Without word wrap every row is one line high. With word wrap a row's height is
- * estimated from its text, then measured once it is on screen.
+ * estimated from its length, then updated in O(log n) in a Fenwick tree once on screen.
  */
 export class FormattedView implements View {
   readonly el: HTMLElement;
@@ -39,6 +40,8 @@ export class FormattedView implements View {
   private total = 0;
   private ratio = 1;
   private readonly heights = new Map<number, number>();
+  /** Compact height cache for Expand all (0 = unknown). */
+  private allHeights: Int32Array | null = null;
   private readonly lineCache = new Map<number, PLine[]>();
   private modelRef: unknown;
   private rendered = 0;
@@ -46,15 +49,17 @@ export class FormattedView implements View {
   /** JSON mode: pretty line numbers that match the search. */
   private focusPath: string | null = null;
   private matchesSeen = -1;
-  /** Word wrap: top of every row in px (length total + 1), or null when not wrapping. */
-  private rowPx: Float64Array | null = null;
+  /** Word wrap: 1-based Fenwick tree of row heights in px, and each row's current height. */
+  private rowBit: Float64Array | null = null;
+  private rowCur: Float32Array | null = null;
+  private rowTotalPx = 0;
+  private highBit = 0;
   /** Word wrap: measured row heights. Key: the record number for a collapsed record, "record:state:line" otherwise. */
   private readonly measured = new Map<number | string, number>();
+  private readonly measuredExpanded = new Set<number>();
   /** The model's errorsVersion this layout was made for. */
   private errorsSeen = -1;
   private relayout = 0;
-  /** Word wrap: estimated height of collapsed and error rows, by record. */
-  private readonly estimates = new Map<number, number>();
   private wrapCols = 0;
   private lastWidth = 0;
   private remeasuring = false;
@@ -74,6 +79,8 @@ export class FormattedView implements View {
         this.lastWidth = w;
         this.onWrapChanged();
         this.layout();
+      } else if (this.ratio < 1) {
+        this.applyScrollHeight();
       }
       this.paint();
     });
@@ -96,11 +103,12 @@ export class FormattedView implements View {
   }
 
   render(anchor?: number): void {
-    const before = anchor !== undefined ? this.rowTopPx(anchor) - this.scroller.scrollTop : undefined;
+    const virtBefore = anchor !== undefined ? this.recordVirtTop(anchor) : -1;
+    const screenOffset = virtBefore >= 0 ? virtBefore - this.virtTop() : undefined;
     this.layout();
-    if (anchor !== undefined && before !== undefined) {
-      const after = this.rowTopPx(anchor);
-      if (after >= 0) this.scroller.scrollTop = after - before;
+    if (anchor !== undefined && screenOffset !== undefined) {
+      const virtAfter = this.recordVirtTop(anchor);
+      if (virtAfter >= 0) this.scroller.scrollTop = this.toScrollTop(virtAfter - screenOffset);
     }
     this.paint();
   }
@@ -115,21 +123,67 @@ export class FormattedView implements View {
 
   onWrapChanged(): void {
     this.measured.clear();
-    this.estimates.clear();
+    this.measuredExpanded.clear();
     this.wrapCols = 0;
   }
 
   onActiveChanged(scroll: boolean): void {
     if (!scroll) return;
     const r = this.app.state.active;
-    const top = this.rowTopPx(r);
-    if (top < 0) return;
     const i = this.indexOf(r);
-    const h = (this.topOf(this.offsets[i + 1]) - this.topOf(this.offsets[i])) * this.ratio;
-    const st = this.scroller.scrollTop;
-    const vh = this.scroller.clientHeight;
-    if (top < st || top + Math.min(h, vh) > st + vh) this.scroller.scrollTop = Math.max(0, top - vh / 3);
+    if (i < 0 || i >= this.offsets.length - 1) return;
+    const top = this.topOf(this.offsets[i]);
+    const h = this.topOf(this.offsets[i + 1]) - top;
+    const vt = this.virtTop();
+    const vh = this.scroller.clientHeight || 600;
+    if (top < vt || top + Math.min(h, vh) > vt + vh) {
+      this.scroller.scrollTop = this.toScrollTop(top - vh / 3);
+    }
     this.paint();
+  }
+
+  /** Precomputes record heights in slices before turning on Expand all on a large file. */
+  prepareExpandAll(onProgress: (pct: number) => void, onDone: () => void): () => void {
+    const m = this.app.model;
+    const n = m.count;
+    if (!this.allHeights || this.allHeights.length < n) {
+      const next = new Int32Array(Math.max(n, 1024));
+      if (this.allHeights) next.set(this.allHeights.subarray(0, Math.min(this.allHeights.length, next.length)));
+      this.allHeights = next;
+    }
+    const arr = this.allHeights;
+    if (n <= 20_000) {
+      for (let r = 0; r < n; r++) if (!arr[r]) arr[r] = this.computeRecordHeight(r);
+      return defer(onDone, 30);
+    }
+    let r = 0;
+    let cancelled = false;
+    let stop = () => undefined as void;
+    let lastPaint = 0;
+    const step = () => {
+      if (cancelled || this.app.model !== m) return;
+      const end = performance.now() + 12;
+      while (r < n) {
+        if (!arr[r]) arr[r] = this.computeRecordHeight(r);
+        r++;
+        if ((r & 127) === 0 && performance.now() > end) break;
+      }
+      if (r >= n) {
+        onDone();
+        return;
+      }
+      const now = performance.now();
+      if (now - lastPaint > 200) {
+        lastPaint = now;
+        onProgress(Math.floor((r / n) * 100));
+      }
+      stop = defer(step);
+    };
+    stop = defer(step, 30);
+    return () => {
+      cancelled = true;
+      stop();
+    };
   }
 
   stepMatch(dir: 1 | -1): void {
@@ -168,7 +222,7 @@ export class FormattedView implements View {
       path = childKey(path, seg);
     });
     if (opened) {
-      this.heights.delete(0);
+      this.invalidateHeight(0);
       this.lineCache.delete(0);
       this.forgetMeasured(0);
     }
@@ -177,10 +231,10 @@ export class FormattedView implements View {
     this.layout();
     const j = this.linesOf(0).findIndex((l) => l.path === key && l.kind !== 'close');
     if (j >= 0) {
-      const top = this.topOf(j) * this.ratio;
-      const st = this.scroller.scrollTop;
-      const vh = this.scroller.clientHeight;
-      if (top < st || top + this.app.rh > st + vh) this.scroller.scrollTop = Math.max(0, top - vh / 3);
+      const top = this.topOf(j);
+      const vt = this.virtTop();
+      const vh = this.scroller.clientHeight || 600;
+      if (top < vt || top + this.app.rh > vt + vh) this.scroller.scrollTop = this.toScrollTop(top - vh / 3);
     }
     this.paint();
   }
@@ -190,7 +244,7 @@ export class FormattedView implements View {
     // "Collapse all" folds everything below the root; the toggles of single nodes start again.
     app.folds(0).clear();
     app.state.foldDepth = collapse ? 1 : Infinity;
-    this.heights.delete(0);
+    this.invalidateHeight(0);
     this.lineCache.delete(0);
     this.forgetMeasured(0);
     this.scroller.scrollTop = 0;
@@ -237,6 +291,19 @@ export class FormattedView implements View {
     return !app.model.isJsonl || app.expandAll || app.state.selected.has(r);
   }
 
+  private invalidateHeight(r: number): void {
+    this.heights.delete(r);
+    if (this.allHeights && r < this.allHeights.length) this.allHeights[r] = 0;
+  }
+
+  private computeRecordHeight(r: number): number {
+    const m = this.app.model;
+    const p = this.app.expandAll ? m.scanParsed(r) : m.get(r);
+    if (p.kind === 'blank') return 1;
+    if (p.kind === 'error') return 2;
+    return countLines(p.value, this.app.foldsOf(r), this.app.foldDepthOf());
+  }
+
   /**
    * Rows of record r. A collapsed record is not parsed for this: it has one row, or two when
    * it is already known to be invalid. The view lays out again when more errors are found.
@@ -244,12 +311,22 @@ export class FormattedView implements View {
   private recordHeight(r: number): number {
     const m = this.app.model;
     if (!this.isExpanded(r)) return m.kind(r) === K_ERROR ? 2 : 1;
-    const p = m.get(r);
-    if (p.kind === 'blank') return 1;
-    if (p.kind === 'error') return 2;
+    if (this.app.expandAll) {
+      if (!this.allHeights || this.allHeights.length < m.count) {
+        const next = new Int32Array(Math.max(m.count, (this.allHeights?.length ?? 512) * 2));
+        if (this.allHeights) next.set(this.allHeights);
+        this.allHeights = next;
+      }
+      let h = this.allHeights[r];
+      if (!h) {
+        h = this.computeRecordHeight(r);
+        this.allHeights[r] = h;
+      }
+      return h;
+    }
     let h = this.heights.get(r);
     if (h === undefined) {
-      h = countLines(p.value, this.app.foldsOf(r), this.app.foldDepthOf());
+      h = this.computeRecordHeight(r);
       this.heights.set(r, h);
     }
     return h;
@@ -261,9 +338,10 @@ export class FormattedView implements View {
     if (this.modelRef !== m) {
       this.modelRef = m;
       this.heights.clear();
+      this.allHeights = null;
       this.lineCache.clear();
       this.measured.clear();
-      this.estimates.clear();
+      this.measuredExpanded.clear();
     }
     if (!m.isJsonl) this.recs = [0];
     else if (app.state.filterOnly && app.query.text) this.recs = app.matches;
@@ -275,7 +353,13 @@ export class FormattedView implements View {
     this.offsets = off;
     this.total = off[n];
     this.errorsSeen = m.errorsVersion;
-    this.rowPx = app.state.wrap ? this.buildRowPx() : null;
+    if (app.state.wrap) this.buildRowPx();
+    else {
+      this.rowBit = null;
+      this.rowCur = null;
+      this.rowTotalPx = 0;
+      this.highBit = 0;
+    }
     this.applyScrollHeight();
     // A new search result: the match that was in focus belongs to the old one.
     if (app.matchesVersion !== this.matchesSeen) {
@@ -286,33 +370,60 @@ export class FormattedView implements View {
 
   private applyScrollHeight(): void {
     const full = this.topOf(this.total);
-    this.ratio = full > MAX_SCROLL_PX ? MAX_SCROLL_PX / full : 1;
-    this.spacer.style.height = `${full * this.ratio}px`;
+    const vh = this.scroller.clientHeight || 600;
+    if (full > MAX_SCROLL_PX && full > vh) {
+      this.ratio = (MAX_SCROLL_PX - vh) / (full - vh);
+      this.spacer.style.height = `${MAX_SCROLL_PX}px`;
+    } else {
+      this.ratio = 1;
+      this.spacer.style.height = `${full}px`;
+    }
+  }
+
+  private virtTop(): number {
+    return this.scroller.scrollTop / this.ratio;
+  }
+
+  private toScrollTop(virtY: number): number {
+    const full = this.topOf(this.total);
+    const vh = this.scroller.clientHeight || 600;
+    return Math.max(0, Math.min(Math.max(0, full - vh), virtY)) * this.ratio;
   }
 
   /** Top of row k in unscaled px. */
   private topOf(k: number): number {
-    return this.rowPx ? this.rowPx[Math.min(k, this.total)] : k * this.app.rh;
+    const clamped = Math.max(0, Math.min(k, this.total));
+    if (!this.rowBit) return clamped * this.app.rh;
+    if (clamped === 0) return 0;
+    if (clamped >= this.total) return this.rowTotalPx;
+    let sum = 0;
+    for (let i = clamped; i > 0; i -= i & -i) sum += this.rowBit[i];
+    return sum;
   }
 
   /** The row at unscaled px y. */
   private rowAt(y: number): number {
-    if (!this.rowPx) return Math.floor(y / this.app.rh);
-    let lo = 0;
-    let hi = this.total - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (this.rowPx[mid] <= y) lo = mid;
-      else hi = mid - 1;
+    if (this.total <= 1 || y <= 0) return 0;
+    if (!this.rowBit) return Math.min(this.total - 1, Math.floor(y / this.app.rh));
+    const bit = this.rowBit;
+    const n = this.total;
+    let idx = 0;
+    let sum = 0;
+    for (let step = this.highBit; step > 0; step = Math.floor(step / 2)) {
+      const next = idx + step;
+      if (next <= n && sum + bit[next] <= y) {
+        idx = next;
+        sum += bit[next];
+      }
     }
-    return Math.max(0, lo);
+    return Math.min(idx, n - 1);
   }
 
-  /** Top of record r in scroller px, or -1 when it is not shown. */
-  private rowTopPx(r: number): number {
+  /** Top of record r in unscaled virtual px, or -1 when it is not shown. */
+  private recordVirtTop(r: number): number {
     const i = this.indexOf(r);
     if (i < 0 || i >= this.offsets.length - 1) return -1;
-    return this.topOf(this.offsets[i]) * this.ratio;
+    return this.topOf(this.offsets[i]);
   }
 
   // ---------- word wrap ----------
@@ -322,10 +433,22 @@ export class FormattedView implements View {
     return j === 0 && !expanded ? r : `${r}:${expanded ? 'e' : 'c'}:${j}`;
   }
 
+  private setMeasured(r: number, key: number | string, h: number): void {
+    if (this.measured.has(key)) this.measured.delete(key);
+    else if (this.measured.size >= MEASURED_CACHE) {
+      const oldest = this.measured.keys().next().value;
+      if (oldest !== undefined) this.measured.delete(oldest);
+    }
+    this.measured.set(key, h);
+    if (typeof key === 'string') this.measuredExpanded.add(r);
+  }
+
   private forgetMeasured(r: number): void {
-    const prefix = `${r}:`;
     this.measured.delete(r);
-    for (const k of [...this.measured.keys()]) if (typeof k === 'string' && k.startsWith(prefix)) this.measured.delete(k);
+    if (this.measuredExpanded.delete(r)) {
+      const prefix = `${r}:`;
+      for (const k of [...this.measured.keys()]) if (typeof k === 'string' && k.startsWith(prefix)) this.measured.delete(k);
+    }
   }
 
   /** Characters per visual line, from the width of the text column and the font. */
@@ -352,14 +475,8 @@ export class FormattedView implements View {
     const m = this.app.model;
     if (j === 1 && m.kind(r) === K_ERROR) return rh;
     if (m.kind(r) === K_ERROR || !this.isExpanded(r)) {
-      // A large file: the estimate comes from the line length alone, so no line is decoded for it.
-      if (m.large) return Math.max(1, Math.ceil(Math.min(m.lineSize(r), WRAP_PREVIEW_CHARS) / Math.max(10, this.columns()))) * rh;
-      let e = this.estimates.get(r);
-      if (e === undefined) {
-        e = this.wrapLines(m.head(r, WRAP_PREVIEW_CHARS)) * rh;
-        this.estimates.set(r, e);
-      }
-      return e;
+      // O(1) length estimate: no line is decoded or regex-scanned off screen; on-screen rows are measured.
+      return Math.max(1, Math.ceil(Math.min(m.lineSize(r), WRAP_PREVIEW_CHARS) / Math.max(10, this.columns()))) * rh;
     }
     const l = this.lineCache.get(r)?.[j];
     if (!l) return rh;
@@ -367,30 +484,65 @@ export class FormattedView implements View {
     return this.wrapLines(lineText(l), indent) * rh;
   }
 
-  private buildRowPx(): Float64Array {
-    const px = new Float64Array(this.total + 1);
-    const known = this.measured.size > 0;
+  private buildRowPx(): void {
+    const n = this.total;
+    if (n <= 0) {
+      this.rowBit = null;
+      this.rowCur = null;
+      this.rowTotalPx = 0;
+      this.highBit = 0;
+      return;
+    }
+    const bit = new Float64Array(n + 1);
+    const cur = new Float32Array(n);
+    const hasMeasured = this.measured.size > 0;
     let k = 0;
+    let totalPx = 0;
     for (let i = 0; i < this.recCount; i++) {
       const r = this.recAt(i);
       const h = this.offsets[i + 1] - this.offsets[i];
-      for (let j = 0; j < h; j++, k++) px[k + 1] = px[k] + ((known ? this.measured.get(this.rowKey(r, j)) : undefined) ?? this.estimate(r, j));
+      const expanded = this.isExpanded(r);
+      const recMeasured = hasMeasured && (expanded ? this.measuredExpanded.has(r) : this.measured.has(r));
+      for (let j = 0; j < h; j++, k++) {
+        const px = (recMeasured ? this.measured.get(this.rowKey(r, j)) : undefined) ?? this.estimate(r, j);
+        cur[k] = px;
+        totalPx += px;
+        const idx = k + 1;
+        bit[idx] += px;
+        const parent = idx + (idx & -idx);
+        if (parent <= n) bit[parent] += bit[idx];
+      }
     }
-    return px;
+    let hb = 1;
+    while (hb * 2 <= n) hb *= 2;
+    this.rowBit = bit;
+    this.rowCur = cur;
+    this.rowTotalPx = totalPx;
+    this.highBit = hb;
   }
 
-  /** Records the real height of the rows on screen. Returns true when an estimate was wrong. */
+  /** Updates the Fenwick tree in O(log n) with the real height of the rows on screen. */
   private measureRows(): boolean {
+    if (!this.rowBit || !this.rowCur) return false;
     let changed = false;
+    const bit = this.rowBit;
+    const cur = this.rowCur;
+    const n = this.total;
     for (const el of Array.from(this.rows.children) as HTMLElement[]) {
       if (!el.classList.contains('row')) continue;
       const r = Number(el.dataset.r);
       const j = Number(el.dataset.j);
+      const k = Number(el.dataset.row);
       const key = this.rowKey(r, j);
       const h = el.offsetHeight;
-      const known = this.measured.get(key) ?? this.estimate(r, j);
-      this.measured.set(key, h);
-      if (Math.abs(h - known) > 0.5) changed = true;
+      this.setMeasured(r, key, h);
+      if (k >= 0 && k < n && Math.abs(h - cur[k]) > 0.5) {
+        const delta = h - cur[k];
+        cur[k] = h;
+        this.rowTotalPx += delta;
+        for (let idx = k + 1; idx <= n; idx += idx & -idx) bit[idx] += delta;
+        changed = true;
+      }
     }
     return changed;
   }
@@ -439,7 +591,7 @@ export class FormattedView implements View {
       const r = this.recAt(i);
       const start = this.offsets[i];
       const h = this.offsets[i + 1] - start;
-      for (let j = row - start; j < h && row < last; j++, row++) html.push(this.rowHtml(r, j, h));
+      for (let j = row - start; j < h && row < last; j++, row++) html.push(this.rowHtml(r, j, h, row));
       i++;
     }
     const focus = this.focusedControl();
@@ -447,16 +599,17 @@ export class FormattedView implements View {
     this.rendered = html.length;
     if (focus) this.refocus(focus);
     if (isTextQuery(app.query)) this.markMatches(app.query.text);
-    if (this.rowPx && !this.remeasuring && this.measureRows()) {
-      // Keep the row at the top of the screen still while the heights above it change.
+    if (this.rowBit && !this.remeasuring) {
       const anchor = this.rowAt(virtTop);
       const into = virtTop - this.topOf(anchor);
-      this.rowPx = this.buildRowPx();
-      this.applyScrollHeight();
-      this.remeasuring = true;
-      this.scroller.scrollTop = (this.topOf(anchor) + into) * this.ratio;
-      this.paint();
-      this.remeasuring = false;
+      if (this.measureRows()) {
+        // Keep the row at the top of the screen still while the heights above it change.
+        this.applyScrollHeight();
+        this.remeasuring = true;
+        this.scroller.scrollTop = this.toScrollTop(this.topOf(anchor) + into);
+        this.paint();
+        this.remeasuring = false;
+      }
     }
     // Painting parsed the rows on screen. A record that turned out to be invalid needs a second row.
     if (app.model.errorsVersion !== this.errorsSeen && !this.relayout) {
@@ -487,7 +640,7 @@ export class FormattedView implements View {
     el?.focus({ preventScroll: true });
   }
 
-  private rowHtml(r: number, j: number, h: number): string {
+  private rowHtml(r: number, j: number, h: number, rowIdx: number): string {
     const app = this.app;
     const m = app.model;
     const s = app.state;
@@ -537,7 +690,7 @@ export class FormattedView implements View {
       }
       if (j === 0 && jsonl) actions = this.actionsHtml(r);
     }
-    return `<div class="${cls.join(' ')}" data-r="${r}" data-j="${j}"${path ? ` data-p="${esc(path)}"` : ''}><span class="gut">${gutter}</span><span class="fg">${fold}</span><span class="code-text"${indentStyle}>${code}</span>${actions}</div>`;
+    return `<div class="${cls.join(' ')}" data-r="${r}" data-j="${j}" data-row="${rowIdx}"${path ? ` data-p="${esc(path)}"` : ''}><span class="gut">${gutter}</span><span class="fg">${fold}</span><span class="code-text"${indentStyle}>${code}</span>${actions}</div>`;
   }
 
   /** The start of the raw line, highlighted. Only that part is read from the store. */
@@ -555,34 +708,59 @@ export class FormattedView implements View {
     return `<span class="acts">${edit}<button class="rbtn a-copy" data-r="${r}" title="${t('Copy the raw line')}">${icon('copy', 12)}${t('Copy')}</button><button class="rbtn a-goto" data-r="${r}" title="${t('Reveal in the text editor')}">${icon('goto', 12)}${t('Source')}</button></span>`;
   }
 
-
   private truncNote(more: number, bytes: boolean): string {
     return `<span class="trunc">${t(bytes ? ' … about {0} more bytes' : ' … {0} more chars', more.toLocaleString())}</span>`;
   }
 
+  /** Marks plain-text matches in `.code-text`, including matches spanning several token spans. */
   private markMatches(q: string): void {
-    const walker = document.createTreeWalker(this.rows, NodeFilter.SHOW_TEXT);
-    const hits: Text[] = [];
-    let n: Node | null;
-    while ((n = walker.nextNode())) {
-      const t = n as Text;
-      if (t.data.toLowerCase().includes(q) && !(t.parentElement?.closest('.gut,.acts'))) hits.push(t);
-    }
-    for (const t of hits) {
-      const text = t.data;
-      const lower = text.toLowerCase();
-      const frag = document.createDocumentFragment();
+    if (!q) return;
+    for (const codeEl of Array.from(this.rows.querySelectorAll<HTMLElement>('.code-text'))) {
+      const full = codeEl.textContent ?? '';
+      if (!full.toLowerCase().includes(q)) continue;
+      const nodes: { node: Text; start: number; end: number }[] = [];
+      const walker = document.createTreeWalker(codeEl, NodeFilter.SHOW_TEXT);
+      let clean = '';
+      let cur: Node | null;
+      while ((cur = walker.nextNode())) {
+        const textNode = cur as Text;
+        if (textNode.parentElement?.closest('.trunc')) continue;
+        const start = clean.length;
+        clean += textNode.data;
+        nodes.push({ node: textNode, start, end: clean.length });
+      }
+      const lower = clean.toLowerCase();
+      const spans: [number, number][] = [];
       let pos = 0;
       let k: number;
       while ((k = lower.indexOf(q, pos)) >= 0) {
-        if (k > pos) frag.appendChild(document.createTextNode(text.slice(pos, k)));
-        const mark = document.createElement('mark');
-        mark.textContent = text.slice(k, k + q.length);
-        frag.appendChild(mark);
+        spans.push([k, k + q.length]);
         pos = k + q.length;
       }
-      if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
-      t.replaceWith(frag);
+      if (!spans.length) continue;
+      for (const { node, start, end } of nodes) {
+        const text = node.data;
+        let localPos = 0;
+        let hit = false;
+        const frag = document.createDocumentFragment();
+        for (const [ms, me] of spans) {
+          if (me <= start) continue;
+          if (ms >= end) break;
+          const a = Math.max(localPos, Math.min(text.length, ms - start));
+          const b = Math.max(a, Math.min(text.length, me - start));
+          if (b <= a) continue;
+          hit = true;
+          if (a > localPos) frag.appendChild(document.createTextNode(text.slice(localPos, a)));
+          const mark = document.createElement('mark');
+          mark.textContent = text.slice(a, b);
+          frag.appendChild(mark);
+          localPos = b;
+        }
+        if (hit) {
+          if (localPos < text.length) frag.appendChild(document.createTextNode(text.slice(localPos)));
+          node.replaceWith(frag);
+        }
+      }
     }
   }
 
@@ -607,7 +785,7 @@ export class FormattedView implements View {
       const f = app.folds(r);
       if (f.has(key)) f.delete(key);
       else f.add(key);
-      this.heights.delete(r);
+      this.invalidateHeight(r);
       this.lineCache.delete(r);
       this.forgetMeasured(r);
       this.render(r);

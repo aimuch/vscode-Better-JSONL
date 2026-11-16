@@ -114,12 +114,15 @@ const SETTING_VALUES: Record<SettingKey, (v: unknown) => boolean> = {
 export class ViewerSession implements vscode.Disposable {
   private uri: vscode.Uri | undefined;
   private doc: vscode.TextDocument | undefined;
-  /** Set when the file is streamed from disk (read-only). */
+  /** Set when the file is streamed from disk (above 50 MB, or compressed). */
   private large: Large | undefined;
   private appending = false;
   private appendAgain = false;
   /** Exports in progress, by id: where the text goes. */
-  private readonly exports = new Map<number, { write(data: string): Promise<void>; finish(): Promise<void>; uri: vscode.Uri; rows: number }>();
+  private readonly exports = new Map<
+    number,
+    { write(data: string): Promise<void>; finish(): Promise<void>; abort(): Promise<void>; uri: vscode.Uri; rows: number }
+  >();
   /** The E2E tests set this: the export goes there, with no save dialog. */
   testExportTarget: vscode.Uri | undefined;
   /** What the webview shows the document as. The webview decides (a .json file can hold JSON Lines). */
@@ -279,6 +282,8 @@ export class ViewerSession implements vscode.Disposable {
     this.generation++;
     clearTimeout(this.updateTimer);
     clearTimeout(this.noticeTimer);
+    for (const e of this.exports.values()) void e.abort();
+    this.exports.clear();
     this.watcher?.dispose();
     this.disposables.forEach((d) => d.dispose());
     this.disposeEmitter.fire();
@@ -392,6 +397,7 @@ export class ViewerSession implements vscode.Disposable {
       let tail: Buffer = Buffer.alloc(0);
       for await (const piece of readUtf8(uri, { gzip: large.gzip, encoding: large.encoding, to: state?.size })) {
         if (!current()) return;
+        large.encoding = piece.encoding;
         if (prev) await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev.data, done: false, read: prev.read } satisfies HostMessage);
         prev = piece;
         decoded += piece.data.length;
@@ -501,14 +507,17 @@ export class ViewerSession implements vscode.Disposable {
         if ((await compare(uri.fsPath, large.state)) !== 'grew') return;
         const generation = this.generation;
         const now = await fileState(uri.fsPath);
-        for await (const piece of readUtf8(uri, { gzip: false, encoding: large.encoding, from: large.state.size, to: now.size })) {
+        const unit = large.encoding === 'utf-16le' || large.encoding === 'utf-16be' ? 2 : 1;
+        const alignedSize = now.size - ((now.size - large.state.size) % unit);
+        if (alignedSize <= large.state.size) return;
+        for await (const piece of readUtf8(uri, { gzip: false, encoding: large.encoding, from: large.state.size, to: alignedSize, detectBom: false })) {
           if (this.disposed || generation !== this.generation || this.large !== large) return;
           if (piece.data.length) await this.panel.webview.postMessage({ type: 'append', version: generation, data: piece.data } satisfies HostMessage);
           large.decoded = (large.decoded ?? 0) + piece.data.length;
           large.decodedTail = tailOf(large.decodedTail ?? Buffer.alloc(0), piece.data);
         }
-        large.state = now;
-        large.bytes = now.size;
+        large.state = alignedSize === now.size ? now : await fileState(uri.fsPath);
+        large.bytes = large.state.size;
       } while (this.appendAgain);
     } catch (e) {
       this.post({ type: 'notice', message: t('Better JSONL could not read the file: {0}', errorMessage(e)) });
@@ -566,7 +575,7 @@ export class ViewerSession implements vscode.Disposable {
   private synced(doc: vscode.TextDocument): void {
     this.syncedVersion = doc.version;
     // Only JSON Lines documents are patched: one JSON value is parsed again as a whole anyway.
-    this.edits = isJsonlDocument(doc) ? [] : undefined;
+    this.edits = isJsonlDocument(doc) || this.jsonl ? [] : undefined;
     this.editChars = 0;
   }
 
@@ -646,6 +655,9 @@ export class ViewerSession implements vscode.Disposable {
         case 'docMode': {
           const changed = this.jsonl !== m.isJsonl;
           this.jsonl = m.isJsonl;
+          if (changed && this.doc && this.doc.version === this.syncedVersion) {
+            this.edits = this.jsonl ? (this.edits ?? []) : undefined;
+          }
           const editor = this.visibleEditor();
           if (changed && editor) this.sendSelection(editor.selections);
           break;
@@ -665,10 +677,10 @@ export class ViewerSession implements vscode.Disposable {
           await this.revealPath(m.line, m.path);
           break;
         case 'editLine':
-          await this.editLine(m.line, m.original, m.text, !!m.exact);
+          await this.editLine(m.line, m.original, m.text, !!m.exact, m.cell);
           break;
         case 'editValue':
-          await this.editValue(m.path, m.version, m.text);
+          await this.editValue(m.path, m.version, m.text, m.cell);
           break;
         case 'follow':
           if (this.large) {
@@ -683,7 +695,7 @@ export class ViewerSession implements vscode.Disposable {
           await this.exportStart(m.id, m.format, m.name, m.rows);
           break;
         case 'exportData':
-          await this.exportData(m.id, m.data, m.done);
+          await this.exportData(m.id, m.data, m.done, m.cancel);
           break;
         case 'diff':
           await this.env.showDiff(m.left, m.right);
@@ -725,22 +737,34 @@ export class ViewerSession implements vscode.Disposable {
 
   /**
    * jq modules: "jq:path" is path.jq (or path/name.jq), "json:path" is path.json, both relative
-   * to the folder of the document (or of the workspace for an untitled one). Null when not found.
+   * to the folder of the document (or of the workspace for an untitled one). Null when not found,
+   * outside the document/workspace roots, or above 10 MB.
    */
   private async readModules(keys: string[]): Promise<Record<string, string | null>> {
+    const MAX_MODULE_BYTES = 10 * 1024 * 1024;
     const out: Record<string, string | null> = {};
     const doc = this.uri;
     const folder = doc && doc.scheme !== 'untitled' ? vscode.Uri.joinPath(doc, '..') : vscode.workspace.workspaceFolders?.[0]?.uri;
+    const roots = [...(folder ? [folder] : []), ...(vscode.workspace.workspaceFolders ?? []).map((w) => w.uri)];
+    const withinAllowed = (u: vscode.Uri) =>
+      roots.some((r) => {
+        if (u.scheme !== r.scheme || u.authority !== r.authority) return false;
+        const prefix = r.path.endsWith('/') ? r.path : r.path + '/';
+        return u.path === r.path || u.path.startsWith(prefix);
+      });
     for (const key of keys.slice(0, 50)) {
       const [kind, ...rest] = key.split(':');
       const name = rest.join(':');
       const ext = kind === 'json' ? '.json' : '.jq';
-      const base = path.isAbsolute(name) ? vscode.Uri.file(name) : folder ? vscode.Uri.joinPath(folder, name) : undefined;
       out[key] = null;
-      if (!base) continue;
+      if (!folder || !name || path.posix.isAbsolute(name) || path.win32.isAbsolute(name) || name.startsWith('\\')) continue;
+      const base = vscode.Uri.joinPath(folder, ...name.split(/[\\/]+/));
       const candidates = name.endsWith(ext) ? [base] : [base.with({ path: base.path + ext }), vscode.Uri.joinPath(base, path.posix.basename(base.path) + ext)];
       for (const c of candidates) {
+        if (!withinAllowed(c)) continue;
         try {
+          const st = await vscode.workspace.fs.stat(c);
+          if (st.size > MAX_MODULE_BYTES) continue;
           out[key] = Buffer.from(await vscode.workspace.fs.readFile(c)).toString('utf8');
           break;
         } catch {
@@ -798,8 +822,8 @@ export class ViewerSession implements vscode.Disposable {
     }
   }
 
-  private async editLine(line: number, original: string, text: string, exact: boolean): Promise<void> {
-    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
+  private async editLine(line: number, original: string, text: string, exact: boolean, cell?: boolean): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message, cell });
     try {
       JSON.parse(text);
     } catch (e) {
@@ -807,7 +831,7 @@ export class ViewerSession implements vscode.Disposable {
     }
     const out = exact ? text : minifyJson(text);
     if (/[\r\n]/.test(out)) return fail(t('A record must stay on one line.'));
-    if (this.large) return this.editLargeLine(line, original, out);
+    if (this.large) return this.editLargeLine(line, original, out, cell);
     // The live document: the check below must see what is in the file now.
     const doc = await this.liveDoc();
     if (!doc) return fail(t('No document.'));
@@ -817,15 +841,15 @@ export class ViewerSession implements vscode.Disposable {
     const edit = new vscode.WorkspaceEdit();
     edit.replace(doc.uri, doc.lineAt(line).range, out);
     const ok = await vscode.workspace.applyEdit(edit);
-    this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.') });
+    this.post(ok ? { type: 'editResult', ok: true, cell } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.'), cell });
   }
 
   /**
    * A record of a large file: the line is replaced on disk (the file is written again).
    * It works when the file is as the view read it and the line still has the text the edit started from.
    */
-  private async editLargeLine(line: number, original: string, text: string): Promise<void> {
-    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
+  private async editLargeLine(line: number, original: string, text: string, cell?: boolean): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message, cell });
     const large = this.large;
     const uri = this.uri;
     if (!large || !uri) return;
@@ -841,15 +865,15 @@ export class ViewerSession implements vscode.Disposable {
     } catch (e) {
       return fail(e instanceof LineConflict ? t('Line {0} changed after the edit started. Nothing was written.', line + 1) : e instanceof EncodeError ? t('Nothing was written: {0}.', errorMessage(e)) : errorMessage(e));
     }
-    this.post({ type: 'editResult', ok: true, line, text });
+    this.post({ type: 'editResult', ok: true, line, text, cell });
   }
 
   /**
    * One JSON document: the value at `path` gets the JSON `text`. Only that span of the file
    * changes, so the rest stays as it is (spacing, comments, number text).
    */
-  private async editValue(jsonPath: JsonPath, version: number, text: string): Promise<void> {
-    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message });
+  private async editValue(jsonPath: JsonPath, version: number, text: string, cell?: boolean): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message, cell });
     if (this.large) return fail(t('This file is read-only here: open it as text to edit it.'));
     try {
       JSON.parse(text);
@@ -864,7 +888,7 @@ export class ViewerSession implements vscode.Disposable {
     const edit = new vscode.WorkspaceEdit();
     edit.replace(doc.uri, new vscode.Range(doc.positionAt(span.offset), doc.positionAt(span.offset + span.length)), text);
     const ok = await vscode.workspace.applyEdit(edit);
-    this.post(ok ? { type: 'editResult', ok: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.') });
+    this.post(ok ? { type: 'editResult', ok: true, cell } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.'), cell });
   }
 
   /** Export: asks where to save, then opens the file for the pieces that follow. */
@@ -889,6 +913,10 @@ export class ViewerSession implements vscode.Disposable {
           await fh.write(data, null, 'utf8');
         },
         finish: () => fh.close(),
+        abort: async () => {
+          await fh.close().catch(() => undefined);
+          await fs.promises.rm(target.fsPath, { force: true }).catch(() => undefined);
+        },
       });
     } else {
       const parts: Buffer[] = [];
@@ -899,24 +927,33 @@ export class ViewerSession implements vscode.Disposable {
           parts.push(Buffer.from(data, 'utf8'));
         },
         finish: () => Promise.resolve(vscode.workspace.fs.writeFile(target, Buffer.concat(parts))),
+        abort: async () => undefined,
       });
     }
     this.post({ type: 'exportReady', id, ok: true });
   }
 
-  private async exportData(id: number, data: string, done: boolean): Promise<void> {
+  private async exportData(id: number, data: string, done: boolean, cancel?: boolean): Promise<void> {
     const e = this.exports.get(id);
     if (!e) return;
+    if (cancel) {
+      this.exports.delete(id);
+      await e.abort();
+      return;
+    }
     try {
       if (data) await e.write(data);
-      if (!done) return;
+      if (!done) {
+        this.post({ type: 'exportReady', id, ok: true });
+        return;
+      }
       this.exports.delete(id);
       await e.finish();
       const name = path.posix.basename(e.uri.path);
       this.post({ type: 'exportDone', id, ok: true, message: t('Saved {0} rows to {1}.', e.rows.toLocaleString(), name) });
     } catch (err) {
       this.exports.delete(id);
-      await e.finish().catch(() => undefined);
+      await e.abort();
       this.post({ type: 'exportDone', id, ok: false, message: t('The export failed: {0}', errorMessage(err)) });
     }
   }
@@ -958,6 +995,9 @@ export class ViewerSession implements vscode.Disposable {
   }
 
   private async exportFile(format: 'svg' | 'png', data: string, name: string): Promise<void> {
+    if (format === 'png' && !data.startsWith('data:image/png;base64,')) {
+      throw new Error('PNG export failed (the graph image is too large for a canvas)');
+    }
     const dir = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
     const target = await vscode.window.showSaveDialog({
       defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
