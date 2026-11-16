@@ -760,9 +760,10 @@ describe('Better JSONL · extension host', () => {
       const srcLines: string[] = [];
       for (let i = 0; i < 12000; i++) srcLines.push(`{"id":${i},"pad":"${pad}"}`);
       fs.writeFileSync(srcPath, srcLines.join('\n') + '\n');
-      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', vscode.Uri.file(srcPath));
+      const srcUri = vscode.Uri.file(srcPath);
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', srcUri);
       const s = await waitFor(
-        () => (api.preview()?.resource?.fsPath === srcPath ? api.preview() : undefined),
+        () => (api.preview()?.resource?.fsPath === srcUri.fsPath ? api.preview() : undefined),
         'preview for multi.jsonl',
       );
       await s.waitForReport((r) => r.fileName === 'multi.jsonl' && parsed(r), 20000);
@@ -770,6 +771,7 @@ describe('Better JSONL · extension host', () => {
       s.testExportTarget = vscode.Uri.file(outPath);
       s.post({ type: 'exportRows', which: 'rows', format: 'jsonl' });
       await waitFor(() => fs.existsSync(outPath) && fs.statSync(outPath).size >= fs.statSync(srcPath).size, 'all chunks written and closed', 20000);
+      await settle(50);
       assert.strictEqual(fs.readFileSync(outPath, 'utf8'), srcLines.join('\n') + '\n');
 
       // 2. Active Markdown editor with no URI argument does not replace or open as JSON.
