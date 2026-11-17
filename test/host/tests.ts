@@ -550,7 +550,7 @@ describe('Better JSONL · extension host', () => {
     } finally {
       await cfg().update('indent', undefined, vscode.ConfigurationTarget.Workspace);
       await cfg().update('indent', undefined, vscode.ConfigurationTarget.Global);
-      if (!hadDir) fs.rmSync(settingsDir, { recursive: true, force: true });
+      if (!hadDir) removeDir(settingsDir);
     }
   });
 

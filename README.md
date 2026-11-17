@@ -176,16 +176,9 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request,
 
 The VSIX and the E2E report are uploaded as build artifacts.
 
-To publish a release, set `version` in `package.json`, commit, then push a matching tag:
+On every push to `main` (or a manual `workflow_dispatch` run, or a `v*` tag push), after all test jobs (including VS Code 1.85 compatibility) pass, the `release` job reads `version` from `package.json` (`v<version>`) and automatically creates the GitHub Release — or replaces the `.vsix` offline installer asset on the existing release when `version` is unchanged. To publish a new version, update `version` in `package.json`, commit, and push to `main`.
 
-```bash
-git tag v0.7.0
-git push origin v0.7.0
-```
-
-The workflow checks that the tag matches the version, runs the tests (also the host tests on VS Code 1.85, the oldest version `package.json` allows), and attaches the tested VSIX to a new GitHub Release.
-
-It also publishes to the Visual Studio Marketplace when the repository has a `VSCE_PAT` secret, and to Open VSX when it has an `OVSX_PAT` secret. Without them these steps are skipped. The `publisher` in `package.json` must be a publisher that the token can publish for.
+When a new release is created, the workflow also publishes to the Visual Studio Marketplace when the repository has a `VSCE_PAT` secret, and to Open VSX when it has an `OVSX_PAT` secret. Without them these steps are skipped. The `publisher` in `package.json` must be a publisher that the token can publish for.
 
 ## License
 
