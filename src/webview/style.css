@@ -25,6 +25,13 @@ body {
   --err-bg: var(--vscode-inputValidation-errorBackground, rgba(244, 135, 113, 0.12));
   --mono: var(--vscode-editor-font-family, Menlo, Consolas, monospace);
   --mono-size: var(--vscode-editor-font-size, 13px);
+  --ic-cyan: #3ec5ff;
+  --ic-amber: #ffb547;
+  --ic-violet: #b48cff;
+  --ic-mint: #4ec9b0;
+  --ic-blue: #6cb6ff;
+  --ic-coral: #f28b82;
+  --ic-slate: #9ca6b8;
 }
 
 body.vscode-light {
@@ -32,6 +39,13 @@ body.vscode-light {
   --tok-string: #a31515;
   --tok-number: #098658;
   --tok-keyword: #0000ff;
+  --ic-cyan: #0284c7;
+  --ic-amber: #d97706;
+  --ic-violet: #7c3aed;
+  --ic-mint: #059669;
+  --ic-blue: #2563eb;
+  --ic-coral: #dc2626;
+  --ic-slate: #64748b;
 }
 
 body.vscode-high-contrast {
@@ -47,6 +61,13 @@ body.vscode-high-contrast-light {
   --tok-string: #a31515;
   --tok-number: #096d48;
   --tok-keyword: #0f4a85;
+  --ic-cyan: #0369a1;
+  --ic-amber: #b45309;
+  --ic-violet: #6d28d9;
+  --ic-mint: #047857;
+  --ic-blue: #1d4ed8;
+  --ic-coral: #b91c1c;
+  --ic-slate: #475569;
 }
 
 /* Theme setting "Dark" (VS Code Dark Modern colors). */
@@ -104,6 +125,13 @@ body[data-theme='dark'] {
   --tok-string: #ce9178;
   --tok-number: #b5cea8;
   --tok-keyword: #569cd6;
+  --ic-cyan: #3ec5ff;
+  --ic-amber: #ffb547;
+  --ic-violet: #b48cff;
+  --ic-mint: #4ec9b0;
+  --ic-blue: #6cb6ff;
+  --ic-coral: #f28b82;
+  --ic-slate: #9ca6b8;
 }
 
 /* Theme setting "Light" (VS Code Light Modern colors). */
@@ -161,6 +189,13 @@ body[data-theme='light'] {
   --tok-string: #a31515;
   --tok-number: #098658;
   --tok-keyword: #0000ff;
+  --ic-cyan: #0284c7;
+  --ic-amber: #d97706;
+  --ic-violet: #7c3aed;
+  --ic-mint: #059669;
+  --ic-blue: #2563eb;
+  --ic-coral: #dc2626;
+  --ic-slate: #64748b;
 }
 
 * {
@@ -221,6 +256,61 @@ button {
 
 .ic {
   flex-shrink: 0;
+}
+
+.ic .ic-2 {
+  stroke: var(--ic-2, currentColor);
+}
+
+.seg-btn[data-view='formatted']:not(.on) .ic {
+  color: var(--ic-cyan);
+}
+
+.seg-btn[data-view='grid']:not(.on) .ic {
+  color: var(--ic-amber);
+}
+
+.seg-btn[data-view='graph']:not(.on) .ic {
+  color: var(--ic-violet);
+}
+
+.search > .ic {
+  color: var(--ic-blue);
+}
+
+.filter-btn .ic,
+.gh-f.on .ic {
+  color: var(--ic-amber);
+}
+
+.follow-btn .ic {
+  color: var(--ic-slate);
+  --ic-2: var(--ic-mint);
+}
+
+.compare-btn .ic {
+  color: var(--ic-cyan);
+  --ic-2: var(--ic-violet);
+}
+
+.export-btn .ic,
+[data-export] .ic {
+  color: var(--ic-cyan);
+}
+
+.wrap-btn .ic {
+  color: var(--ic-slate);
+  --ic-2: var(--ic-amber);
+}
+
+.open-text .ic {
+  color: var(--ic-blue);
+  --ic-2: var(--ic-coral);
+}
+
+.gear-btn .ic {
+  color: var(--ic-violet);
+  --ic-2: var(--ic-amber);
 }
 
 [hidden] {
