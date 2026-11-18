@@ -22,10 +22,14 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Large integers (for example `9007199254740993`) are shown exactly as written.
 - Edit one record in a pretty-printed editor. It is saved back as one compact line.
 - Double-click any line to jump to that member in the source.
+- **Nested JSON-in-String Unpack**: strings that hold serialized JSON (`"{...}"`, `"[...]"`, or multi-line JSONL) show an inline `JSON {N}` / `JSON [N]` pill — click to unpack and browse them as native JSON trees in place.
+- **Multiline & Markdown Value Inspector**: strings with `\n` expand inline (`↵ N lines text`), and right-clicking any value opens the **Value Inspector** (`Text`, sanitized `Markdown`, pretty `JSON`, and `Decoded` views for Unix/ISO timestamps + time delta, JWTs, Base64, and URL query strings).
 - **Word wrap**: press `Alt+Z` (`Option+Z` on macOS) in the view, or use the wrap button in the toolbar. Wrapped parts of a pretty line keep its indent.
+- **Bookmarks & Timeline**: press `B` (or `Alt+Click` the line number) to bookmark lines, `[` / `]` to jump between bookmarks, and open the **Timeline** bar to see time-bucketed volume, error spikes, and drag-to-filter time windows.
 - **Follow** (the arrow button, JSON Lines): the view stays at the last line while lines are added, like `tail -f`.
 - **Compare**: select two lines, then press the compare button. A panel lists the differences field by field (added, removed, changed); **Open in the diff editor** shows the two records side by side in VS Code.
-- **Export** (the download button): the lines on screen (all lines, or the search result) or the selected lines, as JSON Lines (the raw lines) or CSV (one column per key, UTF-8 with a byte order mark).
+- **Schema & Batch Rewrite**: generate **TypeScript**, **JSON Schema**, **Pydantic**, or **Zod** definitions from your records, or run a **Batch `jq` rewrite** with before/after diff preview (plus right-click **Insert / Duplicate / Delete line**).
+- **Export** (the download button): the lines on screen (all lines, or the search/filter result) or the selected lines, as **JSON Lines (`.jsonl`)**, **CSV (`.csv`)**, **JSON Array (`.json`)**, or **Markdown Table (`.md`)**.
 
 ### Grid view
 
@@ -33,10 +37,11 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Nested objects and arrays open as sub-grids under the row, starting under the column you opened. Arrays of objects show as tables.
 - Word wrap (`Alt+Z`) wraps long cell values.
 - Sort by any column. Drag a header edge to resize.
-- Filter by any column: the funnel button in a header lists the column's values with counts. Untick values, or type to keep only cells that contain the text. Filters on several columns combine, and each value list follows the other filters.
-- Column statistics at the top of the filter popup: the types and their counts, the number of distinct values, min / max / mean of the numbers, and the shortest and longest text.
-- **Edit a cell**: double-click a value (text, number, true / false / null). `Enter` writes it, `Esc` cancels. Only that value changes in the file: the rest of the line or document stays as it is. A text cell stays text; in another cell type a JSON value (`"…"` makes text).
-- Export the rows on screen (after search, filters and sort) as JSON Lines or CSV.
+- **Columns manager**: search columns, show/hide, reorder left/right, **pin** columns sticky to the left edge, and mount columns beyond the default 300-column cap.
+- Filter by any column: the funnel button in a header lists the column's values with counts, `Min` / `Max` numeric range inputs, and a text filter. Untick values, set a numeric range, or type to keep only matching cells. Filters on several columns combine, and **Clear all filters** in the status bar resets active filters in one click.
+- Column statistics at the top of the filter popup: types and counts, distinct values, `min · max · mean`, `p50 · p95 · p99` percentiles, `sum`, a 12-bin distribution histogram, and shortest / longest text.
+- **Edit a cell**: double-click a value (including missing cells on object rows and primitive cells inside nested sub-grids). `Enter` writes it, `Esc` cancels. Only that value changes in the file: the rest of the line or document stays as it is.
+- Export the rows on screen (after search, filters and sort) as JSON Lines, CSV, JSON Array, or Markdown Table.
 
 ![Grid view](docs/screenshots/grid.png)
 
@@ -81,7 +86,7 @@ Type plain text, a path query, or a jq or JSONPath query:
 | `.ms as $t \| select($t > 100)`, `reduce .items[] as $i (0; . + $i.n)`, `def big: .ms > 100; select(big)` | jq variables and patterns (`as $x`, `as [$a, $b]`, `as {a: $x}`), `reduce`, `foreach`, `def` (with filter and `$value` parameters, recursion), `try … catch`, `label` / `break`, and assignment (`=`, `\|=`, `+=`, `//=`, …) on a copy of the value |
 | `$..user[?@.name == "Ada"]` | **JSONPath** (RFC 9535, a search that starts with `$`): filters, `..`, `*`, slices, unions, `length()`, `count()`, `match()`, `search()`. On JSON Lines, `$[?…]` tests each record |
 
-The counter says when the search is jq or JSONPath. A query that is not valid is searched as text, and the status bar says why.
+The counter says when the search is jq or JSONPath. Use the search bar toggles for **Match Case** (`Aa`), **Regular Expression** (`.*`), **Literal Text** (`""`), **Query History / Saved Queries** (`↑` / `↓`, `★`), and **jq Transform** (which projects the query's output values into a virtual document across Formatted, Grid, Graph, Schema Generator, and Export). A query that is not valid is searched as text, and the status bar says why.
 
 More jq:
 
@@ -96,8 +101,8 @@ In one JSON document (not JSON Lines), jq and JSONPath results are places in the
 
 ### Keyboard
 
-- `Cmd/Ctrl+F` goes to the search box; `Enter` and `Shift+Enter` step through the matches.
-- JSON Lines: `↑` / `↓` move the current line, `Shift` extends the selection, `Enter` edits the record, `Cmd/Ctrl+C` copies the selected lines.
+- `Cmd/Ctrl+F` goes to the search box; `Enter` and `Shift+Enter` step through the matches; `↑` / `↓` in the search box recall recent queries.
+- JSON Lines: `↑` / `↓` move the current line, `Shift` extends the selection, `B` toggles a bookmark (`[` / `]` jump to previous / next bookmark), `Enter` edits the record, `Cmd/Ctrl+C` copies the selected lines.
 - `Tab` reaches every control. Fold arrows: `Enter` or `Space`. Grid headers: `Enter` sorts.
 - Graph nodes: `Enter` selects (the inspector shows the node), `←` folds, `→` unfolds; `+`, `-` and `0` zoom in, zoom out and fit.
 
@@ -127,6 +132,7 @@ All commands are also in the Command Palette under `Better JSONL: …`.
 |---------|--------------|
 | **Better JSONL: Expand Selected Lines** (right-click menu) | Pretty-prints the selected lines in place (each line that is a JSON value). It uses the editor's own indentation (Tab Size, spaces or tabs). A reminder then offers **Compact Lines**; choose **Don't Show Again** to turn it off. |
 | **Better JSONL: Compact Lines** (right-click menu) | Turns the selections (or the whole file) back into one record per line. Blank lines stay. Nothing changes if any record is invalid. |
+| **Better JSONL: Convert JSON Array ↔ JSON Lines** (right-click menu) | Losslessly converts a top-level JSON array `[...]` into one record per line (`jsonl`), or wraps JSON Lines records into a pretty-printed JSON array (`json`), preserving >53-bit integer tokens. |
 
 Both commands are in the right-click menu and the Command Palette for JSON and JSON Lines files. In a `.json` file, Compact Lines with no selection makes the whole document one compact line.
 | **Format Document** on a `.jsonl` file | Off by default: Format Document does not change JSONL files. Turn on `betterJsonl.formatDocument.enabled` to make each line compact and canonical. It never expands records, because that would break the JSONL format. |

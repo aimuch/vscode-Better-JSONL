@@ -90,6 +90,7 @@ describe('Better JSONL · extension host', () => {
       'betterJsonl.toggleExpandMode',
       'betterJsonl.expandLines',
       'betterJsonl.compactLines',
+      'betterJsonl.convertFormat',
     ]) {
       assert.ok(all.includes(id), id);
     }
@@ -732,8 +733,14 @@ describe('Better JSONL · extension host', () => {
       await s.waitForReport((r) => parsed(r) && r.stats.lines === 1);
       const outside = path.join(os.tmpdir(), `outside-${Date.now()}.jq`);
       fs.writeFileSync(outside, 'def leak: 1;');
+      const escLink = path.join(dir, 'escape.jq');
       try {
-        await s.handle({ type: 'readModules', keys: ['jq:lib/util', 'jq:common', 'json:conf', 'jq:nope', `jq:${outside}`, 'jq:../../outside'] });
+        fs.symlinkSync(outside, escLink);
+      } catch {
+        // Ignore on Windows without symlink privilege.
+      }
+      try {
+        await s.handle({ type: 'readModules', keys: ['jq:lib/util', 'jq:common', 'json:conf', 'jq:nope', `jq:${outside}`, 'jq:../../outside', 'jq:escape'] });
         assert.deepStrictEqual(s.lastModules, {
           'jq:lib/util': 'def double: . * 2;',
           'jq:common': 'def one: 1;',
@@ -741,6 +748,7 @@ describe('Better JSONL · extension host', () => {
           'jq:nope': null,
           [`jq:${outside}`]: null,
           'jq:../../outside': null,
+          'jq:escape': null,
         });
       } finally {
         fs.rmSync(outside, { force: true });
@@ -810,6 +818,69 @@ describe('Better JSONL · extension host', () => {
       r = await ps.waitForReport((x) => x.version === doc.version && parsed(x));
       assert.deepStrictEqual([r.isJsonl, r.stats.valid, r.stats.errors], [true, 2, 1]);
       await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('workbench.action.files.revert');
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H34 v0.8 convertFormat, mutateLines (TextDocument & .gz), and JSON/Markdown/TypeScript exports', async function () {
+    this.timeout(30000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-v08-'));
+    try {
+      // 1. Convert JSON Array <-> JSON Lines losslessly in-place via betterJsonl.convertFormat.
+      const arrFile = path.join(dir, 'items.json');
+      fs.writeFileSync(arrFile, '[\n  { "id": 9007199254740993, "v": "a" },\n  { "id": 2, "v": "b" }\n]\n');
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(arrFile));
+      await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('betterJsonl.convertFormat');
+      assert.strictEqual(doc.languageId, 'jsonl');
+      assert.strictEqual(doc.getText(), '{"id":9007199254740993,"v":"a"}\n{"id":2,"v":"b"}\n');
+      await vscode.commands.executeCommand('betterJsonl.convertFormat');
+      assert.strictEqual(doc.languageId, 'json');
+      assert.ok(doc.getText().startsWith('[\n') && doc.getText().includes('9007199254740993'));
+      await vscode.commands.executeCommand('workbench.action.files.revert');
+
+      // 2. mutateLines (insert, rewrite, delete) on an open TextDocument session + JSON Array & Markdown exports.
+      const jlFile = path.join(dir, 'mut.jsonl');
+      fs.writeFileSync(jlFile, '{"id":1,"name":"Ada"}\n{"id":2,"name":"Lin"}\n');
+      const jlDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(jlFile));
+      await vscode.window.showTextDocument(jlDoc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', jlDoc.uri);
+      const s = await waitFor(() => (api.preview()?.document === jlDoc ? api.preview() : undefined), 'preview for mut.jsonl');
+      await s.waitForReport((x) => x.fileName === 'mut.jsonl' && x.stats.valid === 2);
+
+      await s.handle({ type: 'mutateLines', version: jlDoc.version, mutation: { op: 'insert', after: 0, text: '{"id":3,"name":"Kai"}' } });
+      await s.waitForReport((x) => x.stats.valid === 3);
+      await s.handle({
+        type: 'mutateLines',
+        version: jlDoc.version,
+        mutation: { op: 'rewrite', edits: [{ line: 1, original: '{"id":3,"name":"Kai"}', text: '{"id":30,"name":"Kai"}' }] },
+      });
+      await s.waitForReport((x) => x.version === jlDoc.version && parsed(x));
+      assert.ok(jlDoc.getText().includes('{"id":30,"name":"Kai"}'));
+      await s.handle({ type: 'mutateLines', version: jlDoc.version, mutation: { op: 'delete', lines: [0] } });
+      const rAfter = await s.waitForReport((x) => x.stats.valid === 2);
+      assert.strictEqual(rAfter.stats.valid, 2);
+
+      const jsonOut = path.join(dir, 'rows.json');
+      s.testExportTarget = vscode.Uri.file(jsonOut);
+      s.post({ type: 'exportRows', which: 'rows', format: 'json' });
+      await waitFor(() => fs.existsSync(jsonOut) && fs.readFileSync(jsonOut, 'utf8').trimEnd().endsWith(']'), 'json array export');
+      assert.strictEqual(JSON.parse(fs.readFileSync(jsonOut, 'utf8')).length, 2);
+
+      const mdOut = path.join(dir, 'rows.md');
+      s.testExportTarget = vscode.Uri.file(mdOut);
+      s.post({ type: 'exportRows', which: 'rows', format: 'md' });
+      await waitFor(() => fs.existsSync(mdOut) && fs.statSync(mdOut).size > 10, 'markdown export');
+      assert.ok(fs.readFileSync(mdOut, 'utf8').startsWith('| id | name |\n| --- | --- |\n'));
+
+      const tsOut = path.join(dir, 'mut.types.ts');
+      s.testExportTarget = vscode.Uri.file(tsOut);
+      await s.handle({ type: 'export', format: 'ts', data: 'export interface Mut { id: number; }\n', name: 'mut.types' });
+      assert.strictEqual(fs.readFileSync(tsOut, 'utf8'), 'export interface Mut { id: number; }\n');
+
+      await vscode.window.showTextDocument(jlDoc, { viewColumn: vscode.ViewColumn.One, preview: false });
       await vscode.commands.executeCommand('workbench.action.files.revert');
     } finally {
       removeDir(dir);

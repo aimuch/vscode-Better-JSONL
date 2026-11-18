@@ -14,16 +14,18 @@ type Option = [value: string, label: string];
 export class SettingsPanel {
   readonly el: HTMLElement;
   private readonly content: HTMLElement;
+  private opener: HTMLElement | null = null;
   open = false;
 
   constructor(private readonly app: App) {
     this.el = document.createElement('div');
     this.el.className = 'settings';
     this.el.setAttribute('role', 'dialog');
+    this.el.setAttribute('aria-modal', 'true');
     this.el.setAttribute('aria-label', t('Better JSONL settings'));
     this.el.innerHTML = `
       <div class="settings-head"><h2>${t('Settings')}</h2><span class="dim">Better JSONL</span><button class="icon-btn settings-close" aria-label="${t('Close settings')}">${icon('close', 16)}</button></div>
-      <div class="settings-content"></div>
+      <div class="settings-content" tabindex="0"></div>
       <div class="settings-foot"><span class="dim">${t('Saved to your VS Code settings.')}</span><a href="#" class="settings-link">${t('Open in VS Code Settings')}</a></div>`;
     this.content = this.el.querySelector('.settings-content') as HTMLElement;
     this.el.querySelector('.settings-close')!.addEventListener('click', () => this.close());
@@ -33,6 +35,16 @@ export class SettingsPanel {
     });
     this.content.addEventListener('click', (e) => this.onClick(e));
     this.content.addEventListener('change', (e) => this.onChange(e));
+    this.el.addEventListener('keydown', (e) => this.onKeyDown(e));
+    document.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (!this.open) return;
+        const target = e.target as HTMLElement;
+        if (!this.el.contains(target) && !target.closest('.gear-btn')) this.close();
+      },
+      { signal: this.app.shellSignal },
+    );
   }
 
   toggle(): void {
@@ -41,6 +53,7 @@ export class SettingsPanel {
   }
 
   show(): void {
+    if (!this.open && document.activeElement instanceof HTMLElement) this.opener = document.activeElement;
     this.open = true;
     this.refresh();
     this.el.classList.add('active');
@@ -49,17 +62,49 @@ export class SettingsPanel {
   }
 
   close(): void {
+    if (!this.open) return;
     this.open = false;
     this.el.classList.remove('active');
+    const back = this.opener;
+    this.opener = null;
+    if (back && document.contains(back)) back.focus({ preventScroll: true });
     this.app.stateChanged();
+  }
+
+  private onKeyDown(e: KeyboardEvent): void {
+    if (e.key === 'Tab') {
+      const focusable = Array.from(this.el.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), a[href], [tabindex="0"]'));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+      return;
+    }
+    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && (e.target as HTMLElement).closest('.settings-seg')) {
+      const btn = (e.target as HTMLElement).closest('.seg-btn') as HTMLElement | null;
+      const grp = btn?.closest('.settings-seg');
+      if (!btn || !grp) return;
+      e.preventDefault();
+      const btns = Array.from(grp.querySelectorAll<HTMLElement>('.seg-btn'));
+      const idx = btns.indexOf(btn);
+      const next = btns[(idx + (e.key === 'ArrowRight' ? 1 : -1) + btns.length) % btns.length];
+      next.focus();
+      next.click();
+    }
   }
 
   /** Re-renders from the current config (after a change from here or from settings.json). */
   refresh(): void {
     if (!this.open) return;
     const c = this.app.config;
-    const seg = (key: SettingKey, options: Option[], selected: string) =>
-      `<div class="seg settings-seg" role="radiogroup" data-key="${key}">${options
+    const seg = (key: SettingKey, groupLabel: string, options: Option[], selected: string) =>
+      `<div class="seg settings-seg" role="radiogroup" aria-label="${esc(groupLabel)}" data-key="${key}">${options
         .map(([v, label]) => `<button role="radio" class="seg-btn sub${v === selected ? ' on' : ''}" aria-checked="${v === selected}" data-value="${esc(v)}">${esc(label)}</button>`)
         .join('')}</div>`;
     const row = (label: string, control: string, hint = '') =>
@@ -67,23 +112,22 @@ export class SettingsPanel {
     const check = (key: SettingKey, label: string, value: boolean, hint: string) =>
       `<label class="settings-check"><input type="checkbox" data-key="${key}"${value ? ' checked' : ''}><span><span class="settings-check-label">${esc(label)}</span><span class="settings-hint">${esc(hint)}</span></span></label>`;
     const alt = navigator.platform.includes('Mac') ? '⌥Z' : 'Alt+Z';
-    // 2 and 4, and the value in use when settings.json has another one (the setting allows 1 to 8).
     const indents = [...new Set([2, 4, c.indent])].sort((a, b) => a - b);
     this.content.innerHTML = `
       <section class="settings-section"><h3>${t('APPEARANCE')}</h3>
-        ${row(t('Theme'), seg('theme', [['vscode', t('Follow VS Code')], ['light', t('Light')], ['dark', t('Dark')], ['system', t('Follow system')]], c.theme))}
-        ${row(t('Word wrap'), seg('wordWrap', [['followEditor', t('Follow editor')], ['on', t('On')], ['off', t('Off')]], c.wordWrap), t('{0} toggles wrap in the open view.', alt))}
-        ${row(t('Indent'), seg('indent', indents.map((n) => [String(n), t('{0} spaces', n)]), String(c.indent)), t('Used by the views and the record editor.'))}
+        ${row(t('Theme'), seg('theme', t('Theme'), [['vscode', t('Follow VS Code')], ['light', t('Light')], ['dark', t('Dark')], ['system', t('Follow system')]], c.theme))}
+        ${row(t('Word wrap'), seg('wordWrap', t('Word wrap'), [['followEditor', t('Follow editor')], ['on', t('On')], ['off', t('Off')]], c.wordWrap), t('{0} toggles wrap in the open view.', alt))}
+        ${row(t('Indent'), seg('indent', t('Indent'), indents.map((n) => [String(n), t('{0} spaces', n)]), String(c.indent)), t('Used by the views and the record editor.'))}
       </section>
       <section class="settings-section"><h3>${t('LANGUAGE')}</h3>
         <div class="settings-control">
-          ${seg('language', [['auto', t('Follow VS Code (current: {0})', languageName(c.vscodeLanguage))], ['en', 'English'], ['zh-cn', '简体中文']], c.language)}
+          ${seg('language', t('LANGUAGE'), [['auto', t('Follow VS Code (current: {0})', languageName(c.vscodeLanguage))], ['en', 'English'], ['zh-cn', '简体中文']], c.language)}
           <span class="settings-hint">${esc(t('Right-click menus and the VS Code Settings editor always use the VS Code display language.'))}</span>
         </div>
       </section>
       <section class="settings-section"><h3>${t('VIEWS')}</h3>
-        ${row(t('Default view'), seg('defaultView', [['formatted', t('Formatted')], ['grid', t('Grid')], ['graph', t('Graph')]], c.defaultView))}
-        ${row(t('JSON Lines'), seg('jsonl.expandMode', [['focus', t('Focus')], ['all', t('Expand all')]], c.expandMode), t('The mode a new view starts in.'))}
+        ${row(t('Default view'), seg('defaultView', t('Default view'), [['formatted', t('Formatted')], ['grid', t('Grid')], ['graph', t('Graph')]], c.defaultView))}
+        ${row(t('JSON Lines'), seg('jsonl.expandMode', t('JSON Lines'), [['focus', t('Focus')], ['all', t('Expand all')]], c.expandMode), t('The mode a new view starts in.'))}
         ${row(t('Graph nodes'), `<input class="settings-num" type="number" min="50" max="20000" step="50" data-key="graph.maxNodes" value="${c.graphMaxNodes}" aria-label="${esc(t('Graph node limit'))}">`, t('The graph stops adding nodes after this number.'))}
       </section>
       <section class="settings-section"><h3>${t('TEXT EDITOR')}</h3>
@@ -95,7 +139,6 @@ export class SettingsPanel {
   }
 
   private set(key: SettingKey, value: unknown): void {
-    // Show theme changes at once; the host confirms with a config message.
     if (key === 'theme') {
       this.app.config = { ...this.app.config, theme: value as never };
       this.app.applyTheme();

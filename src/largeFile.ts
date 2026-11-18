@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import { Readable } from 'stream';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
+import { t } from './shared/i18n';
 
 /** A large file goes to the webview in pieces of about this size. */
 export const CHUNK = 4 * 1024 * 1024;
@@ -151,7 +152,7 @@ function makeDecoder(label: string, ignoreBOM: boolean): TextDecoder {
   try {
     return new TextDecoder(label, { ignoreBOM });
   } catch {
-    throw new Error(`the encoding "${label}" is not supported`);
+    throw new Error(t('the encoding "{0}" is not supported', label));
   }
 }
 
@@ -166,4 +167,4 @@ function concat(parts: Buffer[], size: number): Uint8Array {
   return out;
 }
 
-export { compare, fileState, LineConflict, replaceLine, type FileState } from './fileEdit';
+export { compare, fileState, LineConflict, mutateFileLines, replaceLine, TAIL, type FileState } from './fileEdit';

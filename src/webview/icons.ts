@@ -1,4 +1,4 @@
-// Inline stroke icons. They use currentColor, so they follow the theme.
+// Inline stroke icons. They use currentColor (plus optional --ic-2 dual-tone accent), so they follow the theme.
 const P: Record<string, string> = {
   formatted: '<path d="M3 3.5h10M5 6.5h8M5 9.5h6M3 12.5h10"/>',
   grid: '<rect x="2" y="3" width="12" height="10" rx="1"/><path d="M2 6.5h12M2 9.8h12M6.5 3v10"/>',
@@ -27,6 +27,17 @@ const P: Record<string, string> = {
   wrap: '<path d="M2 3.5h12M2 12.5h3"/><path class="ic-2" d="M2 7.5h9.5a2.5 2.5 0 0 1 0 5H8M9.5 10.5 7.5 12.5l2 2"/>',
   gear:
     '<path d="M6.76 3.21 6.92 1.54h2.16l.16 1.67a4.95 4.95 0 0 1 2.29 1.32l1.52-.7 1.09 1.88-1.37.97a4.95 4.95 0 0 1 0 2.64l1.37.97-1.09 1.88-1.52-.7a4.95 4.95 0 0 1-2.29 1.32l-.16 1.67H6.92l-.16-1.67a4.95 4.95 0 0 1-2.29-1.32l-1.52.7-1.09-1.88 1.37-.97a4.95 4.95 0 0 1 0-2.64l-1.37-.97 1.09-1.88 1.52.7a4.95 4.95 0 0 1 2.29-1.32z"/><circle class="ic-2" cx="8" cy="8" r="1.95"/>',
+  bookmark: '<path d="M4 2.2h8a.8.8 0 0 1 .8.8v10.8L8 10.6l-4.8 3.2V3a.8.8 0 0 1 .8-.8z"/>',
+  columns: '<rect x="1.8" y="2.5" width="12.4" height="11" rx="1"/><path class="ic-2" d="M6 2.5v11M10 2.5v11"/>',
+  schema: '<path d="M5 3.2C3.8 3.2 3.2 3.8 3.2 5v1.6c0 .8-.5 1.4-1.4 1.4.9 0 1.4.6 1.4 1.4V11c0 1.2.6 1.8 1.8 1.8"/><path class="ic-2" d="M11 3.2c1.2 0 1.8.6 1.8 1.8v1.6c0 .8.5 1.4 1.4 1.4-.9 0-1.4.6-1.4 1.4V11c0 1.2-.6 1.8-1.8 1.8"/>',
+  timeline: '<path d="M2 13.5h12"/><path class="ic-2" d="M3.5 13.5V9M6.5 13.5V5M9.5 13.5V7.5M12.5 13.5V3.5"/>',
+  transform: '<path d="M2.5 5h6.5M2.5 11h4"/><path class="ic-2" d="M9.5 3.5 13.5 8l-4 4.5M6.5 8h7"/>',
+  history: '<circle cx="8" cy="8.5" r="5.2"/><path d="M8 5.6v3.2l2.2 1.3M3.2 4.5v2.4h2.4"/>',
+  star: '<path d="M8 2l1.8 3.7 4.1.6-3 2.9.7 4.1L8 11.4l-3.6 1.9.7-4.1-3-2.9 4.1-.6z"/>',
+  pin: '<path d="M5.5 2.5h5l-.6 4 2.1 2v1H4v-1l2.1-2z"/><path class="ic-2" d="M8 9.5v4.2"/>',
+  trash: '<path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.6 9h5.8l.6-9"/>',
+  wand: '<path d="M2.5 13.5 10.5 5.5"/><path class="ic-2" d="M12 2v2.5M10.75 3.25h2.5M13.5 7v2M12.5 8h2M7.5 2.5v2M6.5 3.5h2"/>',
+  inspect: '<rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path class="ic-2" d="M4.5 6h7M4.5 8.8h5M4.5 11.2h3.5"/>',
 };
 
 export function icon(name: string, size = 14): string {

@@ -7,6 +7,7 @@ import * as path from 'path';
 import { Readable } from 'stream';
 import * as zlib from 'zlib';
 import { encodeText } from './encoding';
+import type { LineMutation } from './shared/protocol';
 
 export interface FileState {
   size: number;
@@ -15,16 +16,17 @@ export interface FileState {
   tail: Buffer;
 }
 
-const TAIL = 4096;
+export const TAIL = 4096;
 
-export async function fileState(fsPath: string): Promise<FileState> {
+export async function fileState(fsPath: string, atSize?: number): Promise<FileState> {
   const fh = await fs.promises.open(fsPath, 'r');
   try {
     const st = await fh.stat();
-    const n = Math.min(TAIL, st.size);
+    const size = atSize !== undefined && atSize < st.size ? atSize : st.size;
+    const n = Math.min(TAIL, size);
     const tail = Buffer.alloc(n);
-    if (n) await fh.read(tail, 0, n, st.size - n);
-    return { size: st.size, mtimeMs: st.mtimeMs, tail };
+    if (n) await fh.read(tail, 0, n, size - n);
+    return { size, mtimeMs: size < st.size ? 0 : st.mtimeMs, tail };
   } finally {
     await fh.close();
   }
@@ -207,6 +209,7 @@ export async function replaceLine(
     if (!done) throw new LineConflict(`line ${line + 1} is not in the file`);
     sink.end();
     await closed;
+    await fs.promises.chmod(tmp, mode);
     await fs.promises.rename(tmp, realPath);
   } catch (e) {
     raw.destroy();
@@ -221,4 +224,129 @@ export async function replaceLine(
   }
   const lay = l ?? layoutOf(Buffer.alloc(0), opts.encoding);
   return { ...(await fileState(fsPath)), written: { total, tail, label: lay.label, lf: lay.lf } };
+}
+
+/**
+ * Inserts a line, deletes lines, or batch-rewrites lines atomically in a plain or gzip-compressed
+ * file while preserving BOM, encoding, line breaks, symlinks, and file permissions.
+ */
+export async function mutateFileLines(
+  fsPath: string,
+  mutation: LineMutation,
+  opts: { gzip: boolean; encoding: string },
+): Promise<FileState> {
+  const realPath = await fs.promises.realpath(fsPath);
+  const mode = (await fs.promises.stat(realPath)).mode & 0o777;
+  const tmp = path.join(path.dirname(realPath), `.${path.basename(realPath)}.${randomBytes(4).toString('hex')}.tmp`);
+  const raw = fs.createReadStream(realPath, { highWaterMark: 1024 * 1024 });
+  const source: Readable = opts.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 })) : raw;
+  raw.on('error', (e) => source.destroy(e));
+  const file = fs.createWriteStream(tmp, { mode });
+  const sink: NodeJS.WritableStream = opts.gzip ? zlib.createGzip({ chunkSize: 1024 * 1024 }) : file;
+  if (opts.gzip) (sink as zlib.Gzip).pipe(file);
+  const closed = new Promise<void>((resolve, reject) => {
+    file.on('close', resolve);
+    file.on('error', reject);
+  });
+  closed.catch(() => undefined);
+  const delSet = mutation.op === 'delete' ? new Set(mutation.lines) : null;
+  const rewriteMap = mutation.op === 'rewrite' ? new Map(mutation.edits.map((e) => [e.line, e])) : null;
+  let l: Layout | undefined;
+  let carry: Buffer = Buffer.alloc(0);
+  let index = 0;
+  let cur: Buffer[] = [];
+  let inserted = false;
+  try {
+    const emitLine = async (eolBytes: Buffer) => {
+      const lay = l as Layout;
+      let lineBuf = Buffer.concat(cur);
+      cur = [];
+      let bom = Buffer.alloc(0);
+      if (index === 0 && lay.bom && lineBuf.length >= lay.bom) {
+        bom = lineBuf.subarray(0, lay.bom);
+        lineBuf = lineBuf.subarray(lay.bom);
+      }
+      if (bom.length) await write(sink, bom);
+      if (mutation.op === 'insert' && mutation.after < 0 && index === 0 && !inserted) {
+        await write(sink, Buffer.concat([encodeText(mutation.text, lay.label), eolBytes.length ? eolBytes : lay.lf]));
+        inserted = true;
+      }
+      if (delSet?.has(index)) {
+        // Drop this line (its BOM if index 0 was already preserved above).
+      } else if (rewriteMap?.has(index)) {
+        const ed = rewriteMap.get(index)!;
+        if (new TextDecoder(lay.label, { ignoreBOM: true }).decode(lineBuf) !== ed.original) {
+          throw new LineConflict(`line ${index + 1} changed on disk`);
+        }
+        await write(sink, Buffer.concat([encodeText(ed.text, lay.label), eolBytes]));
+      } else {
+        await write(sink, Buffer.concat([lineBuf, eolBytes]));
+      }
+      if (mutation.op === 'insert' && mutation.after === index && !inserted) {
+        if (!eolBytes.length && !delSet?.has(index)) await write(sink, lay.lf);
+        await write(sink, Buffer.concat([encodeText(mutation.text, lay.label), eolBytes.length ? eolBytes : lay.lf]));
+        inserted = true;
+      }
+      index++;
+    };
+    const scanChunk = async (buf: Buffer) => {
+      const lay = l as Layout;
+      let at = 0;
+      while (at < buf.length) {
+        const brk = nextLineBreak(buf, at, lay);
+        if (!brk) {
+          cur.push(Buffer.from(buf.subarray(at)));
+          break;
+        }
+        cur.push(Buffer.from(buf.subarray(at, brk.at)));
+        await emitLine(buf.subarray(brk.at, brk.at + brk.len));
+        at = brk.at + brk.len;
+      }
+    };
+    for await (const piece of source as AsyncIterable<Buffer>) {
+      let buf = carry.length ? Buffer.concat([carry, piece]) : piece;
+      if (!l) {
+        if (buf.length < 3) {
+          carry = buf;
+          continue;
+        }
+        l = layoutOf(buf, opts.encoding);
+      }
+      let usable = l.unit === 2 ? buf.length - (buf.length % 2) : buf.length;
+      if (usable >= l.unit && buf.subarray(usable - l.unit, usable).equals(l.cr)) usable -= l.unit;
+      carry = Buffer.from(buf.subarray(usable));
+      buf = buf.subarray(0, usable);
+      if (buf.length) await scanChunk(buf);
+    }
+    if (!l) l = layoutOf(carry, opts.encoding);
+    if (carry.length) await scanChunk(carry);
+    if (cur.some((b) => b.length > 0) || index === 0) {
+      if (index === 0 && cur.every((b) => b.length === 0)) {
+        if (mutation.op === 'insert' && !inserted) {
+          await write(sink, Buffer.concat([encodeText(mutation.text, l.label), l.lf]));
+          inserted = true;
+        }
+      } else {
+        await emitLine(Buffer.alloc(0));
+      }
+    }
+    if (mutation.op === 'insert' && !inserted) {
+      await write(sink, Buffer.concat([encodeText(mutation.text, l.label), l.lf]));
+    }
+    sink.end();
+    await closed;
+    await fs.promises.chmod(tmp, mode);
+    await fs.promises.rename(tmp, realPath);
+  } catch (e) {
+    raw.destroy();
+    if (opts.gzip) {
+      (sink as zlib.Gzip).unpipe(file);
+      (sink as zlib.Gzip).destroy();
+    }
+    file.destroy();
+    await closed.catch(() => undefined);
+    await fs.promises.rm(tmp, { force: true });
+    throw e;
+  }
+  return fileState(fsPath);
 }

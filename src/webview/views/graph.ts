@@ -1,9 +1,11 @@
 import { t } from '../../shared/i18n';
 import type { JsonPath, RenderReport } from '../../shared/protocol';
 import type { App, View } from '../app';
-import { childKey, entriesHead, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
+import { decodeSmartValue, formatDecodedSummary } from '../inspect';
+import { childKey, decodeKey, entriesHead, esc, isContainer, kindOf, pathToString, primClass, primText, sizeOf, stringifyPretty, summary, type JObj, type JVal } from '../json';
 import { icon } from '../icons';
-import { isTextQuery } from '../model';
+import { isTextQuery, stepIn } from '../model';
+import { pathOf } from '../query';
 
 const HEADER_H = 26;
 const ROW_H = 22;
@@ -16,6 +18,8 @@ const MAX_COMPARE = 10;
 
 interface GRow {
   label: string;
+  rawKey?: string | number;
+  rawVal?: JVal;
   isIdx: boolean;
   text: string;
   cls: string;
@@ -112,6 +116,7 @@ export class GraphView implements View {
     this.mini.addEventListener('pointerup', () => (this.miniDrag = false));
     this.canvasEl.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     this.svg.addEventListener('pointerdown', (e) => this.onDown(e));
+    this.svg.addEventListener('contextmenu', (e) => this.onContextMenu(e));
     this.canvasEl.addEventListener('keydown', (e) => this.onKey(e));
     this.svg.addEventListener('focusin', (e) => this.onFocus(e));
     window.addEventListener('pointermove', (e) => this.onMove(e), { signal: this.gone.signal });
@@ -144,7 +149,7 @@ export class GraphView implements View {
   render(): void {
     if (this.el.hidden) return;
     const sources = this.sources();
-    const key = JSON.stringify([sources.map((s) => s.line), this.app.version]);
+    const key = JSON.stringify([sources.map((s) => s.line), this.app.version, this.app.model.revision]);
     const fresh = key !== this.sourceKey;
     this.sourceKey = key;
     this.build(sources);
@@ -173,14 +178,61 @@ export class GraphView implements View {
   }
 
   stepMatch(dir: 1 | -1): void {
+    const app = this.app;
+    if (!app.query.text) return;
+    const m = app.model;
+    if (m.isJsonl) {
+      const len = this.matchNodes.length;
+      const nextInNode = this.matchIdx < 0 ? (dir > 0 ? 0 : len - 1) : this.matchIdx + dir;
+      const canStepLocal = len > 0 && ((this.matchIdx >= 0 && nextInNode >= 0 && nextInNode < len) || (this.matchIdx < 0 && app.matchSet.has(app.state.active)) || app.matches.length <= 1);
+      if (canStepLocal && nextInNode >= 0 && nextInNode < len) {
+        this.matchIdx = nextInNode;
+        const n = this.matchNodes[this.matchIdx];
+        app.state.graph.selectedNode = n.key;
+        this.centerOn(n);
+        this.paint();
+        this.paintInspector();
+        app.paintCount();
+        app.stateChanged();
+        return;
+      }
+      if (!app.matches.length) return;
+      const nextRec = stepIn(app.matches, app.state.active, dir);
+      app.selectRecord(nextRec);
+      if (this.matchNodes.length) {
+        this.matchIdx = dir > 0 ? 0 : this.matchNodes.length - 1;
+        const n = this.matchNodes[this.matchIdx];
+        app.state.graph.selectedNode = n.key;
+        this.centerOn(n);
+        this.paint();
+        this.paintInspector();
+      }
+      app.paintCount();
+      app.stateChanged();
+      return;
+    }
+    if (!this.matchNodes.length && app.treeMatches.length && app.state.graph.collapsed.size) {
+      // Unfold collapsed ancestors along the target match path so it becomes visible.
+      const targetKey = app.treeMatches[dir > 0 ? 0 : app.treeMatches.length - 1];
+      let cur = 'L0';
+      for (const seg of decodeKey(targetKey)) {
+        app.state.graph.collapsed.delete(cur);
+        cur = childKey(cur, seg);
+      }
+      app.state.graph.collapsed.delete(cur);
+      this.build(this.sources());
+      this.layout();
+      this.markSearch();
+    }
     if (!this.matchNodes.length) return;
-    this.matchIdx = (this.matchIdx + dir + this.matchNodes.length) % this.matchNodes.length;
+    this.matchIdx = this.matchIdx < 0 ? (dir > 0 ? 0 : this.matchNodes.length - 1) : (this.matchIdx + dir + this.matchNodes.length) % this.matchNodes.length;
     const n = this.matchNodes[this.matchIdx];
-    this.app.state.graph.selectedNode = n.key;
+    app.state.graph.selectedNode = n.key;
     this.centerOn(n);
     this.paint();
     this.paintInspector();
-    this.app.stateChanged();
+    app.paintCount();
+    app.stateChanged();
   }
 
   fillReport(r: RenderReport): void {
@@ -201,7 +253,7 @@ export class GraphView implements View {
     const m = app.model;
     if (!m.isJsonl) {
       const v = m.value(0);
-      return v === undefined ? [] : [{ title: 'root', line: 0, value: v }];
+      return v === undefined ? [] : [{ title: t('root'), line: 0, value: v }];
     }
     const sel = [...app.state.selected].sort((a, b) => a - b);
     const lines = sel.length > 1 ? sel.slice(0, MAX_COMPARE) : [app.state.active];
@@ -247,7 +299,12 @@ export class GraphView implements View {
     if (multi) {
       const root = make(undefined, t('{0} selected lines', sources.length), 'sel', -1, [], 0);
       for (const s of sources) {
-        const row: GRow = { label: s.title, isIdx: false, text: isContainer(s.value) ? summary(s.value) : primText(s.value), cls: isContainer(s.value) ? 'dim' : primClass(s.value) };
+        const row: GRow = {
+          label: clip(s.title, 28),
+          isIdx: false,
+          text: isContainer(s.value) ? summary(s.value) : clip(primText(s.value), 32),
+          cls: isContainer(s.value) ? 'dim' : primClass(s.value),
+        };
         row.child = make(s.value, s.title, `L${s.line}`, s.line, [], 1);
         root.rows.push(row);
       }
@@ -260,22 +317,24 @@ export class GraphView implements View {
       const v = n.value;
       if (v === undefined) continue;
       if (!isContainer(v)) {
-        n.rows.push({ label: '', isIdx: false, text: clip(primText(v)), cls: primClass(v) });
+        n.rows.push({ label: '', rawVal: v, isIdx: false, text: clip(primText(v)), cls: primClass(v) });
         continue;
       }
       if (n.collapsed) continue;
       const size = sizeOf(v);
       for (const [k, c] of entriesHead(v, MAX_ROWS)) {
-        const label = String(k);
+        const rawLabel = String(k);
+        const label = clip(rawLabel, 28);
+        const valBudget = Math.max(18, 48 - label.length);
         const isIdx = typeof k === 'number';
         if (!isContainer(c)) {
-          n.rows.push({ label, isIdx, text: clip(primText(c)), cls: primClass(c) });
+          n.rows.push({ label, rawKey: k, rawVal: c, isIdx, text: clip(primText(c), valBudget), cls: primClass(c) });
           continue;
         }
-        const row: GRow = { label, isIdx, text: summary(c), cls: 'dim' };
+        const row: GRow = { label, rawKey: k, rawVal: c, isIdx, text: summary(c), cls: 'dim' };
         if (sizeOf(c) > 0) {
           if (nodes.length < max && n.depth < MAX_DEPTH) {
-            row.child = make(c, label, childKey(n.key, k), n.line, [...n.path, k], n.depth + 1);
+            row.child = make(c, rawLabel, childKey(n.key, k), n.line, [...n.path, k], n.depth + 1);
           } else this.truncated = true;
         }
         n.rows.push(row);
@@ -319,7 +378,7 @@ export class GraphView implements View {
   private layout(): void {
     const colW: number[] = [];
     for (const n of this.nodes) {
-      let w = this.textWidth(n.title) + 140;
+      let w = this.textWidth(clip(n.title, 32)) + 140;
       for (const r of n.rows) w = Math.max(w, this.textWidth(r.label ? `${r.label}: ${r.text}` : r.text) + 32);
       n.w = Math.min(420, Math.max(140, Math.ceil(w)));
       n.h = HEADER_H + Math.max(1, n.rows.length) * ROW_H + (n.rows.length ? 4 : 0);
@@ -364,27 +423,56 @@ export class GraphView implements View {
     if (this.nodes.length) place(this.nodes[0], 0);
   }
 
+  private matchesRowSearch(s: string): boolean {
+    const q = this.app.query;
+    if (!isTextQuery(q)) return false;
+    if (q.re) return q.re.test(s);
+    if (q.regex && q.error) return false;
+    return q.caseSensitive ? s.includes(q.text) : s.toLowerCase().includes(q.text);
+  }
+
   private markSearch(): void {
     const app = this.app;
-    const q = isTextQuery(app.query) ? app.query.text : '';
-    const treeHits = !app.model.isJsonl && app.query.program ? new Set(app.treeMatches) : null;
+    const isText = isTextQuery(app.query);
+    let treeHits: Set<string> | null = null;
+    if (!app.model.isJsonl && app.query.program) {
+      treeHits = new Set(app.treeMatches);
+    } else if (app.model.isJsonl && app.query.program && !app.query.program.usesInputs) {
+      treeHits = new Set();
+      for (const n of this.nodes) {
+        if (n.depth <= 1 && n.path.length === 0 && n.value !== undefined && n.line >= 0) {
+          try {
+            const run = app.query.program.run(n.value);
+            for (const o of run.outs) {
+              if (o.p !== undefined) {
+                const pk = pathOf(o.p).reduce<string>((acc, seg) => childKey(acc, seg), `L${n.line}|`);
+                treeHits.add(pk);
+              }
+            }
+          } catch {
+            // Query runtime errors on non-matching records are ignored.
+          }
+        }
+      }
+    }
     this.matchNodes = [];
     for (const n of this.nodes) {
       n.hit = false;
       if (treeHits) {
-        const nodePath = n.path.reduce<string>((acc, seg) => childKey(acc, seg), '');
+        const prefix = app.model.isJsonl ? `L${n.line}|` : '';
+        const nodePath = n.path.reduce<string>((acc, seg) => childKey(acc, seg), prefix);
         if (treeHits.has(nodePath)) n.hit = true;
         else {
           for (const r of n.rows) {
-            if (!r.note && r.label && treeHits.has(childKey(nodePath, r.isIdx ? Number(r.label) : r.label))) {
+            if (!r.note && r.rawKey !== undefined && treeHits.has(childKey(nodePath, r.rawKey))) {
               n.hit = true;
               break;
             }
           }
         }
-      } else if (q) {
-        if (n.title.toLowerCase().includes(q)) n.hit = true;
-        for (const r of n.rows) if (`${r.label} ${r.text}`.toLowerCase().includes(q)) n.hit = true;
+      } else if (isText) {
+        if (this.matchesRowSearch(n.title)) n.hit = true;
+        for (const r of n.rows) if (this.matchesRowSearch(`${r.label} ${r.text}`)) n.hit = true;
       }
       if (n.hit) this.matchNodes.push(n);
     }
@@ -395,7 +483,7 @@ export class GraphView implements View {
 
   private paint(): void {
     const sel = this.app.state.graph.selectedNode;
-    const q = isTextQuery(this.app.query) ? this.app.query.text : '';
+    const isText = isTextQuery(this.app.query);
     const edges: string[] = [];
     const nodes: string[] = [];
     for (const n of this.nodes) {
@@ -411,10 +499,10 @@ export class GraphView implements View {
       const rows = n.rows
         .map((r, i) => {
           const y = HEADER_H + i * ROW_H;
-          const hit = q && `${r.label} ${r.text}`.toLowerCase().includes(q) ? `<rect class="ghit" x="1" y="${y}" width="${n.w - 2}" height="${ROW_H}"/>` : '';
+          const hit = isText && this.matchesRowSearch(`${r.label} ${r.text}`) ? `<rect class="ghit" x="1" y="${y}" width="${n.w - 2}" height="${ROW_H}"/>` : '';
           const label = r.label ? `<tspan class="${r.isIdx ? 'tz-idx' : 'tk'}">${esc(r.label)}</tspan><tspan class="tp">${r.child || r.cls === 'dim' ? ' ' : ': '}</tspan>` : '';
           const sep = r.child && i > 0 && !n.rows[i - 1].child ? `<line class="gsep" x1="0" x2="${n.w}" y1="${y}" y2="${y}"/>` : '';
-          return `${hit}${sep}<text x="10" y="${y + ROW_H / 2 + 4}">${label}<tspan class="${r.cls}">${esc(r.text)}</tspan></text>`;
+          return `${hit}${sep}<text x="10" y="${y + ROW_H / 2 + 4}" data-ri="${i}">${label}<tspan class="${r.cls}">${esc(r.text)}</tspan></text>`;
         })
         .join('');
       const kind = n.value === undefined ? t('selection') : isContainer(n.value) ? `${t(kindOf(n.value))} · ${sizeOf(n.value as JObj)}` : t(kindOf(n.value));
@@ -553,6 +641,7 @@ export class GraphView implements View {
 
   private paintInspector(): void {
     const n = this.selectedNode();
+    this.inspector.classList.toggle('has-sel', !!n && n.value !== undefined);
     if (!n || n.value === undefined) {
       this.inspector.innerHTML = `<div class="insp-empty dim">${t('Click a node to see its path and value.')}</div>`;
       return;
@@ -563,26 +652,58 @@ export class GraphView implements View {
     const type = isContainer(v)
       ? `${t(kindOf(v))} · ${t(Array.isArray(v) ? (size === 1 ? '{0} item' : '{0} items') : size === 1 ? '{0} key' : '{0} keys', size)}`
       : t(kindOf(v));
+    const decoded = !isContainer(v) ? decodeSmartValue(v) : [];
+    const decHtml = decoded.length
+      ? `<div class="insp-sec"><span class="insp-label">${esc(t('Decoded'))}</span><div class="insp-dec mono">${decoded.map((d) => `<div>${esc(formatDecodedSummary(d))}</div>`).join('')}</div></div>`
+      : '';
+    const revealBtn = this.app.canRevealSource ? `<button class="btn primary" data-i="reveal">${t('Reveal in editor')}</button>` : '';
+    const inspectBtn = `<button class="btn${this.app.canRevealSource ? '' : ' primary'}" data-i="inspect">${icon('inspect', 12)}${esc(t('Inspect value'))}</button>`;
     this.inspector.innerHTML = `
-      <div class="insp-head"><span class="insp-title">${t('Node')}</span><span class="dim">${esc(line)}</span></div>
+      <div class="insp-head"><span class="insp-title">${t('Node')}</span><span class="dim">${esc(line)}</span><button class="icon-btn insp-close" data-i="close" aria-label="${esc(t('Close'))}">${icon('close', 13)}</button></div>
       <div class="insp-sec"><span class="insp-label">${t('PATH')}</span>
         <div class="insp-path"><span class="mono">${esc(pathToString(n.path))}</span><button class="icon-btn" data-i="copy-path" aria-label="${t('Copy path')}">${icon('copy')}</button></div></div>
       <div class="insp-sec"><span class="insp-label">${t('TYPE')}</span><span>${esc(type)}</span></div>
-      <div class="insp-sec spring"><span class="insp-label">${t('VALUE')}</span><pre class="insp-val mono">${esc(stringifyPretty(v, this.app.config.indent, 20_000))}</pre></div>
+      ${decHtml}
+      <div class="insp-sec spring"><span class="insp-label">${t('VALUE')}</span><pre class="insp-val mono" tabindex="0">${esc(stringifyPretty(v, this.app.config.indent, 20_000))}</pre></div>
       <div class="insp-actions">
-        <button class="btn primary" data-i="reveal">${t('Reveal in editor')}</button>
+        ${revealBtn}
+        ${inspectBtn}
         <div class="row2"><button class="btn" data-i="copy-path">${t('Copy path')}</button><button class="btn" data-i="copy-value">${t('Copy value')}</button></div>
       </div>`;
   }
 
   private onInspector(e: MouseEvent): void {
     const b = (e.target as HTMLElement).closest('[data-i]') as HTMLElement | null;
+    if (!b) return;
+    if (b.dataset.i === 'close') {
+      this.selectNode(null);
+      return;
+    }
     const n = this.selectedNode();
-    if (!b || !n || n.value === undefined) return;
+    if (!n || n.value === undefined) return;
     const what = b.dataset.i;
     if (what === 'copy-path') this.app.post({ type: 'copy', text: pathToString(n.path) });
     else if (what === 'copy-value') this.app.post({ type: 'copy', text: stringifyPretty(n.value, this.app.config.indent, 5_000_000) });
     else if (what === 'reveal') this.app.reveal(n.line, n.path);
+    else if (what === 'inspect') this.app.openValueInspector(Math.max(0, n.line), n.path, n.value);
+  }
+
+  private onContextMenu(e: MouseEvent): void {
+    const tEl = e.target as Element;
+    const g = tEl.closest('.gn') as SVGElement | null;
+    if (!g) return;
+    e.preventDefault();
+    const n = this.nodes[Number(g.getAttribute('data-n'))];
+    if (!n || n.value === undefined) return;
+    this.selectNode(n.key);
+    const rowEl = tEl.closest('[data-ri]') as SVGElement | null;
+    const ri = rowEl ? Number(rowEl.getAttribute('data-ri')) : -1;
+    const row = ri >= 0 ? n.rows[ri] : undefined;
+    if (row && row.rawKey !== undefined && row.rawVal !== undefined) {
+      this.app.openContextMenu(e, { record: Math.max(0, n.line), path: [...n.path, row.rawKey], value: row.rawVal, hasValue: true });
+      return;
+    }
+    this.app.openContextMenu(e, { record: Math.max(0, n.line), path: n.path, value: n.value, hasValue: true });
   }
 
   // ---------- pointer ----------
@@ -709,23 +830,28 @@ export class GraphView implements View {
     const pad = 24;
     const css = getComputedStyle(document.body);
     const v = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
-    // The same variable chain as style.css, so the export has the colors of the screen.
     const edge = v('--vscode-editorIndentGuide-activeBackground1', v('--vscode-editorIndentGuide-activeBackground', '#707070'));
+    const ff = v('--vscode-editor-font-family', 'monospace');
+    const bg = v('--bg', v('--vscode-editor-background', '#1e1e1e'));
+    const fg = v('--fg', v('--vscode-editor-foreground', '#ccc'));
+    const dim = v('--dim', v('--vscode-descriptionForeground', '#9d9d9d'));
+    const border = v('--border', v('--vscode-widget-border', '#454545'));
+    const nodeBg = v('--vscode-editorWidget-background', bg);
     const style = `
-      text{font:12px ${v('--vscode-editor-font-family', 'monospace')};fill:${v('--vscode-editor-foreground', '#ccc')}}
-      .gn-bg{fill:${v('--vscode-editorWidget-background', '#252526')};stroke:${v('--vscode-widget-border', '#454545')}}
-      .gsep{stroke:${v('--vscode-widget-border', '#454545')}}
+      text{font-family:${ff};font-size:12px;fill:${fg}}
+      .gn-bg{fill:${nodeBg};stroke:${border}}
+      .gsep{stroke:${border}}
       .ge{fill:none;stroke:${edge};stroke-width:1.5}
       .gdot{fill:${edge}}
-      .gtitle{font-weight:600}.dim{fill:${v('--vscode-descriptionForeground', '#9d9d9d')}}
+      .gtitle{font-weight:600}.dim{fill:${dim}}
       .tk{fill:${v('--tok-key', '#9cdcfe')}}.ts{fill:${v('--tok-string', '#ce9178')}}.tn{fill:${v('--tok-number', '#b5cea8')}}
-      .tb,.tz{fill:${v('--tok-keyword', '#569cd6')}}.tz-idx{fill:${v('--vscode-descriptionForeground', '#9d9d9d')}}.tp{fill:${v('--vscode-editor-foreground', '#ccc')}}
+      .tb,.tz{fill:${v('--tok-keyword', '#569cd6')}}.tz-idx{fill:${dim}}.tp{fill:${fg}}
 `;
+    const xmlStyle = style.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const body = this.exportMarkup();
-    const bg = v('--vscode-editor-background', '#1e1e1e');
     const w = Math.ceil(b.w + pad * 2);
     const h = Math.ceil(b.h + pad * 2);
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="${b.x - pad} ${b.y - pad} ${w} ${h}"><style>${style}</style><rect x="${b.x - pad}" y="${b.y - pad}" width="${w}" height="${h}" fill="${bg}"/>${body}</svg>`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="${b.x - pad} ${b.y - pad} ${w} ${h}"><style>${xmlStyle}</style><rect x="${b.x - pad}" y="${b.y - pad}" width="${w}" height="${h}" fill="${esc(bg)}"/>${body}</svg>`;
     const stem = this.app.doc.fileName.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '');
     const name = this.app.model.isJsonl ? `${stem}-line${this.app.state.active + 1}` : stem;
     if (format === 'svg') {
@@ -735,7 +861,7 @@ export class GraphView implements View {
     const maxArea = 67_108_864;
     const scale = Math.min(2, 16000 / Math.max(1, w, h), Math.sqrt(maxArea / Math.max(1, w * h)));
     const img = new Image();
-    img.onerror = () => this.app.showBanner(t('The export failed: {0}', 'SVG image failed to load'));
+    img.onerror = () => this.app.showBanner(t('The export failed: {0}', t('SVG image failed to load')));
     img.onload = () => {
       const c = document.createElement('canvas');
       c.width = Math.max(1, Math.ceil(w * scale));
@@ -746,7 +872,7 @@ export class GraphView implements View {
       ctx.drawImage(img, 0, 0);
       const url = c.toDataURL('image/png');
       if (!url.startsWith('data:image/png;base64,')) {
-        this.app.showBanner(t('The export failed: {0}', 'the graph image is too large'));
+        this.app.showBanner(t('The export failed: {0}', t('the graph image is too large')));
         return;
       }
       this.app.post({ type: 'export', format, data: url, name });

@@ -2,6 +2,8 @@
 // for other encodings (gbk, gb18030, shift_jis, windows-1252, …) the table is built from the
 // decoder: byte sequences are decoded once, and the result read backwards.
 
+import { t } from './shared/i18n';
+
 export class EncodeError extends Error {}
 
 const tables = new Map<string, Map<string, number[]>>();
@@ -87,20 +89,20 @@ export function encodeText(text: string, label: string): Buffer {
   else if (norm === 'utf-16le') out = Buffer.from(text, 'utf16le');
   else if (norm === 'utf-16be') out = Buffer.from(text, 'utf16le').swap16();
   else {
-    const t = table(norm);
+    const tbl = table(norm);
     const bytes: number[] = [];
     for (const c of text) {
       const code = c.codePointAt(0) as number;
-      let b = code < 0x80 && t.get(c)?.[0] === code ? [code] : t.get(c);
+      let b = code < 0x80 && tbl.get(c)?.[0] === code ? [code] : tbl.get(c);
       if (!b && norm === 'gb18030') {
         b = code >= 0x10000 ? ptrToGb18030(189000 + code - 0x10000) : gb18030Bmp().get(c);
       }
-      if (!b) throw new EncodeError(`"${c}" cannot be written in the encoding ${label}`);
+      if (!b) throw new EncodeError(t('"{0}" cannot be written in the encoding {1}', c, label));
       bytes.push(...b);
     }
     out = Buffer.from(bytes);
   }
   // A last check: the bytes must read back as the same text.
-  if (new TextDecoder(norm, { ignoreBOM: true }).decode(out) !== text) throw new EncodeError(`the text cannot be written in the encoding ${label}`);
+  if (new TextDecoder(norm, { ignoreBOM: true }).decode(out) !== text) throw new EncodeError(t('the text cannot be written in the encoding {0}', label));
   return out;
 }

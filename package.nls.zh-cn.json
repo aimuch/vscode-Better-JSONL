@@ -11,6 +11,7 @@
   "command.toggleWordWrap": "Better JSONL: 切换自动换行",
   "command.expandLines": "Better JSONL: 展开选中行",
   "command.compactLines": "Better JSONL: 压缩行（每行一条记录）",
+  "command.convertFormat": "Better JSONL: 转换 JSON 数组 ↔ JSON Lines",
   "config.defaultView": "打开时显示的视图。",
   "config.defaultView.formatted": "格式化卡片（JSONL 可选聚焦或全部展开）。",
   "config.defaultView.grid": "记录表格，嵌套值可展开为子表格。",

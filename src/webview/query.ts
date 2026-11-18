@@ -32,17 +32,19 @@ class LimitError extends Error {}
 const MAX_OUT = 200_000;
 const MAX_INPUTS_OUT = 20_000_000;
 const MAX_RECORD = 20_000;
+const MAX_DEPTH = 300;
 
 interface ExecState {
   budget: number;
   inputs: Iterator<Out> | null;
+  depth: number;
 }
 
-let activeExec: ExecState = { budget: MAX_OUT, inputs: null };
+let activeExec: ExecState = { budget: MAX_OUT, inputs: null, depth: 0 };
 
 function withExec<T>(limit: number, inputs: Iterator<Out> | null, fn: () => T): T {
   const prev = activeExec;
-  activeExec = { budget: limit, inputs };
+  activeExec = { budget: limit, inputs, depth: 0 };
   try {
     return fn();
   } finally {
@@ -525,7 +527,6 @@ type F = (inp: Out, env: Env) => Out[];
 const EMPTY_ENV: Env = { vars: { name: 'ENV', v: {}, up: null }, funcs: null };
 
 const KEYWORDS = new Set(['and', 'or', 'if', 'then', 'elif', 'else', 'end', 'as', 'reduce', 'foreach', 'def', 'try', 'catch', 'label', 'break']);
-const UNSUPPORTED = new Set<string>();
 
 /** What a parser and its sub-parsers share. */
 interface ParseContext {
@@ -862,8 +863,14 @@ function arith(op: string, a: JVal, b: JVal): JVal {
   } else if (op === '*') {
     if (ta === 'number' && tb === 'number') return num(a) * num(b);
     const [s, n] = ta === 'string' && tb === 'number' ? [a as string, num(b)] : tb === 'string' && ta === 'number' ? [b as string, num(a)] : [null, 0];
-    if (s !== null) return n > 0 ? s.repeat(Math.ceil(n)) : null;
-    if (ta === 'object' && tb === 'object') return { ...(a as JObj), ...(b as JObj) };
+    if (s !== null) {
+      if (Number.isNaN(n) || n < 0) return null;
+      const k = Math.floor(n);
+      if (k === 0 || !s.length) return '';
+      if (!Number.isFinite(k) || s.length * k > 1_000_000) return jqFail('repeated string is too long');
+      return s.repeat(k);
+    }
+    if (ta === 'object' && tb === 'object') return mergeObjects(a as JObj, b as JObj);
   } else if (op === '/') {
     if (ta === 'number' && tb === 'number') return num(b) === 0 ? jqFail('division by zero') : num(a) / num(b);
     if (ta === 'string' && tb === 'string') return (a as string).split(b as string);
@@ -901,6 +908,22 @@ const setKey = (o: JObj, k: string, v: JVal) => {
   else o[k] = v;
 };
 
+function mergeObjects(a: JObj, b: JObj, depth = 0): JObj {
+  if (depth > 200) return jqFail('objects are nested too deeply');
+  const out: JObj = {};
+  for (const k of Object.keys(a)) setKey(out, k, a[k]);
+  for (const k of Object.keys(b)) {
+    const av = Object.prototype.hasOwnProperty.call(out, k) ? out[k] : undefined;
+    const bv = b[k];
+    if (av !== undefined && isContainer(av) && !Array.isArray(av) && isContainer(bv) && !Array.isArray(bv)) {
+      setKey(out, k, mergeObjects(av as JObj, bv as JObj, depth + 1));
+    } else {
+      setKey(out, k, bv);
+    }
+  }
+  return out;
+}
+
 function getPath(v: JVal, path: (string | number)[]): JVal {
   for (const k of path) {
     if (v === null) return null;
@@ -935,25 +958,45 @@ function setPath(v: JVal, path: (string | number)[], x: JVal, i = 0): JVal {
   return obj;
 }
 
-/** A copy of `v` without the values at `paths` (deepest and last first, so indexes stay right). */
+/** A copy of `v` without the values at `paths` (grouped by parent, deepest first, deduplicated). */
 function delPaths(v: JVal, paths: (string | number)[][]): JVal {
-  const sorted = [...paths].sort((a, b) => compareValues(b, a));
-  for (const p of sorted) {
+  if (!paths.length) return v;
+  const groups = new Map<string, { parentPath: (string | number)[]; keys: (string | number)[] }>();
+  for (const p of paths) {
     if (!p.length) return null;
-    const parent = getPath(v, p.slice(0, -1));
-    const k = p[p.length - 1];
+    const parentPath = p.slice(0, -1);
+    const id = JSON.stringify(parentPath);
+    let g = groups.get(id);
+    if (!g) {
+      g = { parentPath, keys: [] };
+      groups.set(id, g);
+    }
+    g.keys.push(p[p.length - 1]);
+  }
+  const ordered = [...groups.values()].sort((a, b) => b.parentPath.length - a.parentPath.length || compareValues(b.parentPath, a.parentPath));
+  for (const g of ordered) {
+    const parent = getPath(v, g.parentPath);
     if (parent === null) continue;
     let next: JVal;
     if (Array.isArray(parent)) {
-      if (typeof k !== 'number') return jqFail('cannot delete a string key from an array');
-      const at = k < 0 ? parent.length + k : k;
-      next = parent.filter((_, i) => i !== at);
+      const drop = new Set<number>();
+      for (const k of g.keys) {
+        if (typeof k !== 'number') return jqFail('cannot delete a string key from an array');
+        const at = k < 0 ? parent.length + k : k;
+        if (at >= 0 && at < parent.length) drop.add(at);
+      }
+      next = parent.filter((_, i) => !drop.has(i));
     } else if (isContainer(parent)) {
+      const drop = new Set<string>();
+      for (const k of g.keys) {
+        if (typeof k !== 'string') return jqFail('cannot delete a number index from an object');
+        drop.add(k);
+      }
       const o: JObj = {};
-      for (const key of Object.keys(parent)) if (key !== k) setKey(o, key, (parent as JObj)[key]);
+      for (const key of Object.keys(parent)) if (!drop.has(key)) setKey(o, key, (parent as JObj)[key]);
       next = o;
     } else return jqFail(`cannot delete from ${typeName(parent)}`);
-    v = setPath(v, p.slice(0, -1), next);
+    v = setPath(v, g.parentPath, next);
   }
   return v;
 }
@@ -974,23 +1017,30 @@ function lookupFunc(env: Env, key: string): FuncDef {
 }
 
 function callUser(def: FuncDef, args: F[], inp: Out, caller: Env): Out[] {
-  if ('closure' in def) return def.closure(inp, def.env);
-  // Each argument: a filter (a closure over the caller's scope), or $name: one call per value.
-  let envs: Env[] = [def.env];
-  def.params.forEach((p, i) => {
-    const a = args[i];
-    if (p.startsWith('$')) {
-      const name = p.slice(1);
-      const values = a(inp, caller);
-      envs = envs.flatMap((e) =>
-        values.map((o) => ({
-          vars: { name, v: o.v, up: e.vars },
-          funcs: { key: `${name}/0`, fn: { closure: () => [val(o.v)], env: e }, up: e.funcs },
-        })),
-      );
-    } else envs = envs.map((e) => ({ vars: e.vars, funcs: { key: `${p}/0`, fn: { closure: a, env: caller }, up: e.funcs } }));
-  });
-  return envs.flatMap((e) => def.body(inp, e));
+  spend();
+  if (activeExec.depth >= MAX_DEPTH) throw new LimitError();
+  activeExec.depth++;
+  try {
+    if ('closure' in def) return def.closure(inp, def.env);
+    // Each argument: a filter (a closure over the caller's scope), or $name: one call per value.
+    let envs: Env[] = [def.env];
+    def.params.forEach((p, i) => {
+      const a = args[i];
+      if (p.startsWith('$')) {
+        const name = p.slice(1);
+        const values = a(inp, caller);
+        envs = envs.flatMap((e) =>
+          values.map((o) => ({
+            vars: { name, v: o.v, up: e.vars },
+            funcs: { key: `${name}/0`, fn: { closure: () => [val(o.v)], env: e }, up: e.funcs },
+          })),
+        );
+      } else envs = envs.map((e) => ({ vars: e.vars, funcs: { key: `${p}/0`, fn: { closure: a, env: caller }, up: e.funcs } }));
+    });
+    return envs.flatMap((e) => def.body(inp, e));
+  } finally {
+    activeExec.depth--;
+  }
 }
 
 type Pattern = (v: JVal, vars: VarScope) => VarScope;
@@ -1497,6 +1547,13 @@ class JqParser {
               const v = b.v;
               if (v === null) return val(null);
               if (typeof v !== 'string' && !Array.isArray(v)) return jqFail(`cannot slice ${typeName(v)}`);
+              if (typeof v === 'string') {
+                const cps = Array.from(v);
+                const len = cps.length;
+                const s = x === null ? 0 : Math.max(0, Math.min(len, Math.floor(x < 0 ? len + x : x)));
+                const e = y === null ? len : Math.max(0, Math.min(len, Math.ceil(y < 0 ? len + y : y)));
+                return val(cps.slice(s, Math.max(s, e)).join(''));
+              }
               const len = v.length;
               const s = x === null ? 0 : Math.max(0, Math.min(len, Math.floor(x < 0 ? len + x : x)));
               const e = y === null ? len : Math.max(0, Math.min(len, Math.ceil(y < 0 ? len + y : y)));
@@ -1603,7 +1660,6 @@ class JqParser {
           throw new BreakSignal(lookupVar(env, label) as unknown as symbol, []);
         };
       }
-      if (UNSUPPORTED.has(name)) this.fail(`${name} is not supported`);
       if (name === 'import' || name === 'include' || name === 'module') this.fail(`${name} must come first in the query`);
       if (name === 'input' || name === 'inputs') this.ctx.usesInputs = true;
       if (KEYWORDS.has(name)) this.fail(`unexpected '${name}'`);
@@ -1994,8 +2050,9 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
     case 'tonumber':
       return map1((v) => {
         if (typeName(v) === 'number') return v;
-        const x = Number(stringArg(v, 'tonumber'));
-        return Number.isNaN(x) || !(v as string).trim() ? jqFail(`cannot parse "${v}" as a number`) : x;
+        const s = stringArg(v, 'tonumber').trim();
+        const x = Number(s);
+        return !s || Number.isNaN(x) ? jqFail(`cannot parse "${v}" as a number`) : parseNumLiteral(s);
       });
     case 'ascii_downcase':
     case 'ascii_upcase':
@@ -2069,7 +2126,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
           if (!isContainer(e) || Array.isArray(e)) return jqFail('from_entries needs objects');
           const o = e as JObj;
           const k = o.key ?? o.k ?? o.name ?? o.Name ?? o.Key ?? o.K;
-          out[typeof k === 'string' ? k : compactJson(k ?? null)] = (o.value ?? o.v ?? o.Value ?? o.V ?? null) as JVal;
+          setKey(out, typeof k === 'string' ? k : compactJson(k ?? null), (o.value ?? o.v ?? o.Value ?? o.V ?? null) as JVal);
         }
         return out;
       });
@@ -2130,6 +2187,7 @@ function builtin(name: string, args: F[], fail: (msg: string) => never): F {
         const out: Out[] = [];
         const stack: Out[] = [inp];
         while (stack.length) {
+          spend();
           const x = stack.pop() as Out;
           out.push(x);
           const next = args[0](x, env);
@@ -2277,17 +2335,18 @@ export function compileJq(src: string, modules: Map<string, string | null> = new
 
 /** A search that starts with `.` (or one of these functions) is a jq filter. */
 const JQ_START =
-  /^(?:\.|(?:select|map|has|any|all|test|to_entries|paths|recurse|keys|length|type|index|rindex|indices)\s*\(|(?:if|def|reduce|foreach|import|include|label)\s|try\s|\[\s*inputs\b|inputs?\s*\||@(?:text|json|csv|tsv|html|uri|sh|base64d?|base32d?)\b)/;
+  /^(?:\.|(?:select|map|map_values|has|any|all|test|to_entries|from_entries|with_entries|paths|recurse|keys|length|type|index|rindex|indices|del|delpaths|getpath|setpath)\s*\(|(?:if|def|reduce|foreach|import|include|label)\s|try\s|\[\s*inputs\b|inputs?\s*\||@(?:text|json|csv|tsv|html|uri|sh|base64d?|base32d?)\b)/;
 
 /**
  * Reads the search text as a query when it looks like one: `$…` is JSONPath, `.…` is jq.
  * Returns an error message when it looks like a query but is not a valid one, and the module
  * files to read first (`needs`) when a jq query imports some that `modules` does not have.
  */
-export function compileQuery(raw: string, modules?: Map<string, string | null>): { program?: Program; error?: string; needs?: string[] } {
+export function compileQuery(raw: string, modules?: Map<string, string | null>, forceJq = false): { program?: Program; error?: string; needs?: string[] } {
   const s = raw.trim();
-  const jsonPath = s.startsWith('$');
-  if (!jsonPath && !JQ_START.test(s)) return {};
+  if (!s) return {};
+  const jsonPath = s.startsWith('$') && !forceJq;
+  if (!jsonPath && !forceJq && !JQ_START.test(s)) return {};
   try {
     return { program: jsonPath ? compileJsonPath(s) : compileJq(s, modules) };
   } catch (e) {

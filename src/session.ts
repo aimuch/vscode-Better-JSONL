@@ -5,11 +5,22 @@ import * as vscode from 'vscode';
 import { isJsonlDocument, isJsonlPath, readConfig, syncSelectionEnabled } from './config';
 import { EncodeError } from './encoding';
 import type { Written } from './fileEdit';
-import { compare, encodingFor, fileState, innerName, LineConflict, readUtf8, replaceLine, type FileState } from './largeFile';
+import { compare, encodingFor, fileState, innerName, LineConflict, mutateFileLines, readUtf8, replaceLine, TAIL, type FileState } from './largeFile';
 import { locatePath, valueSpan } from './locate';
 import { t } from './shared/i18n';
 import { errorMessage, minifyJson } from './shared/jsonText';
-import { SETTING_KEYS, type HostMessage, type JsonPath, type RenderReport, type SettingKey, type TextChange, type WebviewMessage } from './shared/protocol';
+import {
+  SETTING_KEYS,
+  type ExportAssetFormat,
+  type ExportRowFormat,
+  type HostMessage,
+  type JsonPath,
+  type LineMutation,
+  type RenderReport,
+  type SettingKey,
+  type TextChange,
+  type WebviewMessage,
+} from './shared/protocol';
 
 type Waiter = { pred: (r: RenderReport) => boolean; resolve: (r: RenderReport) => void };
 
@@ -38,9 +49,6 @@ interface Large {
   decoded?: number;
   decodedTail?: Buffer;
 }
-
-/** Bytes kept from the end of what the view has. */
-const TAIL = 4096;
 
 /**
  * The last TAIL bytes of the view's text (UTF-8) after replaceLine wrote a file: the bytes it
@@ -154,6 +162,7 @@ export class ViewerSession implements vscode.Disposable {
   private revealing = false;
   /** The session opened the text document itself (no editor shows it). */
   private selfOpened = false;
+  private readonly cancelledExports = new Set<number>();
   private waiters: Waiter[] = [];
   private readonly disposeEmitter = new vscode.EventEmitter<void>();
   readonly onDidDispose = this.disposeEmitter.event;
@@ -205,7 +214,7 @@ export class ViewerSession implements vscode.Disposable {
       // The closed document may have held changes that were not saved. Read the file again, once.
       const mine = this.selfOpened;
       this.selfOpened = false;
-      if (!mine && this.host === 'preview') void this.reopen();
+      if (!mine && this.host === 'preview' && d.uri.scheme !== 'untitled') void this.reopen();
     }, null, this.disposables);
     vscode.window.onDidChangeTextEditorSelection((e) => this.onEditorSelection(e), null, this.disposables);
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -226,9 +235,11 @@ export class ViewerSession implements vscode.Disposable {
     return !!this.large;
   }
 
-  /** Large and compressed files can be written when they are on this computer. */
+  /** Large and compressed files can be written when they are on this computer; virtual read-only schemes cannot. */
   private get readOnly(): boolean {
-    return !!this.large && this.uri?.scheme !== 'file';
+    if (this.large) return this.uri?.scheme !== 'file';
+    if (!this.uri || this.uri.scheme === 'file' || this.uri.scheme === 'untitled') return false;
+    return vscode.workspace.fs.isWritableFileSystem(this.uri.scheme) === false;
   }
 
   bind(target: Target): void {
@@ -284,6 +295,7 @@ export class ViewerSession implements vscode.Disposable {
     clearTimeout(this.noticeTimer);
     for (const e of this.exports.values()) void e.abort();
     this.exports.clear();
+    this.cancelledExports.clear();
     this.watcher?.dispose();
     this.disposables.forEach((d) => d.dispose());
     this.disposeEmitter.fire();
@@ -326,10 +338,10 @@ export class ViewerSession implements vscode.Disposable {
     const uri = this.uri;
     if (!uri || uri.scheme === 'untitled') return;
     try {
-      const name = path.posix.basename(uri.path).replace(/[*?[\]{}]/g, '[$&]');
+      const name = path.posix.basename(uri.path).replace(/[*?]/g, '[$&]').replace(/[\[\]{}]/g, '?');
       const w = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.joinPath(uri, '..'), name));
-      const changed = () => {
-        if (this.uri !== uri) return;
+      const changed = (u: vscode.Uri) => {
+        if (this.uri !== uri || u.toString() !== uri.toString()) return;
         if (this.large) {
           clearTimeout(this.noticeTimer);
           this.noticeTimer = setTimeout(() => void this.onLargeChanged(), 300);
@@ -337,8 +349,8 @@ export class ViewerSession implements vscode.Disposable {
       };
       w.onDidChange(changed);
       w.onDidCreate(changed);
-      w.onDidDelete(() => {
-        if (this.uri === uri) this.post({ type: 'notice', message: t('The file was deleted or moved. The view shows its last content.') });
+      w.onDidDelete((u) => {
+        if (this.uri === uri && u.toString() === uri.toString()) this.post({ type: 'notice', message: t('The file was deleted or moved. The view shows its last content.') });
       });
       this.watcher = w;
     } catch {
@@ -371,7 +383,7 @@ export class ViewerSession implements vscode.Disposable {
     this.synced(doc);
     this.post({
       type: 'init',
-      doc: { ...info, languageId: doc.languageId, isJsonl: isJsonlDocument(doc) },
+      doc: { ...info, languageId: doc.languageId, isJsonl: isJsonlDocument(doc), readOnly: this.readOnly },
       text,
       bytes: Buffer.byteLength(text, 'utf8'),
       version: doc.version,
@@ -516,7 +528,7 @@ export class ViewerSession implements vscode.Disposable {
           large.decoded = (large.decoded ?? 0) + piece.data.length;
           large.decodedTail = tailOf(large.decodedTail ?? Buffer.alloc(0), piece.data);
         }
-        large.state = alignedSize === now.size ? now : await fileState(uri.fsPath);
+        large.state = alignedSize === now.size ? now : await fileState(uri.fsPath, alignedSize);
         large.bytes = large.state.size;
       } while (this.appendAgain);
     } catch (e) {
@@ -682,6 +694,9 @@ export class ViewerSession implements vscode.Disposable {
         case 'editValue':
           await this.editValue(m.path, m.version, m.text, m.cell);
           break;
+        case 'mutateLines':
+          await this.mutateLines(m.version, m.mutation);
+          break;
         case 'follow':
           if (this.large) {
             this.large.follow = m.on;
@@ -744,14 +759,41 @@ export class ViewerSession implements vscode.Disposable {
     const MAX_MODULE_BYTES = 10 * 1024 * 1024;
     const out: Record<string, string | null> = {};
     const doc = this.uri;
-    const folder = doc && doc.scheme !== 'untitled' ? vscode.Uri.joinPath(doc, '..') : vscode.workspace.workspaceFolders?.[0]?.uri;
+    const useDocFolder = doc && doc.scheme !== 'untitled' && (doc.scheme === 'file' || vscode.workspace.fs.isWritableFileSystem(doc.scheme) !== undefined);
+    const folder = useDocFolder ? vscode.Uri.joinPath(doc, '..') : vscode.workspace.workspaceFolders?.[0]?.uri;
     const roots = [...(folder ? [folder] : []), ...(vscode.workspace.workspaceFolders ?? []).map((w) => w.uri)];
-    const withinAllowed = (u: vscode.Uri) =>
-      roots.some((r) => {
+    const realRoots: string[] = [];
+    for (const r of roots) {
+      if (r.scheme === 'file') {
+        try {
+          realRoots.push(await fs.promises.realpath(r.fsPath));
+        } catch {
+          realRoots.push(path.resolve(r.fsPath));
+        }
+      }
+    }
+    const withinAllowed = async (u: vscode.Uri): Promise<boolean> => {
+      if (u.scheme === 'file') {
+        let realCand: string;
+        try {
+          realCand = await fs.promises.realpath(u.fsPath);
+        } catch {
+          return false;
+        }
+        const norm = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s);
+        return realRoots.some((rr) => {
+          const rel = path.relative(norm(rr), norm(realCand));
+          return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
+        });
+      }
+      return roots.some((r) => {
         if (u.scheme !== r.scheme || u.authority !== r.authority) return false;
-        const prefix = r.path.endsWith('/') ? r.path : r.path + '/';
-        return u.path === r.path || u.path.startsWith(prefix);
+        const up = process.platform === 'win32' ? u.path.toLowerCase() : u.path;
+        const rp = process.platform === 'win32' ? r.path.toLowerCase() : r.path;
+        const prefix = rp.endsWith('/') ? rp : rp + '/';
+        return up === rp || up.startsWith(prefix);
       });
+    };
     for (const key of keys.slice(0, 50)) {
       const [kind, ...rest] = key.split(':');
       const name = rest.join(':');
@@ -761,7 +803,7 @@ export class ViewerSession implements vscode.Disposable {
       const base = vscode.Uri.joinPath(folder, ...name.split(/[\\/]+/));
       const candidates = name.endsWith(ext) ? [base] : [base.with({ path: base.path + ext }), vscode.Uri.joinPath(base, path.posix.basename(base.path) + ext)];
       for (const c of candidates) {
-        if (!withinAllowed(c)) continue;
+        if (!(await withinAllowed(c))) continue;
         try {
           const st = await vscode.workspace.fs.stat(c);
           if (st.size > MAX_MODULE_BYTES) continue;
@@ -792,6 +834,10 @@ export class ViewerSession implements vscode.Disposable {
   private async revealPath(line: number, jsonPath: JsonPath): Promise<void> {
     const uri = this.uri;
     if (!uri) return;
+    if (this.large?.gzip) {
+      void vscode.window.showInformationMessage(t('Better JSONL: a compressed file has no text view.'));
+      return;
+    }
     const column = this.visibleEditor()?.viewColumn ?? (this.host === 'preview' ? vscode.ViewColumn.One : vscode.ViewColumn.Beside);
     if (this.large) {
       // No text document for a large file: VS Code opens it and goes to the line.
@@ -891,16 +937,113 @@ export class ViewerSession implements vscode.Disposable {
     this.post(ok ? { type: 'editResult', ok: true, cell } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.'), cell });
   }
 
+  private async mutateLines(version: number, mutation: LineMutation): Promise<void> {
+    const fail = (message: string) => this.post({ type: 'editResult', ok: false, message, batch: true });
+    if (this.readOnly) return fail(t('This file is read-only.'));
+    const checkJsonLine = (s: string): string | null => {
+      try {
+        JSON.parse(s);
+        const min = minifyJson(s);
+        return /[\r\n]/.test(min) ? null : min;
+      } catch {
+        return null;
+      }
+    };
+    let normalized: LineMutation = mutation;
+    if (mutation.op === 'insert') {
+      const min = checkJsonLine(mutation.text);
+      if (min === null) return fail(t('Invalid JSON'));
+      normalized = { op: 'insert', after: mutation.after, text: min };
+    } else if (mutation.op === 'rewrite') {
+      const edits: { line: number; original: string; text: string }[] = [];
+      for (const e of mutation.edits) {
+        const min = checkJsonLine(e.text);
+        if (min === null) return fail(t('Invalid JSON'));
+        edits.push({ line: e.line, original: e.original, text: min });
+      }
+      normalized = { op: 'rewrite', edits };
+    }
+    if (this.large) {
+      const large = this.large;
+      const uri = this.uri;
+      if (!large || !uri) return;
+      if (!large.state || (await compare(uri.fsPath, large.state)) !== 'same') {
+        return fail(t('The file changed on disk. Reload it, then edit again.'));
+      }
+      try {
+        await mutateFileLines(uri.fsPath, normalized, { gzip: large.gzip, encoding: large.encoding });
+      } catch (e) {
+        return fail(e instanceof EncodeError ? t('Nothing was written: {0}.', errorMessage(e)) : errorMessage(e));
+      }
+      this.post({ type: 'editResult', ok: true, batch: true });
+      await this.reload();
+      return;
+    }
+    const doc = await this.liveDoc();
+    if (!doc) return fail(t('No document.'));
+    if (doc.version !== version) return fail(t('The document changed after the edit started. Nothing was written.'));
+    const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const we = new vscode.WorkspaceEdit();
+    if (normalized.op === 'insert') {
+      const nonEmptyLines = doc.lineCount === 1 && doc.lineAt(0).text === '' ? 0 : doc.lineCount;
+      if (nonEmptyLines === 0) {
+        we.insert(doc.uri, new vscode.Position(0, 0), normalized.text + eol);
+      } else if (normalized.after < 0) {
+        we.insert(doc.uri, new vscode.Position(0, 0), normalized.text + eol);
+      } else {
+        const targetLine = Math.min(normalized.after, doc.lineCount - 1);
+        const lineObj = doc.lineAt(targetLine);
+        if (targetLine === doc.lineCount - 1 && lineObj.text === '' && targetLine > 0) {
+          const prev = doc.lineAt(targetLine - 1);
+          we.insert(doc.uri, prev.rangeIncludingLineBreak.end, normalized.text + eol);
+        } else if (lineObj.rangeIncludingLineBreak.isEqual(lineObj.range)) {
+          we.insert(doc.uri, lineObj.range.end, eol + normalized.text);
+        } else {
+          we.insert(doc.uri, lineObj.rangeIncludingLineBreak.end, normalized.text + eol);
+        }
+      }
+    } else if (normalized.op === 'delete') {
+      const sorted = [...new Set(normalized.lines)].filter((l) => l >= 0 && l < doc.lineCount).sort((a, b) => b - a);
+      for (const l of sorted) {
+        const lineObj = doc.lineAt(l);
+        if (!lineObj.rangeIncludingLineBreak.isEqual(lineObj.range)) {
+          we.delete(doc.uri, lineObj.rangeIncludingLineBreak);
+        } else if (l > 0) {
+          we.delete(doc.uri, new vscode.Range(doc.lineAt(l - 1).range.end, lineObj.range.end));
+        } else {
+          we.delete(doc.uri, lineObj.range);
+        }
+      }
+    } else {
+      for (const e of normalized.edits) {
+        if (e.line >= doc.lineCount || doc.lineAt(e.line).text !== e.original) {
+          return fail(t('Line {0} changed after the edit started. Nothing was written.', e.line + 1));
+        }
+        we.replace(doc.uri, doc.lineAt(e.line).range, e.text);
+      }
+    }
+    const ok = await vscode.workspace.applyEdit(we);
+    this.post(ok ? { type: 'editResult', ok: true, batch: true } : { type: 'editResult', ok: false, message: t('VS Code rejected the edit.'), batch: true });
+  }
+
   /** Export: asks where to save, then opens the file for the pieces that follow. */
-  private async exportStart(id: number, format: 'jsonl' | 'csv', name: string, rows: number): Promise<void> {
+  private async exportStart(id: number, format: ExportRowFormat, name: string, rows: number): Promise<void> {
     const dir = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
+    const filters: Record<string, string[]> =
+      format === 'csv'
+        ? { CSV: ['csv'] }
+        : format === 'json'
+          ? { [t('JSON array')]: ['json'] }
+          : format === 'md'
+            ? { [t('Markdown table')]: ['md'] }
+            : { 'JSON Lines': ['jsonl', 'ndjson'] };
     const target =
       this.testExportTarget ??
       (await vscode.window.showSaveDialog({
         defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
-        filters: format === 'csv' ? { CSV: ['csv'] } : { 'JSON Lines': ['jsonl', 'ndjson'] },
+        filters,
       }));
-    if (!target) {
+    if (!target || this.disposed || this.cancelledExports.delete(id)) {
       this.post({ type: 'exportReady', id, ok: false });
       return;
     }
@@ -935,7 +1078,13 @@ export class ViewerSession implements vscode.Disposable {
 
   private async exportData(id: number, data: string, done: boolean, cancel?: boolean): Promise<void> {
     const e = this.exports.get(id);
-    if (!e) return;
+    if (!e) {
+      if (cancel) {
+        this.cancelledExports.add(id);
+        if (this.cancelledExports.size > 100) this.cancelledExports.delete(this.cancelledExports.values().next().value as number);
+      }
+      return;
+    }
     if (cancel) {
       this.exports.delete(id);
       await e.abort();
@@ -994,17 +1143,29 @@ export class ViewerSession implements vscode.Disposable {
     await cfg.update(key, value, target);
   }
 
-  private async exportFile(format: 'svg' | 'png', data: string, name: string): Promise<void> {
+  private async exportFile(format: ExportAssetFormat, data: string, name: string): Promise<void> {
     if (format === 'png' && !data.startsWith('data:image/png;base64,')) {
-      throw new Error('PNG export failed (the graph image is too large for a canvas)');
+      throw new Error(t('PNG export failed (the graph image is too large for a canvas)'));
     }
     const dir = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
-    const target = await vscode.window.showSaveDialog({
-      defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
-      filters: format === 'svg' ? { [t('SVG image')]: ['svg'] } : { [t('PNG image')]: ['png'] },
-    });
+    const filters: Record<string, string[]> =
+      format === 'svg'
+        ? { [t('SVG image')]: ['svg'] }
+        : format === 'png'
+          ? { [t('PNG image')]: ['png'] }
+          : format === 'ts'
+            ? { [t('TypeScript definitions')]: ['ts'] }
+            : format === 'py'
+              ? { [t('Python file')]: ['py'] }
+              : { JSON: ['json'] };
+    const target =
+      this.testExportTarget ??
+      (await vscode.window.showSaveDialog({
+        defaultUri: dir ? vscode.Uri.joinPath(dir, `${name}.${format}`) : undefined,
+        filters,
+      }));
     if (!target) return;
-    const bytes = format === 'svg' ? Buffer.from(data, 'utf8') : Buffer.from(data.replace(/^data:image\/png;base64,/, ''), 'base64');
+    const bytes = format === 'png' ? Buffer.from(data.replace(/^data:image\/png;base64,/, ''), 'base64') : Buffer.from(data, 'utf8');
     await vscode.workspace.fs.writeFile(target, bytes);
     vscode.window.setStatusBarMessage(t('Better JSONL: saved {0}', path.basename(target.path)), 3000);
   }

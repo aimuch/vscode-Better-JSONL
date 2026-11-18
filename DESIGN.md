@@ -81,8 +81,11 @@
 │ model.ts       行存储（文本 / 字节）、惰性解析、缓存、列集合    │
 │ query.ts       jq 子集与 JSONPath（RFC 9535）                  │
 │ byteJson.ts    从字节解析超过一个字符串上限的 JSON 值           │
-│ diff.ts        两条记录的字段级差异；exporter.ts：CSV           │
-│ json.ts        大整数、路径键、语法高亮                        │
+│ diff.ts        两条记录的字段级差异；exporter.ts：CSV / MD 表格  │
+│ inspect.ts     嵌套 JSON 字符串解包、安全 Markdown 与语义解码     │
+│ schema.ts      TypeScript / JSON Schema / Pydantic / Zod 推断   │
+│ timeline.ts    时间戳列自动检测与 48 桶时间分布图                │
+│ json.ts        大整数与高精度小数、路径键、语法高亮              │
 │ settings.ts    设置面板                                       │
 │ views/formatted.ts  虚拟列表（卡片 + 折叠 + 自动换行）          │
 │ views/lines.ts      值 → 显示行（迭代实现，支持默认折叠深度）    │

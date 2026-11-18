@@ -27,9 +27,9 @@ const sourceTextSupported = (() => {
  * or a long fraction. Digits inside a string do not count: the slower parse below is only worth
  * it for real numbers (it takes about 6 times as long).
  */
-const LONG_NUMBER = /(?:^|[\s:,[])-?\d{16,}|\d\.\d{15,}/;
+const LONG_NUMBER = /(?:^|[\s:,[])-?(?:\d{16,}|(?=\d+\.\d)[\d.]{17,}|[\d.]+[eE][+-]?\d{3,})/;
 
-/** Digits in a number's text. A number with fewer than 16 cannot lose precision. */
+/** Digits in a number's text. A number with fewer than 16 cannot lose precision unless its exponent overflows. */
 function digitCount(s: string): number {
   let n = 0;
   for (let i = 0; i < s.length; i++) {
@@ -41,16 +41,18 @@ function digitCount(s: string): number {
 }
 
 function keepSource(_k: string, v: unknown, ctx?: { source?: string }): unknown {
-  if (typeof v === 'number' && ctx && ctx.source !== undefined && !Number.isSafeInteger(v) && String(v) !== ctx.source && digitCount(ctx.source) >= 16) {
-    return new RawNum(ctx.source);
+  if (typeof v === 'number' && ctx && ctx.source !== undefined) {
+    if (!Number.isFinite(v) || (!Number.isSafeInteger(v) && String(v) !== ctx.source && digitCount(ctx.source) >= 16)) {
+      return new RawNum(ctx.source);
+    }
   }
   return v;
 }
 
-/** Parses a number token and keeps a RawNum when a JavaScript number would lose precision. */
+/** Parses a number token and keeps a RawNum when a JavaScript number would lose precision or overflow. */
 export function parseNumLiteral(raw: string): number | RawNum {
   const v = Number(raw);
-  return !Number.isSafeInteger(v) && String(v) !== raw && digitCount(raw) >= 16 ? new RawNum(raw) : v;
+  return !Number.isFinite(v) || (!Number.isSafeInteger(v) && String(v) !== raw && digitCount(raw) >= 16) ? new RawNum(raw) : v;
 }
 
 function normDecimal(s: string): { neg: boolean; digits: string; exp: number } {
@@ -76,6 +78,8 @@ function normDecimal(s: string): { neg: boolean; digits: string; exp: number } {
 /** Exact numerical order for numbers and RawNum values (including >2^53 integers and long decimals). */
 export function compareNumbers(a: number | RawNum, b: number | RawNum): number {
   if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a === 'number' && !Number.isFinite(a)) return Number.isNaN(a) ? 0 : a < 0 ? -1 : 1;
+  if (typeof b === 'number' && !Number.isFinite(b)) return Number.isNaN(b) ? 0 : b < 0 ? 1 : -1;
   const sa = a instanceof RawNum ? a.src : String(a);
   const sb = b instanceof RawNum ? b.src : String(b);
   if (sa === sb) return 0;
@@ -217,6 +221,18 @@ export function pathToString(path: JsonPath): string {
   return s;
 }
 
+/** Formats `path` as a jq path expression (for example `.user.roles[0]` or `.["a.b"]`). */
+export function pathToJq(path: JsonPath): string {
+  if (!path.length) return '.';
+  let s = '';
+  for (const seg of path) {
+    if (typeof seg === 'number') s += `[${seg}]`;
+    else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(seg)) s += `.${seg}`;
+    else s += `[${JSON.stringify(seg)}]`;
+  }
+  return s.startsWith('[') ? `.${s}` : s;
+}
+
 /** Parses "user.name", "$.tags[0]" or '$["a.b"].c'. */
 export function parsePath(text: string): JsonPath | undefined {
   let s = text.trim();
@@ -229,13 +245,37 @@ export function parsePath(text: string): JsonPath | undefined {
       continue;
     }
     if (s[i] === '[') {
-      const end = s.indexOf(']', i);
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      let end = -1;
+      if (s[j] === '"' || s[j] === "'") {
+        const quote = s[j];
+        j++;
+        while (j < s.length) {
+          if (s[j] === '\\') {
+            j += 2;
+            continue;
+          }
+          if (s[j] === quote) {
+            j++;
+            break;
+          }
+          j++;
+        }
+        while (j < s.length && /\s/.test(s[j])) j++;
+        if (s[j] === ']') end = j;
+      } else {
+        end = s.indexOf(']', i);
+      }
       if (end < 0) return undefined;
       const inner = s.slice(i + 1, end).trim();
       if (/^\d+$/.test(inner)) out.push(Number(inner));
       else {
         try {
-          out.push(JSON.parse(inner.replace(/^'(.*)'$/, '"$1"')));
+          const normalized = inner.startsWith("'") && inner.endsWith("'") ? `"${inner.slice(1, -1).replace(/\\'/g, "'").replace(/"/g, '\\"')}"` : inner;
+          const parsed: unknown = JSON.parse(normalized);
+          if (typeof parsed !== 'string' && typeof parsed !== 'number') return undefined;
+          out.push(parsed);
         } catch {
           return undefined;
         }

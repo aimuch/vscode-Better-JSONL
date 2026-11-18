@@ -3,7 +3,7 @@ import { formatDocumentEnabled, isSupportedDocument, isSupportedPath, setTestMod
 import { setLang, t } from './shared/i18n';
 import { randomBytes } from 'crypto';
 import { COMPRESSED_VIEW_TYPE, CompressedEditorProvider, ViewerEditorProvider, VIEWER_VIEW_TYPE } from './customEditor';
-import { compactLines, expandLines, formatJsonl } from './lineCommands';
+import { compactLines, convertFormat, expandLines, formatJsonl } from './lineCommands';
 import { isGzipPath } from './largeFile';
 import { PREVIEW_VIEW_TYPE, PreviewManager, resolveTarget } from './preview';
 import type { SessionEnv, Target, ViewerSession } from './session';
@@ -109,6 +109,8 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
         if (tab instanceof vscode.TabInputText || tab instanceof vscode.TabInputCustom) {
           if (isSupportedPath(tab.uri.path) || isGzipPath(tab.uri.path)) return await resolveTarget(tab.uri);
         }
+        const cur = activeSession();
+        if (cur?.resource) return await resolveTarget(cur.resource);
       }
     } catch (e) {
       void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', e instanceof Error ? e.message : String(e)));
@@ -165,6 +167,11 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
   reg('betterJsonl.compactLines', async () => {
     const editor = vscode.window.activeTextEditor;
     if (editor) return compactLines(editor);
+    return false;
+  });
+  reg('betterJsonl.convertFormat', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (editor) return convertFormat(editor);
     return false;
   });
 

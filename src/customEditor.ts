@@ -31,8 +31,8 @@ export class CompressedEditorProvider implements vscode.CustomReadonlyEditorProv
   }
 
   async resolveCustomEditor(document: vscode.CustomDocument, panel: vscode.WebviewPanel): Promise<void> {
-    const session = new ViewerSession(panel, this.env, 'editor');
     const bytes = (await vscode.workspace.fs.stat(document.uri)).size;
+    const session = new ViewerSession(panel, this.env, 'editor');
     session.bind({ uri: document.uri, bytes, gzip: true });
     this.onSession(session);
   }

@@ -185,3 +185,82 @@ export function errorOffset(message: string): number | undefined {
   const m = /position (\d+)/.exec(message);
   return m ? Number(m[1]) : undefined;
 }
+
+export type ConvertResult =
+  | { ok: true; to: 'jsonl' | 'json'; text: string; count: number }
+  | { ok: false; message: string };
+
+/** Splits the top-level element slices of a valid JSON array text `[ ... ]`, preserving exact tokens. */
+function splitArrayItems(src: string): string[] {
+  let i = src.indexOf('[') + 1;
+  const end = src.lastIndexOf(']');
+  const items: string[] = [];
+  let depth = 0;
+  let itemStart = -1;
+  while (i < end) {
+    const c = src.charCodeAt(i);
+    if (isWs(c) && depth === 0 && itemStart < 0) {
+      i++;
+      continue;
+    }
+    if (itemStart < 0) itemStart = i;
+    if (c === QUOTE) {
+      i = scanString(src, i);
+      continue;
+    }
+    if (c === 123 || c === 91) depth++;
+    else if (c === 125 || c === 93) depth--;
+    else if (c === 44 && depth === 0) {
+      items.push(src.slice(itemStart, i).trim());
+      itemStart = -1;
+    }
+    i++;
+  }
+  if (itemStart >= 0) {
+    const tail = src.slice(itemStart, end).trim();
+    if (tail) items.push(tail);
+  }
+  return items;
+}
+
+/**
+ * Converts a JSON root array (`[...]`) to JSON Lines (one compact value per line), or JSON Lines
+ * to a pretty-printed JSON array (`[\n  ...\n]`), without passing values through JSON.stringify
+ * so >53-bit integers and exact token formatting stay intact.
+ */
+export function convertJsonAndJsonl(src: string, indent: number | string = 2, eol = '\n', preferJsonlInput?: boolean): ConvertResult {
+  const clean = stripBom(src);
+  const trimmed = clean.trim();
+  if (!trimmed) return { ok: true, to: preferJsonlInput ? 'json' : 'jsonl', text: preferJsonlInput ? '[]' + eol : '', count: 0 };
+  const spans = splitJsonValues(clean);
+  if (spans.length === 1 && trimmed.startsWith('[') && !preferJsonlInput) {
+    try {
+      JSON.parse(trimmed);
+      const items = splitArrayItems(trimmed).map((it) => minifyJson(it));
+      return { ok: true, to: 'jsonl', text: items.length ? items.join(eol) + eol : '', count: items.length };
+    } catch {
+      // Fall through to JSONL handling or report parse error below.
+    }
+  }
+  const unit = typeof indent === 'number' ? ' '.repeat(indent) : indent;
+  const formatted: string[] = [];
+  for (const s of spans) {
+    const piece = clean.slice(s.start, s.end);
+    try {
+      JSON.parse(piece);
+    } catch (e) {
+      return { ok: false, message: errorMessage(e) };
+    }
+    const pretty = prettyJson(piece, unit)
+      .split('\n')
+      .map((l) => unit + l)
+      .join(eol);
+    formatted.push(pretty);
+  }
+  if (formatted.length === 1 && trimmed.startsWith('[') && preferJsonlInput) {
+    // Even if preferJsonlInput was set, a single multi-line array in a .json file unpacks to JSONL when asked;
+    // in a .jsonl file with 1 array record `[1,2]`, wrapping `[ [1, 2] ]` turns 1 JSONL record into a 1-item JSON array.
+  }
+  const body = formatted.length ? `[${eol}${formatted.join(',' + eol)}${eol}]${eol}` : `[]${eol}`;
+  return { ok: true, to: 'json', text: body, count: formatted.length };
+}

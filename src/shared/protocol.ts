@@ -7,6 +7,13 @@ export type JsonPath = (string | number)[];
 /** 'vscode' follows the VS Code color theme; 'system' follows the operating system. */
 export type ThemeMode = 'vscode' | 'light' | 'dark' | 'system';
 export type WrapSetting = 'followEditor' | 'on' | 'off';
+export type ExportRowFormat = 'jsonl' | 'csv' | 'json' | 'md';
+export type ExportAssetFormat = 'svg' | 'png' | 'ts' | 'json' | 'py';
+
+export type LineMutation =
+  | { op: 'insert'; after: number; text: string }
+  | { op: 'delete'; lines: number[] }
+  | { op: 'rewrite'; edits: { line: number; original: string; text: string }[] };
 
 /** Settings the webview may change (keys under "betterJsonl."). */
 export const SETTING_KEYS = [
@@ -124,9 +131,9 @@ export type HostMessage =
   | { type: 'setView'; view: ViewKind }
   | { type: 'toggleExpandMode' }
   | { type: 'toggleWrap' }
-  | { type: 'exportRows'; which: 'rows' | 'selected'; format: 'jsonl' | 'csv' }
+  | { type: 'exportRows'; which: 'rows' | 'selected'; format: ExportRowFormat }
   /** `line` and `text`: a large file, where the view shows the written line itself. */
-  | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string; cell?: boolean }
+  | { type: 'editResult'; ok: boolean; message?: string; line?: number; text?: string; cell?: boolean; batch?: boolean }
   /** jq module files, by "jq:path" or "json:path": their text, or null when there is none. */
   | { type: 'modules'; files: Record<string, string | null> }
   | { type: 'exportReady'; id: number; ok: boolean }
@@ -149,17 +156,19 @@ export type WebviewMessage =
   | { type: 'editLine'; line: number; original: string; text: string; exact?: boolean; cell?: boolean }
   /** One JSON document: replace the value at `path` with the JSON `text`. `version` is the version the view has. */
   | { type: 'editValue'; path: JsonPath; version: number; text: string; cell?: boolean }
+  /** Insert, delete, or batch-rewrite lines in a JSON Lines document. */
+  | { type: 'mutateLines'; version: number; mutation: LineMutation }
   /** Large files: follow the end of the file (new bytes are added to the view as they come). */
   | { type: 'follow'; on: boolean }
   | { type: 'loadAppended' }
   /** Export rows: the host asks where to save, then the view sends the text in pieces. */
-  | { type: 'exportStart'; id: number; format: 'jsonl' | 'csv'; name: string; rows: number }
+  | { type: 'exportStart'; id: number; format: ExportRowFormat; name: string; rows: number }
   | { type: 'exportData'; id: number; data: string; done: boolean; cancel?: boolean }
   /** Open two records side by side in the VS Code diff editor. */
   | { type: 'diff'; left: { title: string; text: string }; right: { title: string; text: string } }
   | { type: 'copy'; text: string }
   | { type: 'openAsText' }
-  | { type: 'export'; format: 'svg' | 'png'; data: string; name: string }
+  | { type: 'export'; format: ExportAssetFormat; data: string; name: string }
   | { type: 'setSetting'; key: SettingKey; value: unknown }
   | { type: 'openSettings' }
   | { type: 'report'; report: RenderReport };

@@ -2,7 +2,7 @@ import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { errorMessage, errorOffset, stripBom } from '../shared/jsonText';
 import type { JsonPath, TextChange } from '../shared/protocol';
 import type { ItemStore } from './items';
-import { compileQuery, type Program } from './query';
+import { compactJson, compileQuery, type Program } from './query';
 import {
   childKey,
   compareNumbers,
@@ -246,8 +246,10 @@ export class ByteStore implements LineStore {
   size(i: number): number {
     const o = this.overlay?.get(i);
     if (o) return o.length;
-    const end = i + 1 < this.nStarts ? this.starts[i + 1] - 1 : this.total;
-    return end - this.starts[i];
+    const a = this.starts[i];
+    let end = i + 1 < this.nStarts ? this.starts[i + 1] - 1 : this.total;
+    if (end > a && this.byteAt(end - 1) === 13) end--;
+    return end - a;
   }
 
   blank(i: number): boolean {
@@ -310,7 +312,7 @@ export class DocModel {
   private readonly endsWithEol: boolean = false;
   private kinds: Uint8Array;
   private readonly cache = new Map<number, Parsed>();
-  private readonly limited: boolean;
+  private limited: boolean;
   /** Records the background scan has seen. */
   private scanned = 0;
   valid = 0;
@@ -326,6 +328,8 @@ export class DocModel {
   private colsFinal = false;
   /** Grows when a record turns out to be invalid. The Formatted view gives those records two rows. */
   errorsVersion = 0;
+  /** Grows on in-place mutations (`replaceLine` / `append`) so views invalidate cached lines/columns. */
+  revision = 0;
 
   /** `src`: the text, the byte store of a large file, or the records of a JSON Lines document (with `endsWithEol`). */
   constructor(src: string | ByteStore | ItemStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false, preferJsonl = false) {
@@ -403,6 +407,26 @@ export class DocModel {
     return m;
   }
 
+  /** Virtual projected document built from jq / JSONPath output values. */
+  static fromValues(values: JVal[]): DocModel {
+    const lines = values.map((v) => compactJson(v));
+    const bytes = lines.reduce((sum, l) => sum + l.length + 1, 0);
+    const m = new DocModel(lines, true, bytes, true);
+    for (let i = 0; i < values.length; i++) {
+      const p: Parsed = { kind: 'value', value: values[i] };
+      m.note(i, p);
+      if (!m.limited) m.cache.set(i, p);
+    }
+    m.scanned = values.length;
+    m.colsFinal = true;
+    return m;
+  }
+
+  /** Enables keeping all records in memory once a small streamed `.gz` file finishes loading under 50 MB. */
+  allowKeepAll(): void {
+    if (!this.loading && this.bytes <= KEEP_ALL_BYTES) this.limited = false;
+  }
+
   /** Record i changed: what was known about it is gone, and the scan reads it again. */
   forget(i: number): void {
     const k = this.kinds[i];
@@ -419,6 +443,7 @@ export class DocModel {
       this.colsFinal = false;
     }
     this.errorsVersion++;
+    this.revision++;
   }
 
   /** A large file: line i was written by the view. */
@@ -437,6 +462,7 @@ export class DocModel {
     const last = store.count - 1;
     store.append(data, true);
     if (open && last >= 0) this.forget(last);
+    else this.revision++;
   }
 
   /** One JSON value too large for memory, shown as the items of its array (see items.ts). */
@@ -772,12 +798,23 @@ export function stepIn(sorted: ArrayLike<number>, from: number, dir: 1 | -1): nu
   return sorted[i >= 0 ? i : sorted.length - 1];
 }
 
-export type Op = ':' | '=' | '!=' | '>' | '<';
+export type Op = ':' | '=' | '==' | '!=' | '>=' | '<=' | '>' | '<';
+
+export interface SearchOptions {
+  caseSensitive?: boolean;
+  regex?: boolean;
+  literal?: boolean;
+  forceJq?: boolean;
+}
 
 export interface Query {
   raw: string;
-  /** Lower-case text for plain search. */
+  /** Normalized text for plain search (lower-case unless caseSensitive). */
   text: string;
+  caseSensitive?: boolean;
+  regex?: boolean;
+  literal?: boolean;
+  re?: RegExp;
   path?: JsonPath;
   op?: Op;
   value?: string;
@@ -789,27 +826,47 @@ export interface Query {
   needs?: string[];
 }
 
-/** Plain text search: no path query, no JSONPath or jq. */
+/** Plain text or regex search: no path query, no JSONPath or jq. */
 export function isTextQuery(q: Query): boolean {
   return !!q.text && !q.path && !q.program;
 }
 
-const PATH_QUERY = /^\s*(\$?[A-Za-z_$\[][^\s:=!<>]*)\s*(!=|=|:|>|<)\s*(.*)$/;
+const PATH_QUERY = /^\s*(\$?[A-Za-z_$\[][^\s:=!<>]*)\s*(!=|==|>=|<=|=|:|>|<)\s*(.*)$/;
 
-export function parseQuery(raw: string, model: DocModel, modules?: Map<string, string | null>): Query {
-  const q: Query = { raw, text: raw.trim().toLowerCase() };
-  const m = PATH_QUERY.exec(raw);
-  if (m) {
-    const path = parsePath(m[1]);
-    const head = path?.[0];
-    if (path && path.length && (m[1].startsWith('$') || (typeof head === 'string' && model.columns.includes(head)))) {
-      q.path = path;
-      q.op = m[2] as Op;
-      q.value = m[3].trim();
+export function parseQuery(raw: string, model: DocModel, modules?: Map<string, string | null>, opts?: SearchOptions): Query {
+  const trimmed = raw.trim();
+  const cs = !!opts?.caseSensitive;
+  const q: Query = {
+    raw,
+    text: cs ? trimmed : trimmed.toLowerCase(),
+    caseSensitive: cs,
+    regex: !!opts?.regex,
+    literal: !!opts?.literal,
+  };
+  if (!trimmed) return q;
+  if (opts?.regex) {
+    try {
+      q.re = new RegExp(trimmed, cs ? 'u' : 'iu');
+    } catch (e) {
+      q.error = e instanceof Error ? e.message : String(e);
+    }
+    return q;
+  }
+  if (opts?.literal) return q;
+  if (!opts?.forceJq) {
+    const m = PATH_QUERY.exec(raw);
+    if (m) {
+      const path = parsePath(m[1]);
+      const head = path?.[0];
+      if (path && path.length && (m[1].startsWith('$') || (model.isJsonl && typeof head === 'string' && model.columns.includes(head)))) {
+        q.path = path;
+        q.op = m[2] as Op;
+        q.value = m[3].trim();
+      }
     }
   }
   if (!q.path && q.text) {
-    const c = compileQuery(raw, modules);
+    const c = compileQuery(raw, modules, !!opts?.forceJq && !trimmed.startsWith('$'));
     q.program = c.program;
     q.error = c.error;
     q.needs = c.needs;
@@ -825,33 +882,58 @@ function stripQuotes(s: string): string {
   return s.length >= 2 && s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s;
 }
 
+export function matchesPathValue(v: JVal | undefined, op: Op | undefined, rawWant: string, caseSensitive = false): boolean {
+  const want = stripQuotes(rawWant);
+  switch (op) {
+    case ':':
+      if (v === undefined) return false;
+      return caseSensitive ? valueText(v).includes(want) : valueText(v).toLowerCase().includes(want.toLowerCase());
+    case '=':
+    case '==':
+      if (v === undefined) return false;
+      if ((typeof v === 'number' || v instanceof RawNum) && want && !Number.isNaN(Number(want)) && !rawWant.startsWith('"')) {
+        return compareNumbers(v, parseNumLiteral(want)) === 0;
+      }
+      return valueText(v) === want;
+    case '!=':
+      if (v === undefined) return true;
+      if ((typeof v === 'number' || v instanceof RawNum) && want && !Number.isNaN(Number(want)) && !rawWant.startsWith('"')) {
+        return compareNumbers(v, parseNumLiteral(want)) !== 0;
+      }
+      return valueText(v) !== want;
+    case '>':
+    case '<':
+    case '>=':
+    case '<=': {
+      if (v === undefined || (typeof v !== 'number' && !(v instanceof RawNum))) return false;
+      if (!want || Number.isNaN(Number(want))) return false;
+      const cmp = compareNumbers(v, parseNumLiteral(want));
+      return op === '>' ? cmp > 0 : op === '<' ? cmp < 0 : op === '>=' ? cmp >= 0 : cmp <= 0;
+    }
+  }
+  return false;
+}
+
 export function matchesRecord(model: DocModel, i: number, q: Query): boolean {
   if (!q.text) return true;
+  if (q.re) return q.re.test(model.line(i));
+  if (q.error && q.regex) return false;
   if (q.program) {
     const rec = model.scanValue(i);
     return rec !== undefined && q.program.matches(rec);
   }
-  if (!q.path) return model.line(i).toLowerCase().includes(q.text);
+  if (!q.path) {
+    const line = model.line(i);
+    const hay = q.caseSensitive ? line : line.toLowerCase();
+    if (hay.includes(q.text)) return true;
+    if (!q.literal && q.text.includes('": ')) {
+      return hay.includes(q.text.replace(/":\s+/g, '":'));
+    }
+    return false;
+  }
   const rec = model.scanValue(i);
   if (rec === undefined) return false;
-  const v = getAt(rec, q.path);
-  const want = stripQuotes(q.value ?? '');
-  switch (q.op) {
-    case ':':
-      return v !== undefined && valueText(v).toLowerCase().includes(want.toLowerCase());
-    case '=':
-      return v !== undefined && valueText(v) === want;
-    case '!=':
-      return v === undefined || valueText(v) !== want;
-    case '>':
-    case '<': {
-      if (v === undefined || (typeof v !== 'number' && !(v instanceof RawNum))) return false;
-      if (!want || Number.isNaN(Number(want))) return false;
-      const cmp = compareNumbers(v, parseNumLiteral(want));
-      return q.op === '>' ? cmp > 0 : cmp < 0;
-    }
-  }
-  return false;
+  return matchesPathValue(getAt(rec, q.path), q.op, q.value ?? '', q.caseSensitive);
 }
 
 // ---------- search in one JSON document ----------
@@ -874,8 +956,13 @@ export class TreeSearch {
   done = false;
   private readonly stack: Frame[] = [];
 
-  /** `q` is lower-case text. */
-  constructor(root: JVal, private readonly q: string, private readonly max = TREE_MATCHES) {
+  /** `q` is search text (lower-case unless `caseSensitive`). */
+  constructor(
+    root: JVal,
+    private readonly q: string,
+    private readonly max = TREE_MATCHES,
+    private readonly opts?: { caseSensitive?: boolean; re?: RegExp },
+  ) {
     this.visit(root, undefined, '');
   }
 
@@ -910,7 +997,8 @@ export class TreeSearch {
     const text = (typeof key === 'string' ? JSON.stringify(key) + ': ' : '') + (box ? (arr ? (n ? '[' : '[]') : n ? '{' : '{}') : primText(v));
     // The path is built only for a match and for a container that is entered.
     let path: string | undefined;
-    if (text.toLowerCase().includes(this.q)) {
+    const hit = this.opts?.re ? this.opts.re.test(text) : this.opts?.caseSensitive ? text.includes(this.q) : text.toLowerCase().includes(this.q);
+    if (hit) {
       if (this.matches.length >= this.max) {
         this.capped = true;
         this.done = true;

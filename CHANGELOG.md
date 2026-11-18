@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0
+
+- **Nested JSON-in-String Unpack**: string values containing serialized JSON (`"{...}"`, `"[...]"`, or multi-line JSONL) get an inline `JSON {N}` / `JSON [N]` unpack pill in Formatted and Grid views (plus right-click **Unpack JSON**) so double-encoded logs, tool calls, and webhook payloads expand in place without modifying the file.
+- **Multiline String Expansion & Value Inspector**: strings with `\n` can expand inline in Formatted view (`↵ N lines text`) or open in the full **Value Inspector** modal (`Text`, XSS-safe `Markdown`, pretty `JSON`, and `Decoded` tabs without preview truncation).
+- **Smart Value Semantic Decoder**: hovering or inspecting Unix epoch timestamps (seconds / ms / µs / ns) and ISO-8601 dates shows local time, UTC time, and the delta from the previous record; JWT tokens decode header, payload, and expiry status; Base64 values decode UTF-8 / JSON; URLs list decoded query parameters.
+- **jq Transform / Projection Virtual View**: toggle **Transform** (`xform`) in the search bar to project `jq` or `JSONPath` outputs (for example `{id, user: .user.name, fast: (.ms < 100)}`) into a virtual document across Formatted, Grid, Graph, Schema Generator, and Export.
+- **Search Modes, History & Saved Queries**: added **Match Case** (`Aa`), **Regular Expression** (`.*`), and **Literal Text** (`""`) toggles, `>=` / `<=` / `==` path operators, copy-pasted `"key": value` fallback, `↑` / `↓` query history, and starred saved queries (`★`).
+- **Timeline Sparkline & Numeric Percentiles**: JSONL files with timestamp columns can open an interactive 48-bucket **Timeline** bar with error markers and drag-to-brush time-window filtering; Grid column statistics now include `p50 · p95 · p99`, `sum`, and a 12-bin distribution histogram.
+- **Grid Column Manager & Numeric Range Filter**: added a **Columns** popover to search, show/hide, reorder, sticky-pin columns to the left, and mount columns beyond the default 300-column cap; added `Min` / `Max` numeric range inputs in column filters, missing-cell & nested sub-grid primitive editing, and an always-visible **Clear all filters** action in the status bar.
+- **Row Bookmarks**: press `B` (or `Alt+Click` a line number) to bookmark records, `[` / `]` to jump between bookmarks, and filter to **Bookmarked lines** only.
+- **Schema & Type Generator**: infer **TypeScript** interfaces, **JSON Schema (2020-12)**, **Python Pydantic** models, and **Zod** schemas from visible records with one-click Copy or Save.
+- **Field Context Menu, New Exports & Format Converter**: right-click any field or row for **Inspect value**, **Copy raw value / JSON / JSONPath / jq path**, **Filter `=` / `!=`**, bookmark, and row actions; export rows or selections as **JSON Array (`.json`)** and **Markdown Table (`.md`)**; added **Better JSONL: Convert JSON Array ↔ JSON Lines** (`betterJsonl.convertFormat`).
+- **Row Insert / Duplicate / Delete & Batch `jq` Rewrite**: insert, duplicate, or delete JSONL lines directly from the viewer (including `.jsonl.gz` and non-UTF-8 files), or transform records in bulk with before/after diff preview via **Batch `jq` rewrite**.
+- **Fixes & Hardening**: exact `RawNum` preservation for >=16-digit split decimals and overflow exponents, RFC 8259 control-byte validation in `byteJson`, jq recursion depth guard & recursive object `*` merge, symlink boundary check in `readModules`, virtual-filesystem read-only detection, High Contrast theme support, responsive Graph inspector drawer, and multi-URI webview state LRU.
+
 ## 0.7.0
 
 - **Fixed: Export (CSV / JSON Lines)** now acknowledges every streamed chunk so exports above 2 MB write the full file, close their file handle, and finish cleanly.

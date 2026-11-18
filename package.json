@@ -2,7 +2,7 @@
   "name": "better-jsonl",
   "displayName": "Better JSONL",
   "description": "%description%",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "andy",
   "license": "MIT",
   "repository": {
@@ -39,6 +39,16 @@
     "onWebviewPanel:betterJsonl.preview"
   ],
   "contributes": {
+    "languages": [
+      {
+        "id": "jsonl",
+        "extensions": [
+          ".jsonl",
+          ".ndjson",
+          ".jsonlines"
+        ]
+      }
+    ],
     "customEditors": [
       {
         "viewType": "betterJsonl.viewer",
@@ -55,6 +65,9 @@
           },
           {
             "filenamePattern": "*.json"
+          },
+          {
+            "filenamePattern": "*.jsonc"
           }
         ],
         "priority": "option"
@@ -128,13 +141,17 @@
       {
         "command": "betterJsonl.compactLines",
         "title": "%command.compactLines%"
+      },
+      {
+        "command": "betterJsonl.convertFormat",
+        "title": "%command.convertFormat%"
       }
     ],
     "menus": {
       "editor/title": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "resourceLangId == json || resourceLangId == jsonc || resourceLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "resourceLangId == json || resourceLangId == jsonc || resourceLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
           "group": "navigation@-100"
         },
         {
@@ -146,61 +163,70 @@
       "editor/title/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
+          "when": "resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "0_betterJsonl@1"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
+          "when": "resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "0_betterJsonl@2"
         }
       ],
       "editor/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
           "group": "0_betterJsonl@1"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
+          "when": "editorLangId == json || editorLangId == jsonc || editorLangId == jsonl || resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines",
           "group": "0_betterJsonl@2"
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@3"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
           "group": "0_betterJsonl@4"
+        },
+        {
+          "command": "betterJsonl.convertFormat",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson",
+          "group": "0_betterJsonl@5"
         }
       ],
       "explorer/context": [
         {
           "command": "betterJsonl.openPreviewToSide",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
+          "when": "resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "navigation@20"
         },
         {
           "command": "betterJsonl.openInViewer",
-          "when": "resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
+          "when": "resourceExtname == .json || resourceExtname == .jsonc || resourceExtname == .jsonl || resourceExtname == .ndjson || resourceExtname == .jsonlines || resourceExtname == .gz",
           "group": "navigation@21"
         }
       ],
       "commandPalette": [
         {
           "command": "betterJsonl.openAsText",
-          "when": "activeCustomEditorId == betterJsonl.viewer"
+          "when": "activeCustomEditorId == betterJsonl.viewer || activeWebviewPanelId == betterJsonl.preview"
         },
         {
           "command": "betterJsonl.expandLines",
-          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         },
         {
           "command": "betterJsonl.compactLines",
-          "when": "editorLangId == jsonl || editorLangId == json || editorLangId == jsonc || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
+        },
+        {
+          "command": "betterJsonl.convertFormat",
+          "when": "editorLangId == jsonl || editorLangId == json || resourceExtname == .json || resourceExtname == .jsonl || resourceExtname == .jsonlines || resourceExtname == .ndjson"
         }
       ]
     },

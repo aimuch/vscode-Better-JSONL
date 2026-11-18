@@ -62,6 +62,7 @@ export function parseJsonBytes(chunks: readonly Uint8Array[]): JVal {
     while (j < n) {
       const b = cur[j];
       if (b === 34) break;
+      if (b < 0x20) fail('the string has a control character');
       if (b === 92) {
         esc = true;
         j += 2;
@@ -84,6 +85,7 @@ export function parseJsonBytes(chunks: readonly Uint8Array[]): JVal {
         const b = peek();
         if (b < 0) fail('the string has no end');
         if (b === 34) break;
+        if (b < 0x20) fail('the string has a control character');
         if (len + 2 > scratch.length) {
           const grown = new Uint8Array(scratch.length * 2);
           grown.set(scratch);

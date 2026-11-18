@@ -3,22 +3,25 @@
 // Run: npm run test:unit
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compactText, minifyJson, prettyJson, splitJsonValues } from '../../src/shared/jsonText';
+import { compactText, convertJsonAndJsonl, minifyJson, prettyJson, splitJsonValues } from '../../src/shared/jsonText';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { EncodeError, encodeText } from '../../src/encoding';
-import { compare, fileState, LineConflict, replaceLine } from '../../src/fileEdit';
+import { compare, fileState, LineConflict, mutateFileLines, replaceLine } from '../../src/fileEdit';
 import { locatePath, valueSpan } from '../../src/locate';
 import { indexItems, ItemStore } from '../../src/webview/items';
 import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
 import { diffValues } from '../../src/webview/diff';
-import { csvField, csvRow } from '../../src/webview/exporter';
+import { csvField, csvRow, mdDivider, mdRow } from '../../src/webview/exporter';
+import { decodeSmartValue, renderMarkdownSafe, resolveAtPathKey, tryUnpackJsonString } from '../../src/webview/inspect';
+import { emitJsonSchema, emitPydantic, emitTypeScript, emitZod, inferSchema } from '../../src/webview/schema';
+import { buildTimeline, detectTimeColumn } from '../../src/webview/timeline';
 import { compactJson, compileJq, compileJsonPath, compileQuery, formatValue, pathOf } from '../../src/webview/query';
 import { ByteStore, DocModel, K_ERROR, K_UNKNOWN, K_VALUE, lowerBound, matchesRecord, parseQuery, patchLines, stepIn, TreeSearch } from '../../src/webview/model';
 import { buildLines, countLines, lineText } from '../../src/webview/views/lines';
-import { childKey, compareNumbers, decodeKey, parseJson, parseNumLiteral, RawNum, type JVal } from '../../src/webview/json';
+import { childKey, compareNumbers, decodeKey, parseJson, parseNumLiteral, pathToJq, parsePath, RawNum, type JVal } from '../../src/webview/json';
 
 /** A small seeded generator, so a failure can be repeated. */
 function rng(seed: number): () => number {
@@ -853,6 +856,143 @@ test('ByteStore standalone CR line ends, DocModel sticky JSONL, hasNonObject res
     await replaceLine(link, 0, '{"a":1}', '{"a":10}', { gzip: false, encoding: 'utf-8' });
     assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'symlink preserved');
     assert.equal(fs.readFileSync(crFile, 'utf8'), '{"a":10}\r{"b":2}\r');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v0.8 number precision, parsePath brackets, byteJson control bytes, and jq safety/semantics', () => {
+  // 1. Split decimals (>= 16 digits across `.`) and overflow exponents (`1e500`) stay exact RawNum.
+  const decA = parseJson('{"t":1731899999.12345678}') as { t: RawNum };
+  const decB = parseJson('{"t":1731899999.12345679}') as { t: RawNum };
+  assert.equal(decA.t instanceof RawNum, true);
+  assert.equal(decA.t.src, '1731899999.12345678');
+  assert.equal(compareNumbers(decA.t, decB.t), -1);
+  const hugeExp = parseJson('1e500') as RawNum;
+  assert.equal(hugeExp instanceof RawNum && hugeExp.src === '1e500', true);
+  assert.equal(compareNumbers(hugeExp, parseNumLiteral('1e499')), 1);
+
+  // 2. parsePath with `]` inside quoted keys, and pathToJq formatting.
+  assert.deepEqual(parsePath('$["a]b"][0].x'), ['a]b', 0, 'x']);
+  assert.equal(pathToJq(['user', 'a.b', 0, 'say "hi"']), '.user["a.b"][0]["say \\"hi\\""]');
+
+  // 3. byteJson rejects unescaped ASCII control bytes (< 0x20) inside JSON strings.
+  assert.throws(() => parseJsonBytes([new TextEncoder().encode('"hello\nworld"')]), ByteJsonError);
+  assert.throws(() => parseJsonBytes([new TextEncoder().encode('"tab\there"')]), ByteJsonError);
+
+  // 4. jq recursion budget, string repeat caps/rounding, recursive object `*`, del/delpaths, emoji slice, tonumber RawNum, from_entries __proto__.
+  assert.equal(compileJq('def inf: inf; inf').run(null).capped, true);
+  assert.equal(compileJq('def inf: inf; inf').matches(null), false);
+  assert.equal(compileJq('recurse(.)').run({ a: 1 }).capped, true);
+  assert.deepEqual(jq('"ab" * 0, "ab" * 2.9, "ab" * -1', null), ['""', '"abab"', 'null']);
+  assert.throws(() => compileJq('"x" * 2000000').run(null), /repeated string is too long/);
+  assert.deepEqual(jq('{"a":{"x":1,"y":2},"k":1} * {"a":{"y":9,"z":3}}', null), ['{"a":{"x":1,"y":9,"z":3},"k":1}']);
+  assert.deepEqual(jq('del(.[0], .[0])', [10, 20, 30]), ['[20,30]']);
+  assert.deepEqual(jq('delpaths([[-1], [-2]])', [10, 20, 30, 40]), ['[10,20]']);
+  assert.deepEqual(jq('.[0:2]', '😀abc'), ['"😀a"']);
+  assert.deepEqual(jq('"9007199254740993" | tonumber', null), ['9007199254740993']);
+  assert.deepEqual(jq('[{"key":"__proto__","value":42},{"key":"a","value":1}] | from_entries', null), ['{"__proto__":42,"a":1}']);
+});
+
+test('v0.8 search modes, >= / <= path queries, unpacked/multiline lines, inspect, schema, timeline, convert & mutate', async () => {
+  const m = new DocModel('{"id":1,"ms":100,"msg":"Hello World"}\n{"id":2,"ms":250,"msg":"hello [regex]+"}\n', true);
+  m.parseSome(1000);
+
+  // >=, <=, == path queries + SearchOptions (caseSensitive, regex, literal) + `": "` copy-paste fallback
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('ms>=100', m))), [true, true]);
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('ms<=100', m))), [true, false]);
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('id==2', m))), [false, true]);
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('Hello', m, undefined, { caseSensitive: true }))), [true, false]);
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('\\[regex\\]\\+', m, undefined, { regex: true }))), [false, true]);
+  assert.deepEqual([0, 1].map((i) => matchesRecord(m, i, parseQuery('[regex]+', m, undefined, { literal: true }))), [false, true]);
+  assert.equal(matchesRecord(m, 0, parseQuery('"id": 1', m)), true);
+
+  // ByteStore CRLF lineSize excludes \r
+  const crlfStore = new ByteStore();
+  crlfStore.append(new TextEncoder().encode('{"a":1}\r\n{"b":22}\r\n'), true);
+  assert.deepEqual([crlfStore.size(0), crlfStore.size(1)], [7, 8]);
+
+  // Unpacked JSON-in-string & multiline string expansion preserve countLines === buildLines.length
+  assert.deepEqual(tryUnpackJsonString('{"x":1}'), { x: 1 });
+  assert.deepEqual(tryUnpackJsonString('{"a":1}\n{"b":2}'), [{ a: 1 }, { b: 2 }]);
+  const nestedDoc: JVal = { payload: '{"nested":{"k":1},"arr":[1,2]}', stack: 'Error: boom\n  at fn (a.ts:1)\n  at main (b.ts:2)' };
+  const pPayload = childKey('', 'payload');
+  const pStack = childKey('', 'stack');
+  const unpacked = new Set([pPayload]);
+  const multiline = new Set([pStack]);
+  const lines = buildLines(nestedDoc, new Set(), Infinity, unpacked, multiline);
+  assert.equal(countLines(nestedDoc, new Set(), Infinity, unpacked, multiline), lines.length);
+  assert.equal(resolveAtPathKey(nestedDoc, childKey(childKey(pPayload, 'nested'), 'k'), unpacked), 1);
+
+  // Smart Value Decoder (Timestamp + delta, JWT, Base64, URL) & XSS-safe Markdown
+  const tsDec = decodeSmartValue(1730000005, 1730000000_000);
+  assert.equal(tsDec[0]?.kind, 'timestamp');
+  if (tsDec[0]?.kind === 'timestamp') assert.equal(tsDec[0].delta, '+5.00 s');
+
+  const jwtHeader = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const jwtPayload = Buffer.from(JSON.stringify({ sub: 'u_1', exp: 1893456000 })).toString('base64url');
+  const jwtDec = decodeSmartValue(`${jwtHeader}.${jwtPayload}.sig`);
+  assert.equal(jwtDec.some((d) => d.kind === 'jwt'), true);
+
+  const b64Dec = decodeSmartValue(Buffer.from('{"hello":"world","n":42}').toString('base64'));
+  assert.equal(b64Dec.some((d) => d.kind === 'base64' && d.json !== undefined), true);
+
+  const urlDec = decodeSmartValue('https://example.com/cb?q=hello%20world&lang=zh');
+  assert.equal(urlDec.some((d) => d.kind === 'url' && d.params.length === 2), true);
+
+  const md = renderMarkdownSafe('# Title\n\n<script>alert(1)</script>\n\n| A | B |\n|---|---|\n| **1** | `2` |');
+  assert.equal(md.includes('<script>'), false);
+  assert.equal(md.includes('&#60;script&#62;'), true);
+  assert.equal(md.includes('<table class="md-tbl">'), true);
+
+  // Schema inference (TypeScript, JSON Schema, Pydantic, Zod) & Markdown table export
+  const { schema, sampled } = inferSchema([
+    { id: 1, name: 'Ada', tags: ['a'] },
+    { id: 2, score: 9.5, tags: [] },
+  ]);
+  assert.equal(sampled, 2);
+  assert.match(emitTypeScript(schema, 'Event'), /name\?: string;/);
+  assert.match(emitJsonSchema(schema, 'Event'), /"required": \[\s*"id",\s*"tags"\s*\]/);
+  assert.match(emitPydantic(schema, 'Event'), /class Event\(BaseModel\):/);
+  assert.match(emitZod(schema, 'EventSchema'), /z\.object/);
+  assert.equal(mdRow(['a|b', 'line1\nline2']), '| a\\|b | line1<br>line2 |');
+  assert.equal(mdDivider(2), '| --- | --- |');
+
+  // Timeline detection & bucketing
+  const tlModel = new DocModel('{"ts":"2026-10-27T09:00:00Z","v":1}\n{"ts":"2026-10-27T09:10:00Z","v":2}\n{bad}\n', true);
+  tlModel.parseSome(1000);
+  const tcol = detectTimeColumn(tlModel);
+  assert.equal(tcol, 'ts');
+  const tl = buildTimeline(tlModel, tcol!, 8);
+  assert.ok(tl && tl.counts[0] === 1 && tl.counts[7] === 1 && tl.errors.reduce((a, b) => a + b, 0) === 1);
+
+  // Lossless JSON Array <-> JSONL conversion (preserving >53-bit integers)
+  const arrSrc = '[\n  { "id": 9007199254740993, "k": "a" },\n  { "id": 2, "k": "b" }\n]\n';
+  const toJl = convertJsonAndJsonl(arrSrc, '  ', '\n');
+  assert.ok(toJl.ok && toJl.to === 'jsonl' && toJl.count === 2);
+  assert.equal(toJl.text, '{"id":9007199254740993,"k":"a"}\n{"id":2,"k":"b"}\n');
+  const backToArr = convertJsonAndJsonl(toJl.text, '  ', '\n');
+  assert.ok(backToArr.ok && backToArr.to === 'json' && backToArr.text.includes('9007199254740993'));
+
+  // Streaming mutateFileLines (insert, rewrite, delete) on plain & .gz files
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bj-mut-'));
+  try {
+    const f = path.join(dir, 'data.jsonl');
+    fs.writeFileSync(f, '{"id":1}\r\n{"id":2}\r\n{"id":3}\r\n');
+    await mutateFileLines(f, { op: 'insert', after: 0, text: '{"id":1.5}' }, { gzip: false, encoding: 'utf-8' });
+    assert.equal(fs.readFileSync(f, 'utf8'), '{"id":1}\r\n{"id":1.5}\r\n{"id":2}\r\n{"id":3}\r\n');
+    await mutateFileLines(
+      f,
+      { op: 'rewrite', edits: [{ line: 2, original: '{"id":2}', text: '{"id":20}' }] },
+      { gzip: false, encoding: 'utf-8' },
+    );
+    await mutateFileLines(f, { op: 'delete', lines: [0, 3] }, { gzip: false, encoding: 'utf-8' });
+    assert.equal(fs.readFileSync(f, 'utf8'), '{"id":1.5}\r\n{"id":20}\r\n');
+
+    const gz = path.join(dir, 'data.jsonl.gz');
+    fs.writeFileSync(gz, zlib.gzipSync('{"a":1}\n{"a":2}\n'));
+    await mutateFileLines(gz, { op: 'insert', after: 1, text: '{"a":3}' }, { gzip: true, encoding: 'utf-8' });
+    assert.equal(zlib.gunzipSync(fs.readFileSync(gz)).toString('utf8'), '{"a":1}\n{"a":2}\n{"a":3}\n');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

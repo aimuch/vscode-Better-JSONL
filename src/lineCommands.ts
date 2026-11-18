@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { isJsonlDocument } from './config';
 import { t } from './shared/i18n';
-import { compactText, minifyJson, prettyJson } from './shared/jsonText';
+import { compactText, convertJsonAndJsonl, minifyJson, prettyJson, stripBom } from './shared/jsonText';
 
 function eolOf(doc: vscode.TextDocument): string {
   return doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
@@ -37,14 +37,18 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
   const indent = editorIndent(editor);
   const eol = eolOf(doc);
   let count = 0;
+  const expandedSpans: [number, number][] = [];
+  let lineDelta = 0;
   const ok = await editor.edit((b) => {
     for (const range of lineRanges(doc, editor.selections)) {
       const out: string[] = [];
       let changed = false;
       for (let l = range.start.line; l <= range.end.line; l++) {
-        const text = doc.lineAt(l).text;
+        const rawText = doc.lineAt(l).text;
+        const text = l === 0 ? stripBom(rawText) : rawText;
+        const bom = l === 0 && rawText !== text ? '\ufeff' : '';
         if (!text.trim()) {
-          out.push(text);
+          out.push(rawText);
           continue;
         }
         try {
@@ -54,12 +58,20 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
             changed = true;
             count++;
           }
-          out.push(pretty.split('\n').join(eol));
+          out.push(bom + pretty.split('\n').join(eol));
         } catch {
-          out.push(text);
+          out.push(rawText);
         }
       }
-      if (changed) b.replace(range, out.join(eol));
+      if (changed) {
+        const joined = out.join(eol);
+        const newLines = joined.split(eol).length;
+        const oldLines = range.end.line - range.start.line + 1;
+        const startAfter = range.start.line + lineDelta;
+        expandedSpans.push([startAfter, startAfter + newLines - 1]);
+        lineDelta += newLines - oldLines;
+        b.replace(range, joined);
+      }
     }
   });
   const cfg = vscode.workspace.getConfiguration('betterJsonl');
@@ -74,9 +86,20 @@ export async function expandLines(editor: vscode.TextEditor): Promise<number> {
         compact,
         never,
       )
-      .then((pick) => {
-        if (pick === compact) return vscode.commands.executeCommand('betterJsonl.compactLines');
-        if (pick === never) return cfg.update('expandLines.showReminder', false, vscode.ConfigurationTarget.Global);
+      .then(async (pick) => {
+        if (pick === compact) {
+          const ed = vscode.window.visibleTextEditors.find((e) => e.document === doc) ?? (await vscode.window.showTextDocument(doc));
+          if (expandedSpans.length && ed.selections.every((s) => s.isEmpty)) {
+            ed.selections = expandedSpans
+              .filter(([a, b]) => b < doc.lineCount && a <= b)
+              .map(([a, b]) => new vscode.Selection(a, 0, b, doc.lineAt(b).text.length));
+          }
+          return compactLines(ed);
+        }
+        if (pick === never) {
+          const target = cfg.inspect('expandLines.showReminder')?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+          return cfg.update('expandLines.showReminder', false, target);
+        }
         return undefined;
       });
   }
@@ -118,10 +141,12 @@ export function formatJsonl(doc: vscode.TextDocument): vscode.TextEdit[] {
   let perLineOk = true;
   for (let l = 0; l < doc.lineCount; l++) {
     const line = doc.lineAt(l);
-    if (!line.text.trim()) continue;
+    const text = l === 0 ? stripBom(line.text) : line.text;
+    const bom = l === 0 && text !== line.text ? '\ufeff' : '';
+    if (!text.trim()) continue;
     try {
-      JSON.parse(line.text);
-      const min = minifyJson(line.text);
+      JSON.parse(text);
+      const min = bom + minifyJson(text);
       if (min !== line.text) edits.push(vscode.TextEdit.replace(line.range, min));
     } catch {
       perLineOk = false;
@@ -135,4 +160,29 @@ export function formatJsonl(doc: vscode.TextDocument): vscode.TextEdit[] {
   const trailing = /\r?\n\s*$/.test(all) ? eolOf(doc) : '';
   const full = new vscode.Range(0, 0, doc.lineCount - 1, doc.lineAt(doc.lineCount - 1).text.length);
   return [vscode.TextEdit.replace(full, res.text + trailing)];
+}
+
+/** Converts a JSON array document to JSON Lines, or a JSON Lines document to a pretty JSON array. */
+export async function convertFormat(editor: vscode.TextEditor): Promise<boolean> {
+  const doc = editor.document;
+  const src = doc.getText();
+  const eol = eolOf(doc);
+  const indent = editorIndent(editor);
+  const res = convertJsonAndJsonl(src, indent, eol, isJsonlDocument(doc));
+  if (!res.ok) {
+    void vscode.window.showErrorMessage(t('Better JSONL: cannot convert invalid JSON ({0}).', res.message));
+    return false;
+  }
+  const full = new vscode.Range(0, 0, doc.lineCount - 1, doc.lineAt(Math.max(0, doc.lineCount - 1)).text.length);
+  const ok = await editor.edit((b) => b.replace(full, res.text));
+  if (ok) {
+    await vscode.languages.setTextDocumentLanguage(doc, res.to === 'jsonl' ? 'jsonl' : 'json');
+    vscode.window.setStatusBarMessage(
+      res.to === 'jsonl'
+        ? t('Better JSONL: converted to JSON Lines ({0} records).', res.count)
+        : t('Better JSONL: converted to JSON array ({0} items).', res.count),
+      3000,
+    );
+  }
+  return ok;
 }

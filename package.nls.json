@@ -11,6 +11,7 @@
   "command.toggleWordWrap": "Better JSONL: Toggle Word Wrap",
   "command.expandLines": "Better JSONL: Expand Selected Lines",
   "command.compactLines": "Better JSONL: Compact Lines",
+  "command.convertFormat": "Better JSONL: Convert JSON Array ↔ JSON Lines",
   "config.defaultView": "The view that opens first.",
   "config.defaultView.formatted": "Formatted cards (Focus or Expand all for JSONL).",
   "config.defaultView.grid": "Grid of records with nested sub-grids.",

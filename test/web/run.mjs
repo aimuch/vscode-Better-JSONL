@@ -1112,7 +1112,16 @@ await scenario('W43', 'Export: rows as CSV or JSON Lines, sent in pieces when th
   await complete(page);
   await page.click('.export-btn');
   const items = await page.$$eval('.export-menu .menu-item', (els) => els.map((e) => e.dataset.export));
-  check.eq('menu: all rows, and the selected line', items, ['rows:jsonl', 'rows:csv', 'selected:jsonl', 'selected:csv']);
+  check.eq('menu: all rows, and the selected line', items, [
+    'rows:jsonl',
+    'rows:csv',
+    'rows:json',
+    'rows:md',
+    'selected:jsonl',
+    'selected:csv',
+    'selected:json',
+    'selected:md',
+  ]);
   await shot('Export menu');
   await page.click('[data-export="rows:csv"]');
   const start = (await posted(page, 'exportStart')).at(-1);
@@ -1411,6 +1420,147 @@ await scenario('W51', 'Grid scales past 1.5M rows (>33.5M px); cross-token marks
   await send(page, { type: 'selection', lines: [1499999], active: 1499999 });
   await page.waitForFunction(() => document.querySelector('.grow[data-id="1499999"]'), null, { timeout: 10000 });
   check.ok('row 1,500,000 renders in the Grid past the 33.5M px browser height limit', await page.locator('.grow[data-id="1499999"]').isVisible());
+});
+
+await scenario('W52', 'v0.8 features: JSON unpack, multiline & Markdown inspector, search modes, jq Transform, Timeline, Bookmarks, Column Manager, range filter, Schema, Batch rewrite & Markdown export', [], async ({ page, check, shot }) => {
+  const sample = [
+    JSON.stringify({
+      id: 1,
+      ts: '2026-10-27T09:00:00Z',
+      ms: 10,
+      payload: '{"nested":{"ok":true},"items":[1,2]}',
+      note: '# Heading\n\nLine two\nLine three',
+      tok: 'https://api.test/cb?code=abc%20123&state=xyz',
+    }),
+    JSON.stringify({ id: 2, ts: '2026-10-27T09:05:00Z', ms: 50, payload: '{"nested":{"ok":false}}', note: 'hello [lit]+', tok: 'plain' }),
+    JSON.stringify({ id: 3, ts: '2026-10-27T09:10:00Z', ms: 200, payload: '{}', note: 'HELLO world', tok: 'plain' }),
+  ].join('\n') + '\n';
+
+  await open(page, 'v08.jsonl', { text: sample });
+  let r = await complete(page);
+  check.eq('3 valid records', r.stats.valid, 3);
+
+  // 1. Nested JSON-in-string unpack & multiline string expansion + Value Inspector (Markdown + URL decoded).
+  await page.locator('.formatted .unpack-btn').first().click();
+  await page.waitForFunction(() => document.querySelector('.formatted .rows')?.textContent.includes('"nested"'));
+  check.ok('stringified JSON unpacked inline in Formatted view', (await page.locator('.formatted .rows').innerText()).includes('"ok": true'));
+
+  await page.locator('.formatted .ml-btn').first().click();
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .ml-line').length >= 2);
+  check.ok('multiline string expanded inline', (await page.locator('.formatted .rows').innerText()).includes('Line three'));
+
+  await page.locator('.formatted .row[data-r="0"]').filter({ hasText: 'api.test' }).click({ button: 'right' });
+  await page.locator('.ctx-menu [data-ctx="inspect"]').click();
+  await page.locator('.valpanel').waitFor({ state: 'visible' });
+  check.ok('URL query parameters decoded in Value Inspector', (await page.locator('.valpanel').innerText()).includes('abc 123'));
+  await page.keyboard.press('Escape');
+  check.ok('Escape closes Value Inspector', await page.locator('.valpanel').isHidden());
+
+  await page.locator('.formatted .row[data-r="0"]').filter({ hasText: 'Heading' }).first().click({ button: 'right' });
+  await page.locator('.ctx-menu [data-ctx="inspect"]').click();
+  await page.locator('.valpanel [data-vtab="md"]').click();
+  check.eq('Markdown tab renders heading safely', await page.locator('.valpanel .md-body h1').innerText(), 'Heading');
+  await page.keyboard.press('Escape');
+
+  // 2. Search mode toggles: literal (""), case-sensitive (Aa), regex (.*).
+  await page.click('.lit-btn');
+  await page.fill('.search input', '[lit]+');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('literal mode matches [lit]+', r.matches, 1);
+  await page.click('.lit-btn');
+
+  await page.click('.case-btn');
+  await page.fill('.search input', 'HELLO');
+  r = await report(page, (x) => x.matches === 1);
+  check.eq('case-sensitive mode matches HELLO only', r.matches, 1);
+  await page.click('.case-btn');
+
+  await page.click('.regex-btn');
+  await page.fill('.search input', '"ms":(50|200)');
+  r = await report(page, (x) => x.matches === 2);
+  check.eq('regex mode matches 2 records', r.matches, 2);
+  await page.click('.regex-btn');
+
+  // 3. jq Transform virtual projection across views.
+  await page.fill('.search input', '{id, fast: (.ms < 100)}');
+  await page.click('.xform-btn');
+  await page.waitForFunction(() => document.querySelector('.proj-chip') !== null);
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid' && x.grid.columns.length === 2);
+  check.eq('projected virtual Grid columns', r.grid.columns, ['id', 'fast']);
+  await shot('jq Transform projected view in Grid');
+  await page.click('[data-exit-xform]');
+  await page.fill('.search input', '');
+  await tabBtn(page, 'formatted').click();
+  r = await report(page, (x) => x.view === 'formatted' && x.stats.lines === 3);
+
+  // 4. Bookmarks + Clear all filters chip + Timeline sparkline.
+  await page.locator('.formatted .scroller').focus();
+  await page.keyboard.press('b');
+  await page.waitForFunction(() => document.querySelector('.formatted .row.first[data-r="0"].bookmarked') !== null);
+  await page.click('.bm-btn');
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .row.first').length === 1);
+  check.eq('bookmarked-only filter shows 1 record', await page.locator('.formatted .row.first').count(), 1);
+  await page.click('[data-clear-all-filters]');
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .row.first').length === 3);
+  check.eq('Clear all filters chip restores all 3 records', await page.locator('.formatted .row.first').count(), 3);
+
+  await page.click('.timeline-btn');
+  await page.locator('.timeline-bar').waitFor({ state: 'visible' });
+  check.eq('timeline bar renders 48 buckets', await page.locator('.timeline-bar .tl-slot').count(), 48);
+  await page.click('.timeline-btn');
+
+  // 5. Grid Column Manager (pin & hide) + numeric >= Min / <= Max range filter + percentiles.
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid');
+  await page.click('.cols-btn');
+  await page.locator('.col-picker').waitFor({ state: 'visible' });
+  await page.click('.col-picker [data-cpin="id"]');
+  check.ok('pinned column has sticky class', (await page.locator('.gh[data-col="id"].sticky').count()) === 1);
+  await page.click('.col-picker input[data-ctoggle="tok"]');
+  r = await report(page, (x) => !x.grid.columns.includes('tok'));
+  check.ok('hidden column removed from Grid', !r.grid.columns.includes('tok'));
+  await page.keyboard.press('Escape');
+
+  await page.hover('.gh[data-col="ms"]');
+  await page.click('.gh[data-col="ms"] .gh-f');
+  const gfStats = await page.locator('.gf-stats').innerText();
+  check.ok('percentiles shown in numeric column stats', gfStats.includes('p50') && gfStats.includes('p95'), gfStats);
+  await page.fill('.gfilter [data-fmin]', '20');
+  await page.fill('.gfilter [data-fmax]', '100');
+  r = await report(page, (x) => x.grid.rows === 1);
+  check.eq('numeric [min, max] filter narrows to ms=50', r.grid.rows, 1);
+  await page.click('.gfilter .gf-clear');
+  r = await report(page, (x) => x.grid.rows === 3);
+  await page.keyboard.press('Escape');
+
+  // 6. Schema Generator modal, Batch jq Rewrite preview & apply, and Markdown Table export.
+  await page.click('.schema-btn');
+  await page.locator('.schemapanel').waitFor({ state: 'visible' });
+  check.ok('TypeScript interface inferred', (await page.locator('.schemapanel .sp-code').innerText()).includes('export interface V08'));
+  await page.click('.schemapanel [data-stab="zod"]');
+  check.ok('Zod schema generated', (await page.locator('.schemapanel .sp-code').innerText()).includes('z.object'));
+  await page.keyboard.press('Escape');
+
+  await page.click('.wand-btn');
+  await page.locator('.batchpanel').waitFor({ state: 'visible' });
+  await page.fill('.batchpanel .batch-expr', '.ms += 5');
+  await page.click('.batchpanel .batch-prev');
+  await page.locator('.batchpanel .batch-diff').waitFor({ state: 'visible' });
+  await page.click('.batchpanel .batch-apply');
+  await page.waitForFunction(() => window.harness.posted('mutateLines').length === 1);
+  const mut = (await posted(page, 'mutateLines'))[0];
+  check.eq('Batch jq rewrite posts atomic rewrite mutation for all 3 lines', [mut.mutation.op, mut.mutation.edits.length], ['rewrite', 3]);
+  await page.keyboard.press('Escape');
+
+  await page.click('.export-btn');
+  await page.click('[data-export="rows:md"]');
+  const expStart = (await posted(page, 'exportStart')).at(-1);
+  check.eq('Markdown table export started', expStart.format, 'md');
+  await send(page, { type: 'exportReady', id: expStart.id, ok: true });
+  await page.waitForFunction((id) => window.harness.posted('exportData').some((m) => m.id === id), expStart.id);
+  const mdOut = (await posted(page, 'exportData')).find((m) => m.id === expStart.id).data;
+  check.ok('Markdown pipe table header emitted', mdOut.startsWith('| id | ts | ms |'), mdOut.slice(0, 80));
 });
 
 await browser.close();

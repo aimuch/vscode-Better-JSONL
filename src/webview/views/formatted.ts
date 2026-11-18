@@ -1,9 +1,10 @@
 import { t } from '../../shared/i18n';
 import type { RenderReport } from '../../shared/protocol';
 import { defer, type App, type View } from '../app';
-import { childKey, decodeKey, esc, highlightRaw } from '../json';
+import { resolveAtPathKey } from '../inspect';
+import { childKey, decodeKey, esc, highlightRaw, parseJson, type JVal } from '../json';
 import { icon } from '../icons';
-import { isTextQuery, K_ERROR, K_VALUE, stepIn } from '../model';
+import { isTextQuery, K_ERROR, K_VALUE, stepIn, type Query } from '../model';
 import { buildLines, countLines, isFolded, lineHtml, lineText, type PLine } from './lines';
 
 /** Browsers cap element height near 33.5M px. Above this the scroll space is scaled. */
@@ -44,6 +45,7 @@ export class FormattedView implements View {
   private allHeights: Int32Array | null = null;
   private readonly lineCache = new Map<number, PLine[]>();
   private modelRef: unknown;
+  private modelRev = -1;
   private rendered = 0;
   private firstRecord = 0;
   /** JSON mode: pretty line numbers that match the search. */
@@ -87,6 +89,8 @@ export class FormattedView implements View {
     this.resizes.observe(this.scroller);
     this.rows.addEventListener('click', (e) => this.onClick(e));
     this.rows.addEventListener('dblclick', (e) => this.onDblClick(e));
+    this.rows.addEventListener('contextmenu', (e) => this.onContextMenu(e));
+    this.rows.addEventListener('mouseover', (e) => this.onHover(e));
   }
 
   show(): void {
@@ -145,6 +149,15 @@ export class FormattedView implements View {
   /** Precomputes record heights in slices before turning on Expand all on a large file. */
   prepareExpandAll(onProgress: (pct: number) => void, onDone: () => void): () => void {
     const m = this.app.model;
+    if (this.modelRef !== m || this.modelRev !== m.revision) {
+      this.modelRef = m;
+      this.modelRev = m.revision;
+      this.heights.clear();
+      this.allHeights = null;
+      this.lineCache.clear();
+      this.measured.clear();
+      this.measuredExpanded.clear();
+    }
     const n = m.count;
     if (!this.allHeights || this.allHeights.length < n) {
       const next = new Int32Array(Math.max(n, 1024));
@@ -153,7 +166,7 @@ export class FormattedView implements View {
     }
     const arr = this.allHeights;
     if (n <= 20_000) {
-      for (let r = 0; r < n; r++) if (!arr[r]) arr[r] = this.computeRecordHeight(r);
+      for (let r = 0; r < n; r++) if (!arr[r]) arr[r] = this.computeRecordHeight(r, true);
       return defer(onDone, 30);
     }
     let r = 0;
@@ -164,7 +177,7 @@ export class FormattedView implements View {
       if (cancelled || this.app.model !== m) return;
       const end = performance.now() + 12;
       while (r < n) {
-        if (!arr[r]) arr[r] = this.computeRecordHeight(r);
+        if (!arr[r]) arr[r] = this.computeRecordHeight(r, true);
         r++;
         if ((r & 127) === 0 && performance.now() > end) break;
       }
@@ -291,17 +304,23 @@ export class FormattedView implements View {
     return !app.model.isJsonl || app.expandAll || app.state.selected.has(r);
   }
 
+  invalidateRecord(r: number): void {
+    this.invalidateHeight(r);
+    this.lineCache.delete(r);
+    this.forgetMeasured(r);
+  }
+
   private invalidateHeight(r: number): void {
     this.heights.delete(r);
     if (this.allHeights && r < this.allHeights.length) this.allHeights[r] = 0;
   }
 
-  private computeRecordHeight(r: number): number {
+  private computeRecordHeight(r: number, scan = false): number {
     const m = this.app.model;
-    const p = this.app.expandAll ? m.scanParsed(r) : m.get(r);
+    const p = scan || this.app.expandAll ? m.scanParsed(r) : m.get(r);
     if (p.kind === 'blank') return 1;
     if (p.kind === 'error') return 2;
-    return countLines(p.value, this.app.foldsOf(r), this.app.foldDepthOf());
+    return countLines(p.value, this.app.foldsOf(r), this.app.foldDepthOf(), this.app.unpackedOf(r), this.app.multilineOf(r));
   }
 
   /**
@@ -335,8 +354,9 @@ export class FormattedView implements View {
   private layout(): void {
     const app = this.app;
     const m = app.model;
-    if (this.modelRef !== m) {
+    if (this.modelRef !== m || this.modelRev !== m.revision) {
       this.modelRef = m;
+      this.modelRev = m.revision;
       this.heights.clear();
       this.allHeights = null;
       this.lineCache.clear();
@@ -344,8 +364,7 @@ export class FormattedView implements View {
       this.measuredExpanded.clear();
     }
     if (!m.isJsonl) this.recs = [0];
-    else if (app.state.filterOnly && app.query.text) this.recs = app.matches;
-    else this.recs = null;
+    else this.recs = app.formattedRecords();
     this.recCount = this.recs ? this.recs.length : m.count;
     const n = this.recCount;
     const off = new Float64Array(n + 1);
@@ -551,7 +570,7 @@ export class FormattedView implements View {
     let lines = this.lineCache.get(r);
     if (!lines) {
       const v = this.app.model.value(r);
-      lines = v === undefined ? [] : buildLines(v, this.app.foldsOf(r), this.app.foldDepthOf());
+      lines = v === undefined ? [] : buildLines(v, this.app.foldsOf(r), this.app.foldDepthOf(), this.app.unpackedOf(r), this.app.multilineOf(r));
       if (this.lineCache.size >= LINE_CACHE) this.lineCache.delete(this.lineCache.keys().next().value as number);
       this.lineCache.set(r, lines);
     }
@@ -570,7 +589,13 @@ export class FormattedView implements View {
     const last = Math.min(this.total, this.rowAt(virtTop + vh) + 5);
     this.rows.style.transform = `translateY(${st + this.topOf(first) - virtTop}px)`;
     if (this.total === 0) {
-      const note = app.model.loading ? t('Loading…') : app.searching ? t('Searching…') : app.state.filterOnly && app.query.text ? t('No line matches the search.') : t('The file is empty.');
+      const note = app.model.loading
+        ? t('Loading…')
+        : app.searching
+          ? t('Searching…')
+          : app.recsFiltered()
+            ? t('No line matches the search.')
+            : t('The file is empty.');
       this.rows.innerHTML = `<div class="empty-note">${note}</div>`;
       this.rendered = 0;
       return;
@@ -598,7 +623,7 @@ export class FormattedView implements View {
     this.rows.innerHTML = html.join('');
     this.rendered = html.length;
     if (focus) this.refocus(focus);
-    if (isTextQuery(app.query)) this.markMatches(app.query.text);
+    if (isTextQuery(app.query)) this.markMatches(app.query);
     if (this.rowBit && !this.remeasuring) {
       const anchor = this.rowAt(virtTop);
       const into = virtTop - this.topOf(anchor);
@@ -629,7 +654,13 @@ export class FormattedView implements View {
     if (!(a instanceof HTMLElement) || !this.rows.contains(a)) return null;
     const row = a.closest('.row') as HTMLElement | null;
     if (!row) return null;
-    const kind = a.classList.contains('rbtn') ? `.rbtn.${a.classList[1]}` : '.fold';
+    const kind = a.classList.contains('rbtn')
+      ? `.rbtn.${a.classList[1]}`
+      : a.hasAttribute('data-unpack')
+        ? '[data-unpack]'
+        : a.hasAttribute('data-ml')
+          ? '[data-ml]'
+          : '.fold';
     return { r: row.dataset.r as string, j: row.dataset.j as string, kind };
   }
 
@@ -649,6 +680,7 @@ export class FormattedView implements View {
     if (m.isJsonl) {
       if (s.selected.has(r)) cls.push('sel');
       if (s.active === r) cls.push('act');
+      if (s.bookmarks.has(r)) cls.push('bookmarked');
     }
     if (j === 0) cls.push('first');
     if (j === h - 1) cls.push('last');
@@ -696,47 +728,48 @@ export class FormattedView implements View {
   /** The start of the raw line, highlighted. Only that part is read from the store. */
   private rawHtml(r: number, preview: number): string {
     const m = this.app.model;
-    const raw = m.head(r, preview);
-    const size = m.lineSize(r);
-    // A byte store knows the size in bytes; it is only a note, so the line is not decoded to count characters.
-    const more = m.large ? (raw.length >= preview ? size - preview : 0) : size - raw.length;
-    return highlightRaw(raw) + (more > 0 ? this.truncNote(more, m.large) : '');
+    const raw = m.head(r, preview + 1);
+    const trunc = raw.length > preview;
+    const shown = trunc ? raw.slice(0, preview) : raw;
+    let more = 0;
+    if (trunc) {
+      const size = m.lineSize(r);
+      more = m.large ? Math.max(1, size - new TextEncoder().encode(shown).length) : Math.max(1, size - shown.length);
+    }
+    return highlightRaw(shown) + (more > 0 ? this.truncNote(more, m.large) : '');
   }
 
   private actionsHtml(r: number): string {
     const edit = this.app.readOnly ? '' : `<button class="rbtn a-edit" data-r="${r}" title="${t('Edit this record (Enter)')}">${icon('edit', 12)}${t('Edit')}</button>`;
-    return `<span class="acts">${edit}<button class="rbtn a-copy" data-r="${r}" title="${t('Copy the raw line')}">${icon('copy', 12)}${t('Copy')}</button><button class="rbtn a-goto" data-r="${r}" title="${t('Reveal in the text editor')}">${icon('goto', 12)}${t('Source')}</button></span>`;
+    const goto = this.app.canRevealSource ? `<button class="rbtn a-goto" data-r="${r}" title="${t('Reveal in the text editor')}">${icon('goto', 12)}${t('Source')}</button>` : '';
+    return `<span class="acts">${edit}<button class="rbtn a-copy" data-r="${r}" title="${t('Copy the raw line')}">${icon('copy', 12)}${t('Copy')}</button>${goto}</span>`;
   }
 
   private truncNote(more: number, bytes: boolean): string {
     return `<span class="trunc">${t(bytes ? ' … about {0} more bytes' : ' … {0} more chars', more.toLocaleString())}</span>`;
   }
 
-  /** Marks plain-text matches in `.code-text`, including matches spanning several token spans. */
-  private markMatches(q: string): void {
-    if (!q) return;
+  /** Marks plain-text or regex matches in `.code-text`, including matches spanning several token spans. */
+  private markMatches(query: Query): void {
+    if (!query.text || (query.regex && !query.re)) return;
     for (const codeEl of Array.from(this.rows.querySelectorAll<HTMLElement>('.code-text'))) {
       const full = codeEl.textContent ?? '';
-      if (!full.toLowerCase().includes(q)) continue;
+      if (!query.re) {
+        const hay = query.caseSensitive ? full : full.toLowerCase();
+        if (!hay.includes(query.text)) continue;
+      }
       const nodes: { node: Text; start: number; end: number }[] = [];
       const walker = document.createTreeWalker(codeEl, NodeFilter.SHOW_TEXT);
       let clean = '';
       let cur: Node | null;
       while ((cur = walker.nextNode())) {
         const textNode = cur as Text;
-        if (textNode.parentElement?.closest('.trunc')) continue;
+        if (textNode.parentElement?.closest('.trunc, .ph, .pill')) continue;
         const start = clean.length;
         clean += textNode.data;
         nodes.push({ node: textNode, start, end: clean.length });
       }
-      const lower = clean.toLowerCase();
-      const spans: [number, number][] = [];
-      let pos = 0;
-      let k: number;
-      while ((k = lower.indexOf(q, pos)) >= 0) {
-        spans.push([k, k + q.length]);
-        pos = k + q.length;
-      }
+      const spans = findSpans(clean, query);
       if (!spans.length) continue;
       for (const { node, start, end } of nodes) {
         const text = node.data;
@@ -776,7 +809,17 @@ export class FormattedView implements View {
     if (act) {
       if (act.classList.contains('a-edit')) app.openEditor(r);
       else if (act.classList.contains('a-copy')) app.post({ type: 'copy', text: app.model.line(r) });
-      else app.reveal(r, []);
+      else if (act.classList.contains('a-goto')) app.reveal(r, []);
+      return;
+    }
+    const unpackEl = target.closest('[data-unpack]') as HTMLElement | null;
+    if (unpackEl) {
+      app.toggleUnpack(r, unpackEl.dataset.unpack as string);
+      return;
+    }
+    const mlEl = target.closest('[data-ml]') as HTMLElement | null;
+    if (mlEl) {
+      app.toggleMultiline(r, mlEl.dataset.ml as string);
       return;
     }
     const foldEl = target.closest('[data-k]') as HTMLElement | null;
@@ -785,11 +828,13 @@ export class FormattedView implements View {
       const f = app.folds(r);
       if (f.has(key)) f.delete(key);
       else f.add(key);
-      this.invalidateHeight(r);
-      this.lineCache.delete(r);
-      this.forgetMeasured(r);
+      this.invalidateRecord(r);
       this.render(r);
       app.stateChanged();
+      return;
+    }
+    if (e.altKey && target.closest('.gut') && app.model.isJsonl) {
+      app.toggleBookmark(r);
       return;
     }
     if (!app.model.isJsonl) return;
@@ -803,10 +848,108 @@ export class FormattedView implements View {
 
   private onDblClick(e: MouseEvent): void {
     const rowEl = (e.target as HTMLElement).closest('.row') as HTMLElement | null;
-    if (!rowEl || (e.target as HTMLElement).closest('.rbtn,[data-k]')) return;
+    if (!rowEl || (e.target as HTMLElement).closest('.rbtn,[data-k],[data-unpack],[data-ml]')) return;
     const r = Number(rowEl.dataset.r);
-    const path = rowEl.dataset.p ? decodeKey(rowEl.dataset.p) : [];
+    const pathKey = rowEl.dataset.p ?? '';
+    const path = pathKey ? decodeKey(pathKey) : [];
     window.getSelection()?.removeAllRanges();
+    if (!this.app.canRevealSource) {
+      const val = resolveAtPathKey(this.app.model.value(r), pathKey, this.app.unpackedOf(r));
+      this.app.openValueInspector(r, path, val);
+      return;
+    }
     this.app.reveal(r, path);
   }
+
+  private onContextMenu(e: MouseEvent): void {
+    const rowEl = (e.target as HTMLElement).closest('.row') as HTMLElement | null;
+    if (!rowEl) return;
+    e.preventDefault();
+    const r = Number(rowEl.dataset.r);
+    if (this.app.model.isJsonl && !this.app.state.selected.has(r)) this.app.selectRecord(r, 'set');
+    const pathKey = rowEl.dataset.p ?? '';
+    const path = pathKey ? decodeKey(pathKey) : [];
+    const root = this.app.model.value(r);
+    const val = resolveAtPathKey(root, pathKey, this.app.unpackedOf(r));
+    this.app.openContextMenu(e, { record: r, path, value: val, hasValue: root !== undefined && (pathKey === '' || val !== undefined) });
+  }
+
+  private onHover(e: MouseEvent): void {
+    const tok = (e.target as HTMLElement).closest('.ts, .tn') as HTMLElement | null;
+    if (!tok || tok.dataset.tip === '1') return;
+    tok.dataset.tip = '1';
+    const rowEl = tok.closest('.row') as HTMLElement | null;
+    if (!rowEl) return;
+    const r = Number(rowEl.dataset.r);
+    let val: JVal | undefined;
+    if (rowEl.dataset.p !== undefined) {
+      val = resolveAtPathKey(this.app.model.value(r), rowEl.dataset.p, this.app.unpackedOf(r));
+    } else {
+      try {
+        val = parseJson(tok.textContent ?? '');
+      } catch {
+        val = undefined;
+      }
+    }
+    if (val === undefined) return;
+    const tip = this.app.smartTooltip(r, val);
+    if (tip) tok.title = tip;
+  }
+}
+
+/** Finds non-overlapping `[start, end)` UTF-16 match spans in `clean`, preserving indices even under case-folding expansion (`İ`). */
+function findSpans(clean: string, query: Query): [number, number][] {
+  const spans: [number, number][] = [];
+  if (query.re) {
+    const flags = query.re.flags.includes('g') ? query.re.flags : query.re.flags + 'g';
+    const re = new RegExp(query.re.source, flags);
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(clean)) !== null) {
+      if (m[0].length > 0) spans.push([m.index, m.index + m[0].length]);
+      else re.lastIndex = m.index + (clean.codePointAt(m.index)! > 0xffff ? 2 : 1);
+      if (spans.length >= 2000) break;
+    }
+    return spans;
+  }
+  const needle = query.text;
+  if (!needle) return spans;
+  if (query.caseSensitive) {
+    let pos = 0;
+    let k: number;
+    while ((k = clean.indexOf(needle, pos)) >= 0) {
+      spans.push([k, k + needle.length]);
+      pos = k + needle.length;
+    }
+    return spans;
+  }
+  const lower = clean.toLowerCase();
+  if (lower.length === clean.length) {
+    let pos = 0;
+    let k: number;
+    while ((k = lower.indexOf(needle, pos)) >= 0) {
+      spans.push([k, k + needle.length]);
+      pos = k + needle.length;
+    }
+    return spans;
+  }
+  const map: number[] = [];
+  for (let i = 0; i < clean.length; ) {
+    const cp = clean.codePointAt(i)!;
+    const step = cp > 0xffff ? 2 : 1;
+    const folded = clean.slice(i, i + step).toLowerCase();
+    for (let f = 0; f < folded.length; f++) map.push(i);
+    i += step;
+  }
+  map.push(clean.length);
+  let pos = 0;
+  let k: number;
+  while ((k = lower.indexOf(needle, pos)) >= 0) {
+    const a = map[k];
+    const endIdx = k + needle.length;
+    let b = map[endIdx];
+    while (b === a && b < clean.length) b++;
+    spans.push([a, b]);
+    pos = endIdx;
+  }
+  return spans;
 }
