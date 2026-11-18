@@ -7,7 +7,7 @@ export type JsonPath = (string | number)[];
 /** 'vscode' follows the VS Code color theme; 'system' follows the operating system. */
 export type ThemeMode = 'vscode' | 'light' | 'dark' | 'system';
 export type WrapSetting = 'followEditor' | 'on' | 'off';
-export type ExportRowFormat = 'jsonl' | 'csv' | 'json' | 'md';
+export type ExportRowFormat = 'jsonl' | 'csv' | 'json' | 'md' | 'tsv' | 'sql';
 export type ExportAssetFormat = 'svg' | 'png' | 'ts' | 'json' | 'py';
 
 export type LineMutation =
@@ -81,6 +81,18 @@ export interface DocInfo {
   readOnly?: boolean;
 }
 
+/** Explicit finite-state-machine snapshot exposed for E2E harnesses, developers, and AI agents (AX). */
+export interface WebviewMachineSnapshot {
+  lifecycle: 'booting' | 'streaming' | 'parsing-json' | 'scanning' | 'ready' | 'error';
+  querySyntax: 'auto' | 'regex' | 'literal';
+  projection: 'off' | 'projecting' | 'projected';
+  search: 'idle' | 'running' | 'awaiting-modules';
+  modal: string | null;
+  popover: string | null;
+  mutation: 'idle' | 'cell' | 'record' | 'insert-open' | 'batch';
+  export: 'idle' | 'streaming';
+}
+
 /** A summary the webview reports after each render. The E2E tests read it. */
 export interface RenderReport {
   fileName: string;
@@ -111,6 +123,7 @@ export interface RenderReport {
   settingsOpen: boolean;
   lang: Lang;
   version: number;
+  machines?: WebviewMachineSnapshot;
 }
 
 export type HostMessage =
@@ -138,12 +151,13 @@ export type HostMessage =
   | { type: 'modules'; files: Record<string, string | null> }
   | { type: 'exportReady'; id: number; ok: boolean }
   | { type: 'exportDone'; id: number; ok: boolean; message: string }
+  | { type: 'fileDiff'; otherName: string; otherText: string }
   | { type: 'notice'; message: string; action?: 'reload' | 'append' };
 
 export type WebviewMessage =
   | { type: 'ready' }
   /** What the webview shows the document as. A .json file with one value per line is JSON Lines. */
-  | { type: 'docMode'; isJsonl: boolean }
+  | { type: 'docMode'; isJsonl: boolean; concatenated?: boolean }
   /** The changes did not fit: send the whole text again. */
   | { type: 'resync' }
   /** jq import / include: read these module files (paths relative to the document's folder). */
@@ -166,6 +180,8 @@ export type WebviewMessage =
   | { type: 'exportData'; id: number; data: string; done: boolean; cancel?: boolean }
   /** Open two records side by side in the VS Code diff editor. */
   | { type: 'diff'; left: { title: string; text: string }; right: { title: string; text: string } }
+  /** Ask the host to pick and read another JSON/JSONL file for cross-file diffing. */
+  | { type: 'compareWithFile' }
   | { type: 'copy'; text: string }
   | { type: 'openAsText' }
   | { type: 'export'; format: ExportAssetFormat; data: string; name: string }

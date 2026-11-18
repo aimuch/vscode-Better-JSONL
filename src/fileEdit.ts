@@ -96,6 +96,48 @@ async function write(stream: NodeJS.WritableStream, data: Uint8Array, seen?: (d:
   if (!stream.write(data)) await new Promise<void>((resolve) => stream.once('drain', resolve));
 }
 
+export type Compression = 'gzip' | 'brotli' | null;
+
+function resolveCompression(opts: { gzip?: boolean; compression?: Compression }): Compression {
+  if (opts.compression !== undefined) return opts.compression;
+  return opts.gzip ? 'gzip' : null;
+}
+
+function wrapReadStream(raw: Readable, comp: Compression): Readable {
+  if (comp === 'gzip') return raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 }));
+  if (comp === 'brotli') return raw.pipe(zlib.createBrotliDecompress({ chunkSize: 1024 * 1024 }));
+  return raw;
+}
+
+function wrapWriteStream(file: fs.WriteStream, comp: Compression): { sink: NodeJS.WritableStream; destroy: () => void } {
+  if (comp === 'gzip') {
+    const gz = zlib.createGzip({ chunkSize: 1024 * 1024 });
+    gz.pipe(file);
+    return {
+      sink: gz,
+      destroy: () => {
+        gz.unpipe(file);
+        gz.destroy();
+      },
+    };
+  }
+  if (comp === 'brotli') {
+    const br = zlib.createBrotliCompress({
+      chunkSize: 1024 * 1024,
+      params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+    });
+    br.pipe(file);
+    return {
+      sink: br,
+      destroy: () => {
+        br.unpipe(file);
+        br.destroy();
+      },
+    };
+  }
+  return { sink: file, destroy: () => undefined };
+}
+
 /** What replaceLine wrote (before compression): its size, its last bytes, and how its text is encoded. */
 export interface Written {
   total: number;
@@ -107,7 +149,7 @@ export interface Written {
 const WRITTEN_TAIL = 16 * 1024;
 
 /**
- * Replaces line `line` (0-based) of a file: plain or gzip-compressed, in its encoding
+ * Replaces line `line` (0-based) of a file: plain or compressed (`.gz` / `.br`), in its encoding
  * (`encoding`, or the one a UTF-16/UTF-8 byte order mark says). The line must still read
  * `original`; its line end (LF, CR LF, or CR) stays. Symbolic links are resolved first so the
  * target file is updated rather than replacing the link. The file is written to a temporary
@@ -118,17 +160,17 @@ export async function replaceLine(
   line: number,
   original: string,
   text: string,
-  opts: { gzip: boolean; encoding: string },
+  opts: { gzip?: boolean; compression?: Compression; encoding: string },
 ): Promise<FileState & { written: Written }> {
+  const comp = resolveCompression(opts);
   const realPath = await fs.promises.realpath(fsPath);
   const mode = (await fs.promises.stat(realPath)).mode & 0o777;
   const tmp = path.join(path.dirname(realPath), `.${path.basename(realPath)}.${randomBytes(4).toString('hex')}.tmp`);
   const raw = fs.createReadStream(realPath, { highWaterMark: 1024 * 1024 });
-  const source: Readable = opts.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 })) : raw;
+  const source: Readable = wrapReadStream(raw, comp);
   raw.on('error', (e) => source.destroy(e));
   const file = fs.createWriteStream(tmp, { mode });
-  const sink: NodeJS.WritableStream = opts.gzip ? zlib.createGzip({ chunkSize: 1024 * 1024 }) : file;
-  if (opts.gzip) (sink as zlib.Gzip).pipe(file);
+  const { sink, destroy: destroyComp } = wrapWriteStream(file, comp);
   const closed = new Promise<void>((resolve, reject) => {
     file.on('close', resolve);
     file.on('error', reject);
@@ -213,10 +255,7 @@ export async function replaceLine(
     await fs.promises.rename(tmp, realPath);
   } catch (e) {
     raw.destroy();
-    if (opts.gzip) {
-      (sink as zlib.Gzip).unpipe(file);
-      (sink as zlib.Gzip).destroy();
-    }
+    destroyComp();
     file.destroy();
     await closed.catch(() => undefined);
     await fs.promises.rm(tmp, { force: true });
@@ -227,23 +266,23 @@ export async function replaceLine(
 }
 
 /**
- * Inserts a line, deletes lines, or batch-rewrites lines atomically in a plain or gzip-compressed
+ * Inserts a line, deletes lines, or batch-rewrites lines atomically in a plain or compressed
  * file while preserving BOM, encoding, line breaks, symlinks, and file permissions.
  */
 export async function mutateFileLines(
   fsPath: string,
   mutation: LineMutation,
-  opts: { gzip: boolean; encoding: string },
+  opts: { gzip?: boolean; compression?: Compression; encoding: string },
 ): Promise<FileState> {
+  const comp = resolveCompression(opts);
   const realPath = await fs.promises.realpath(fsPath);
   const mode = (await fs.promises.stat(realPath)).mode & 0o777;
   const tmp = path.join(path.dirname(realPath), `.${path.basename(realPath)}.${randomBytes(4).toString('hex')}.tmp`);
   const raw = fs.createReadStream(realPath, { highWaterMark: 1024 * 1024 });
-  const source: Readable = opts.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 })) : raw;
+  const source: Readable = wrapReadStream(raw, comp);
   raw.on('error', (e) => source.destroy(e));
   const file = fs.createWriteStream(tmp, { mode });
-  const sink: NodeJS.WritableStream = opts.gzip ? zlib.createGzip({ chunkSize: 1024 * 1024 }) : file;
-  if (opts.gzip) (sink as zlib.Gzip).pipe(file);
+  const { sink, destroy: destroyComp } = wrapWriteStream(file, comp);
   const closed = new Promise<void>((resolve, reject) => {
     file.on('close', resolve);
     file.on('error', reject);
@@ -339,10 +378,7 @@ export async function mutateFileLines(
     await fs.promises.rename(tmp, realPath);
   } catch (e) {
     raw.destroy();
-    if (opts.gzip) {
-      (sink as zlib.Gzip).unpipe(file);
-      (sink as zlib.Gzip).destroy();
-    }
+    destroyComp();
     file.destroy();
     await closed.catch(() => undefined);
     await fs.promises.rm(tmp, { force: true });

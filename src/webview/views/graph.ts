@@ -114,6 +114,8 @@ export class GraphView implements View {
     });
     this.mini.addEventListener('pointermove', (e) => this.miniDrag && this.miniGo(e));
     this.mini.addEventListener('pointerup', () => (this.miniDrag = false));
+    this.mini.addEventListener('pointercancel', () => (this.miniDrag = false));
+    this.mini.addEventListener('lostpointercapture', () => (this.miniDrag = false));
     this.canvasEl.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     this.svg.addEventListener('pointerdown', (e) => this.onDown(e));
     this.svg.addEventListener('contextmenu', (e) => this.onContextMenu(e));
@@ -121,6 +123,7 @@ export class GraphView implements View {
     this.svg.addEventListener('focusin', (e) => this.onFocus(e));
     window.addEventListener('pointermove', (e) => this.onMove(e), { signal: this.gone.signal });
     window.addEventListener('pointerup', (e) => this.onUp(e), { signal: this.gone.signal });
+    window.addEventListener('pointercancel', (e) => this.onUp(e), { signal: this.gone.signal });
     this.el.querySelector('.zoombar')!.addEventListener('click', (e) => {
       const z = ((e.target as HTMLElement).closest('[data-z]') as HTMLElement | null)?.dataset.z;
       if (z === 'in') this.zoomAt(1.25);

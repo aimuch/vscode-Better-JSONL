@@ -38,6 +38,11 @@ const P: Record<string, string> = {
   trash: '<path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.6 9h5.8l.6-9"/>',
   wand: '<path d="M2.5 13.5 10.5 5.5"/><path class="ic-2" d="M12 2v2.5M10.75 3.25h2.5M13.5 7v2M12.5 8h2M7.5 2.5v2M6.5 3.5h2"/>',
   inspect: '<rect x="2" y="2.5" width="12" height="11" rx="1.2"/><path class="ic-2" d="M4.5 6h7M4.5 8.8h5M4.5 11.2h3.5"/>',
+  pivot: '<rect x="2" y="2.5" width="3.2" height="11" rx=".6"/><path class="ic-2" d="M7.2 3h6.8v2.4H7.2zM7.2 6.8h5.2v2.4H7.2zM7.2 10.6h3.6V13H7.2z"/>',
+  shield: '<path d="M8 1.8 13.2 3.8v4c0 3.2-2.3 5.4-5.2 6.5-2.9-1.1-5.2-3.3-5.2-6.5v-4z"/><path class="ic-2" d="M5.6 8.1 7.3 9.8l3.3-3.4"/>',
+  chat: '<path d="M2.2 3.5a1 1 0 0 1 1-1h9.6a1 1 0 0 1 1 1v6.4a1 1 0 0 1-1 1H6.5L3.2 13.6v-2.7a1 1 0 0 1-1-1z"/><path class="ic-2" d="M5.2 5.8h5.6M5.2 8.2h3.6"/>',
+  waterfall: '<path d="M2 4h4.5M5 8h6M9 12h5"/><circle class="ic-2" cx="2" cy="4" r=".9"/><circle class="ic-2" cx="5" cy="8" r=".9"/><circle class="ic-2" cx="9" cy="12" r=".9"/>',
+  'diff-files': '<rect x="2" y="2.5" width="6.5" height="9.5" rx="1"/><rect class="ic-2" x="7.5" y="4" width="6.5" height="9.5" rx="1"/><path class="ic-2" d="M9.5 7.5h2.5M9.5 10h2.5"/>',
 };
 
 export function icon(name: string, size = 14): string {

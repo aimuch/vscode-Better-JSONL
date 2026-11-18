@@ -22,18 +22,19 @@ Download `better-jsonl-<version>.vsix` from the [GitHub Releases](../../releases
 - Large integers (for example `9007199254740993`) are shown exactly as written.
 - Edit one record in a pretty-printed editor. It is saved back as one compact line.
 - Double-click any line to jump to that member in the source.
-- **Nested JSON-in-String Unpack**: strings that hold serialized JSON (`"{...}"`, `"[...]"`, or multi-line JSONL) show an inline `JSON {N}` / `JSON [N]` pill — click to unpack and browse them as native JSON trees in place.
-- **Multiline & Markdown Value Inspector**: strings with `\n` expand inline (`↵ N lines text`), and right-clicking any value opens the **Value Inspector** (`Text`, sanitized `Markdown`, pretty `JSON`, and `Decoded` views for Unix/ISO timestamps + time delta, JWTs, Base64, and URL query strings).
+- **Nested JSON-in-String Unpack & LLM Chat Reader**: strings that hold serialized JSON (`"{...}"`, `"[...]"`, or multi-line JSONL) show an inline `JSON {N}` / `JSON [N]` pill, and LLM `messages` / `conversations` / `contents` arrays get an inline `Chat (N)` pill that opens a clean multi-turn **Chat** reader (system, user, assistant, collapsible `thinking`, tool calls/results, and SFT/DPO `chosen` / `rejected`).
+- **Multiline & Markdown Value Inspector**: strings with `\n` expand inline (`↵ N lines text`), and right-clicking any value opens the **Value Inspector** (`Text`, `Chat`, sanitized `Markdown`, pretty `JSON`, and `Decoded` views for Unix/ISO timestamps + time delta, JWTs, Base64, and URL query strings).
 - **Word wrap**: press `Alt+Z` (`Option+Z` on macOS) in the view, or use the wrap button in the toolbar. Wrapped parts of a pretty line keep its indent.
-- **Bookmarks & Timeline**: press `B` (or `Alt+Click` the line number) to bookmark lines, `[` / `]` to jump between bookmarks, and open the **Timeline** bar to see time-bucketed volume, error spikes, and drag-to-filter time windows.
+- **Bookmarks, Timeline & Trace Waterfall**: press `B` (or `Alt+Click` the line number) to bookmark lines, `[` / `]` to jump between bookmarks, open the **Timeline** bar to brush time windows, or right-click any `trace_id` / `request_id` (`Trace call flow`) to view a Gantt latency waterfall across matching spans.
+- **Pivot Summary & Data Quality**: open **Pivot & Group By** to aggregate `Count`, `Share %`, `Sum`, `Avg`, `Min`, `p50`, `p95`, and `Max` by any nested path (click a group to filter), or open **Data quality & duplicates** to find and clean up syntax errors, exact duplicates, duplicate primary keys, type drift, and missing core fields.
 - **Follow** (the arrow button, JSON Lines): the view stays at the last line while lines are added, like `tail -f`.
-- **Compare**: select two lines, then press the compare button. A panel lists the differences field by field (added, removed, changed); **Open in the diff editor** shows the two records side by side in VS Code.
+- **Compare Lines & Cross-File Dataset Diff**: select two lines to diff them field by field, or click **Compare with file…** (`Better JSONL: Compare With JSON/JSONL File…`) to align two `.jsonl` / `.json` / `.gz` / `.br` datasets by primary key (`id`) or line number (`#`).
 - **Schema & Batch Rewrite**: generate **TypeScript**, **JSON Schema**, **Pydantic**, or **Zod** definitions from your records, or run a **Batch `jq` rewrite** with before/after diff preview (plus right-click **Insert / Duplicate / Delete line**).
-- **Export** (the download button): the lines on screen (all lines, or the search/filter result) or the selected lines, as **JSON Lines (`.jsonl`)**, **CSV (`.csv`)**, **JSON Array (`.json`)**, or **Markdown Table (`.md`)**.
+- **Export & Redaction** (the download button): copy rows directly as **TSV (Excel / Sheets)** or stream exports as **JSON Lines (`.jsonl`)**, **CSV (`.csv`)**, **TSV (`.tsv`)**, **JSON Array (`.json`)**, **Markdown Table (`.md`)**, or **SQL (`CREATE TABLE` + `INSERT`, `.sql`)** — with optional **Redact secrets & PII** masking (also available via right-click **Copy redacted JSON**).
 
 ### Grid view
 
-- One row per record. The columns are all top-level keys.
+- One row per record. The columns are all top-level keys, plus any **promoted nested paths** (`user.name`, `usage.total_tokens`) added via right-click **Add as Grid column** or **Flatten 1 level** in the Columns manager.
 - Nested objects and arrays open as sub-grids under the row, starting under the column you opened. Arrays of objects show as tables.
 - Word wrap (`Alt+Z`) wraps long cell values.
 - Sort by any column. Drag a header edge to resize.
@@ -64,7 +65,7 @@ VS Code does not give extensions the text of a file above 50 MB, and has no text
 - Only the lines on screen are decoded and parsed. Search runs in the background and shows its progress. In the Grid, sorting and column filters first read the columns they need (the status bar shows the progress).
 - **Edit a record** of a large JSON Lines file (the record editor or a grid cell), also of a compressed file and in other encodings: the line is replaced on disk (a compressed file is compressed again). The edit is refused when the file or the line changed since it was read, or when a character cannot be written in the file's encoding.
 - **Follow**: when a file only grows at its end (a log), the new lines are added to the view without reading the file again. A compressed file is decompressed again, and only what follows the text the view has is added. Without follow mode, a **Load new lines** button appears. Other changes show a **Reload** button.
-- **Compressed files**: `.jsonl.gz`, `.ndjson.gz`, `.jsonlines.gz` and `.json.gz` open in Better JSONL when you open them in VS Code.
+- **Compressed & Concatenated files**: `.jsonl.gz`, `.ndjson.gz`, `.jsonlines.gz`, `.json.gz`, `.jsonl.br`, `.ndjson.br`, `.jsonlines.br`, and `.json.br` open natively in Better JSONL, and multi-line concatenated JSON streams (`{\n  "a": 1\n}\n{\n  "b": 2\n}`) are automatically detected and shown as records.
 - **Encodings**: a UTF-16 byte order mark is read, and so is the `files.encoding` setting (for example `gbk`, `shiftjis`, `windows1252`).
 - One large JSON value (for example a 300 MB array) is parsed once, then opens with its members folded.
 - **Above about 512 MB** (too long for one JavaScript string): an array, or an object that is mostly one array, is read item by item. Its items are shown as records (as JSON Lines, read-only) and only their byte ranges are kept: a 600 MB array of 4.4 million items opens in about 9 seconds with about 1 GB of memory. Another value is parsed from the bytes as a whole and needs memory for all of it.
@@ -101,8 +102,9 @@ In one JSON document (not JSON Lines), jq and JSONPath results are places in the
 
 ### Keyboard
 
-- `Cmd/Ctrl+F` goes to the search box; `Enter` and `Shift+Enter` step through the matches; `↑` / `↓` in the search box recall recent queries.
-- JSON Lines: `↑` / `↓` move the current line, `Shift` extends the selection, `B` toggles a bookmark (`[` / `]` jump to previous / next bookmark), `Enter` edits the record, `Cmd/Ctrl+C` copies the selected lines.
+- `Cmd/Ctrl+F` goes to the search box (with schema-aware `Tab` autocomplete for paths, enum values, and `jq` functions); `Enter` and `Shift+Enter` step through the matches; `↑` / `↓` in the search box recall recent queries.
+- `Cmd/Ctrl+G` (or clicking `Line N` in the status bar) opens **Go to Line / `%` / Timestamp** (`42`, `50%`, `09:15:00`, or ISO-8601).
+- JSON Lines: `↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` move the current line, `Shift` extends the selection, `B` toggles a bookmark (`[` / `]` jump to previous / next bookmark), `Enter` edits the record, `Cmd/Ctrl+C` copies the selected lines.
 - `Tab` reaches every control. Fold arrows: `Enter` or `Space`. Grid headers: `Enter` sorts.
 - Graph nodes: `Enter` selects (the inspector shows the node), `←` folds, `→` unfolds; `+`, `-` and `0` zoom in, zoom out and fit.
 

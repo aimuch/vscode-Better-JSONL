@@ -14,13 +14,18 @@ import type {
 } from '../shared/protocol';
 import { valueSpan } from '../locate';
 import { ByteJsonError, parseJsonBytes } from './byteJson';
+import { collectFieldCandidates, getSearchCompletions, type CompletionItem, type FieldInfo } from './autocomplete';
+import { detectConversation, renderConversationHtml } from './chatReader';
+import { diffDatasets, parseDatasetRecords } from './datasetDiff';
 import { indexItems, ItemStore } from './items';
 import { diffValues, type Difference } from './diff';
-import { csvRow, mdDivider, mdRow } from './exporter';
+import { csvRow, inferSqlColumnTypes, mdDivider, mdRow, sqlCreateTable, sqlInsertBatch, tsvRow } from './exporter';
 import {
   decodeSmartValue,
   extractRecordEpochMs,
   formatDecodedSummary,
+  formatDelta,
+  parseTimestampMs,
   renderMarkdownSafe,
   tryUnpackJsonString,
   type DecodedInfo,
@@ -33,6 +38,7 @@ import {
   isArr,
   isContainer,
   isObj,
+  parsePath,
   pathToJq,
   pathToString,
   RawNum,
@@ -40,7 +46,10 @@ import {
   type JObj,
   type JVal,
 } from './json';
+import { computePivot, discoverFieldPaths, renderPivotTableHtml } from './pivot';
+import { analyzeDataQuality } from './quality';
 import { compactJson, compileQuery, pathOf, type Out, type Program } from './query';
+import { redactJsonLine, redactValue } from './redact';
 import {
   ByteStore,
   DocModel,
@@ -62,7 +71,23 @@ import { SettingsPanel } from './settings';
 import { buildTimeline, detectTimeColumn, renderTimelineHtml, type TimelineData } from './timeline';
 import { FormattedView } from './views/formatted';
 import { GraphView } from './views/graph';
-import { GridView } from './views/grid';
+import { GridView, promotedColId } from './views/grid';
+import {
+  buildMachineSnapshot,
+  deriveDocLifecycle,
+  normalizeQuerySyntax,
+  OverlayController,
+  startExportStream,
+  syntaxToFlags,
+  toggleQuerySyntax,
+  trapModalTabKey,
+  type ExportStreamState,
+  type ModalId,
+  type MutationState,
+  type PopoverId,
+  type QuerySyntaxMode,
+} from './stateMachines';
+import { buildTraceWaterfall, isTraceCandidate, renderWaterfallHtml } from './waterfall';
 
 export interface View {
   readonly el: HTMLElement;
@@ -106,6 +131,7 @@ export interface UIState {
   multiline: Map<number, Set<string>>;
   timelineOpen: boolean;
   timelineRange: [number, number] | null;
+  subsetFilter: { label: string; ids: Set<number> } | null;
   /** JSON Lines: stay at the end when lines are added (like tail -f). */
   follow: boolean;
   wrap: boolean;
@@ -123,6 +149,7 @@ export interface UIState {
     filters: Map<string, ColFilter>;
     hiddenCols: Set<string>;
     pinnedCols: Set<string>;
+    promotedCols: string[];
     colOrder: string[];
   };
   graph: { collapsed: Set<string>; selectedNode: string | null };
@@ -162,6 +189,7 @@ interface DocSaved {
     filters: [string, { text: string; exclude: string[]; min?: string; max?: string }][];
     hiddenCols?: string[];
     pinnedCols?: string[];
+    promotedCols?: string[];
     colOrder?: string[];
   };
   graph?: { collapsed: string[] };
@@ -273,26 +301,33 @@ export class App {
   private lastLoadPaint = 0;
   private persistTimer: ReturnType<typeof setTimeout> | undefined;
   private rangeCapped = false;
-  private lastMode: boolean | undefined;
+  private lastModeKey = '';
   /** File bytes read so far while a large file loads (compressed bytes for a .gz file). */
   private loadRead = 0;
-  /** A cell edit waits for the host. */
-  private cellPending = false;
-  /** After inserting a blank record below `r`, open the editor on `r + 1` once the document updates. */
-  private pendingOpenRecord = -1;
+  private parsingJson = false;
+  private bootError = false;
+  /** Explicit state machines for overlays, mutations, and streaming exports. */
+  private readonly overlays = new OverlayController();
+  private mutation: MutationState = { kind: 'idle' };
+  private exportState: ExportStreamState = { kind: 'idle' };
   /** The user confirmed Expand all for this file over 50 MB. */
   private bigExpandOK = false;
   /** Ends the document listeners of the shell when it is built again. */
   private shellGone = new AbortController();
   private nextExport = 1;
-  /** The export in progress: it sends the next piece when the host is ready for it. */
-  private exporting: { id: number; next: () => string | null } | undefined;
   /** Row height of code lines in px. */
   readonly rh: number;
 
   private queryHistory: string[] = [];
   private savedQueries: string[] = [];
   private histCursor = -1;
+  private subsetRev = 0;
+  private redactExports = false;
+  private acFields: FieldInfo[] = [];
+  private acModelRef: unknown;
+  private acModelRev = -1;
+  private acItems: CompletionItem[] = [];
+  private acIndex = -1;
 
   private timelineData: TimelineData | undefined;
   private timelineModelRef: unknown;
@@ -310,8 +345,6 @@ export class App {
   private stopExpand: (() => void) | undefined;
   private reportTimer: ReturnType<typeof setTimeout> | undefined;
   private searchTimer: ReturnType<typeof setTimeout> | undefined;
-  private editRecord = -1;
-  private editOriginal = '';
   private lastStatsPaint = 0;
   private settings: SettingsPanel | undefined;
   private readonly darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
@@ -329,9 +362,160 @@ export class App {
       this.applyTheme();
       this.stateChanged();
     });
+    root.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key === 'Tab' && this.overlays.modal && this.overlays.modal !== 'settings') {
+          const modalEl = this.modalElement(this.overlays.modal);
+          if (modalEl && !modalEl.hidden) trapModalTabKey(modalEl, e);
+        }
+      },
+      true,
+    );
     document.addEventListener('keydown', (e) => this.onKey(e));
     root.innerHTML = `<div class="boot">${t('Loading…')}</div>`;
+    this.syncAxDomAttributes();
     this.post({ type: 'ready' });
+  }
+
+  private modalElement(id: ModalId): HTMLElement | null {
+    const sel: Record<ModalId, string> = {
+      edit: '.editpanel',
+      compare: '.comparepanel',
+      inspector: '.valpanel',
+      schema: '.schemapanel',
+      batch: '.batchpanel',
+      pivot: '.pivotpanel',
+      quality: '.qualitypanel',
+      filediff: '.filediffpanel',
+      trace: '.tracepanel',
+      settings: '.settings',
+    };
+    return this.root.querySelector(sel[id]);
+  }
+
+  private hideModalDom(id: ModalId): void {
+    if (id === 'settings') {
+      if (this.settings?.open) this.settings.close();
+      return;
+    }
+    const el = this.modalElement(id);
+    if (!el) return;
+    el.hidden = true;
+    if (id !== 'edit') {
+      el.onclick = null;
+      if (id !== 'compare') el.innerHTML = '';
+    } else if (this.mutation.kind === 'record') {
+      this.mutation = { kind: 'idle' };
+    }
+  }
+
+  private hidePopoverDom(id: PopoverId, restoreFocus = false): void {
+    if (id === 'grid-filter') {
+      (this.views?.grid as GridView | undefined)?.closeFilter(restoreFocus);
+      return;
+    }
+    if (id === 'col-picker') {
+      (this.views?.grid as GridView | undefined)?.closeColPicker(restoreFocus);
+      return;
+    }
+    const sel: Record<Exclude<PopoverId, 'grid-filter' | 'col-picker'>, string> = {
+      'ctx-menu': '.ctx-menu',
+      'export-menu': '.export-menu',
+      'hist-menu': '.hist-menu',
+      'ac-menu': '.ac-menu',
+      'goto-box': '.goto-box',
+    };
+    const el = this.root.querySelector(sel[id]) as HTMLElement | null;
+    if (el) el.hidden = true;
+    if (id === 'ac-menu') this.acIndex = -1;
+    if (restoreFocus) {
+      if (id === 'export-menu') (this.toolbar?.querySelector('.export-btn') as HTMLElement | null)?.focus();
+      else if (id === 'hist-menu') (this.toolbar?.querySelector('.hist-btn') as HTMLElement | null)?.focus();
+    }
+  }
+
+  private activateModal(id: ModalId): void {
+    const tr = this.overlays.openModal(id, document.activeElement);
+    if (tr.closePopover) this.hidePopoverDom(tr.closePopover);
+    if (tr.closeModal) this.hideModalDom(tr.closeModal);
+    this.syncAxDomAttributes();
+  }
+
+  private deactivateModal(id: ModalId, restoreFocus = true): void {
+    this.hideModalDom(id);
+    const tr = this.overlays.closeModal(id);
+    this.syncAxDomAttributes();
+    if (restoreFocus && tr.restoreFocus && document.contains(tr.restoreFocus)) {
+      tr.restoreFocus.focus({ preventScroll: true });
+    }
+    this.stateChanged();
+  }
+
+  onSettingsWillOpen(): void {
+    this.activateModal('settings');
+  }
+
+  onSettingsDidClose(): void {
+    this.overlays.closeModal('settings');
+    this.syncAxDomAttributes();
+  }
+
+  onPopoverOpened(id: PopoverId): void {
+    const tr = this.overlays.openPopover(id);
+    if (tr.closePopover) this.hidePopoverDom(tr.closePopover);
+    this.syncAxDomAttributes();
+  }
+
+  onPopoverClosed(id: PopoverId): void {
+    this.overlays.closePopover(id);
+    this.syncAxDomAttributes();
+  }
+
+  get querySyntax(): QuerySyntaxMode {
+    return normalizeQuerySyntax(this.state?.regex, this.state?.literal);
+  }
+
+  private machineSnapshot() {
+    const hasViews = !!this.views && !!this.model;
+    const lifecycle = deriveDocLifecycle({
+      hasViews,
+      hasLoadStore: !!this.loadStore,
+      parsingJson: this.parsingJson,
+      bootError: this.bootError,
+      modelLoading: hasViews ? this.model.loading : false,
+      modelComplete: hasViews ? this.model.complete : false,
+    });
+    const projection = this.transformMode
+      ? this.searching
+        ? 'projecting'
+        : this.baseModel
+          ? 'projected'
+          : 'off'
+      : 'off';
+    return buildMachineSnapshot({
+      lifecycle,
+      querySyntax: this.querySyntax,
+      projection,
+      searching: this.searching,
+      awaitingModules: !!this.query?.needs?.length,
+      modal: this.overlays.modal,
+      popover: this.overlays.popover,
+      mutation: this.mutation.kind,
+      exporting: this.exportState.kind === 'streaming',
+    });
+  }
+
+  private syncAxDomAttributes(): void {
+    const snap = this.machineSnapshot();
+    const ds = this.root.dataset;
+    ds.lifecycle = snap.lifecycle;
+    if (this.state?.view) ds.activeView = this.state.view;
+    ds.modal = snap.modal ?? 'none';
+    ds.popover = snap.popover ?? 'none';
+    ds.queryMode = snap.querySyntax;
+    ds.projection = snap.projection;
+    this.root.setAttribute('aria-busy', String(snap.lifecycle === 'streaming' || snap.lifecycle === 'parsing-json' || snap.search === 'running'));
   }
 
   get shellSignal(): AbortSignal {
@@ -369,7 +553,31 @@ export class App {
   }
 
   get readOnly(): boolean {
-    return !!this.doc.readOnly || !!this.model?.items || this.isProjected;
+    return !!this.doc.readOnly || !!this.model?.items || !!this.model?.concatenated || this.isProjected;
+  }
+
+  promoteNestedColumn(path: readonly (string | number)[], forceAdd = false): void {
+    if (!path.length) return;
+    const cid = promotedColId(path);
+    const g = this.state.grid;
+    const idx = g.promotedCols.indexOf(cid);
+    if (idx >= 0 && !forceAdd) {
+      g.promotedCols.splice(idx, 1);
+      g.pinnedCols.delete(cid);
+      g.hiddenCols.delete(cid);
+      g.colOrder = g.colOrder.filter((c) => c !== cid);
+      g.filters.delete(cid);
+    } else {
+      if (idx < 0) g.promotedCols.push(cid);
+      g.hiddenCols.delete(cid);
+      if (g.colOrder.length && !g.colOrder.includes(cid)) g.colOrder.push(cid);
+    }
+    if (this.state.view !== 'grid') this.setView('grid');
+    else {
+      this.activeView.render();
+      this.paintChrome();
+      this.stateChanged();
+    }
   }
 
   /** Asks the host to show record `r` (at `path`) in the text editor: at its line in the file. */
@@ -437,15 +645,16 @@ export class App {
   }
 
   hasGlobalRowFilter(): boolean {
-    return this.state.bookmarkedOnly || this.state.timelineRange !== null;
+    return this.state.bookmarkedOnly || this.state.timelineRange !== null || this.state.subsetFilter !== null;
   }
 
   globalFilterSig(): string {
-    return `${this.state.bookmarkedOnly ? 1 : 0}|${this.bookmarksRev}|${this.state.timelineRange ? this.state.timelineRange.join(':') : ''}`;
+    return `${this.state.bookmarkedOnly ? 1 : 0}|${this.bookmarksRev}|${this.state.timelineRange ? this.state.timelineRange.join(':') : ''}|${this.state.subsetFilter ? `${this.subsetRev}:${this.state.subsetFilter.ids.size}` : ''}`;
   }
 
   passesGlobalRowFilter(r: number): boolean {
     if (this.state.bookmarkedOnly && !this.state.bookmarks.has(r)) return false;
+    if (this.state.subsetFilter && !this.state.subsetFilter.ids.has(r)) return false;
     if (this.state.timelineRange) {
       const td = this.ensureTimelineData();
       if (!td || r >= td.rowTimes.length) return false;
@@ -517,7 +726,10 @@ export class App {
         this.onExportReady(m.id, m.ok);
         break;
       case 'exportDone':
-        if (this.exporting?.id === m.id) this.exporting = undefined;
+        if (this.exportState.kind === 'streaming' && this.exportState.id === m.id) {
+          this.exportState = { kind: 'idle' };
+          this.syncAxDomAttributes();
+        }
         if (this.views) this.showBanner(m.message);
         break;
       case 'update':
@@ -570,6 +782,9 @@ export class App {
       case 'editResult':
         this.onEditResult(m.ok, m.message, m.line, m.text, m.cell, m.batch);
         break;
+      case 'fileDiff':
+        if (this.views && this.model) this.openFileDiffPanel(m.otherName, m.otherText);
+        break;
       case 'notice':
         // While a large file loads there is no banner yet: the message takes the place of the progress text.
         if (this.views) this.showBanner(m.message, m.action);
@@ -581,10 +796,13 @@ export class App {
   private init(doc: DocInfo, version: number, config: ViewerConfig, model: DocModel): void {
     this.stopJobs();
     this.loadStore = undefined;
+    this.parsingJson = false;
+    this.bootError = false;
     this.baseModel = undefined;
     this.transformMode = false;
     this.timelineData = undefined;
-    this.pendingOpenRecord = -1;
+    this.overlays.reset();
+    this.mutation = { kind: 'idle' };
     this.doc = doc;
     this.config = config;
     this.version = version;
@@ -611,13 +829,14 @@ export class App {
     // A new file over 50 MB asks again before it expands every line.
     this.bigExpandOK = false;
     if (expandMode === 'all' && !model.keepsAll) expandMode = 'focus';
+    const normSyntax = syntaxToFlags(normalizeQuerySyntax(old.regex, old.literal));
     this.state = {
       view: old.view || prev?.view || config.defaultView,
       expandMode,
       query: old.query ?? '',
       caseSensitive: !!old.caseSensitive,
-      regex: !!old.regex,
-      literal: !!old.literal,
+      regex: normSyntax.regex,
+      literal: normSyntax.literal,
       filterOnly: !!old.filterOnly,
       bookmarkedOnly: !!old.bookmarkedOnly && !!(old.bookmarks && old.bookmarks.length),
       bookmarks: new Set((old.bookmarks ?? []).filter(within)),
@@ -625,6 +844,7 @@ export class App {
       multiline: new Map(),
       timelineOpen: false,
       timelineRange: null,
+      subsetFilter: null,
       follow: !!old.follow,
       wrap: old.wrap !== undefined ? old.wrap : config.wrap,
       active: old.active !== undefined ? (model.loading ? old.active : Math.min(old.active, last)) : 0,
@@ -641,6 +861,7 @@ export class App {
         ),
         hiddenCols: new Set(old.grid?.hiddenCols ?? []),
         pinnedCols: new Set(old.grid?.pinnedCols ?? []),
+        promotedCols: [...(old.grid?.promotedCols ?? [])],
         colOrder: [...(old.grid?.colOrder ?? [])],
       },
       graph: { collapsed: new Set(old.graph?.collapsed ?? []), selectedNode: null },
@@ -669,10 +890,13 @@ export class App {
   /** A large file: the text follows as "chunk" messages. */
   private initLarge(doc: DocInfo, version: number, config: ViewerConfig): void {
     this.stopJobs();
+    this.parsingJson = false;
+    this.bootError = false;
     this.baseModel = undefined;
     this.transformMode = false;
     this.timelineData = undefined;
-    this.pendingOpenRecord = -1;
+    this.overlays.reset();
+    this.mutation = { kind: 'idle' };
     this.doc = doc;
     this.config = config;
     this.version = version;
@@ -687,10 +911,12 @@ export class App {
     this.paintBoot();
   }
 
-  private paintBoot(text?: string): void {
+  private paintBoot(text?: string, isError = false): void {
+    this.bootError = isError;
     const total = this.doc.large?.bytes ?? 0;
     const msg = text ?? t('Loading {0} of {1}…', formatBytes(Math.min(this.loadRead, total)), formatBytes(total));
     this.root.innerHTML = `<div class="boot">${esc(msg)}</div>`;
+    this.syncAxDomAttributes();
   }
 
   private onChunk(version: number, data: Uint8Array, done: boolean): void {
@@ -737,11 +963,13 @@ export class App {
       this.paintBoot();
       return;
     }
+    this.parsingJson = true;
     this.paintBoot(t('Parsing {0}…', formatBytes(store.total)));
     // Let the "Parsing" text paint first: JSON.parse of a large file blocks for a while.
     setTimeout(() => {
       if (version !== this.version || this.loadStore !== store) return;
       this.loadStore = undefined;
+      this.parsingJson = false;
       let model: DocModel;
       try {
         // Too long for one string. An array (or an object that is mostly one array): its items
@@ -751,7 +979,7 @@ export class App {
         else model = store.total >= BYTE_JSON_AT ? DocModel.fromValue(parseJsonBytes(store.chunkList()), store.total) : new DocModel(store.takeText(), false, store.total);
       } catch (e) {
         const why = e instanceof ByteJsonError ? t('not valid JSON: {0}', e.message) : errorMessage(e);
-        this.paintBoot(t('This file cannot be shown as one JSON value ({0}).', why));
+        this.paintBoot(t('This file cannot be shown as one JSON value ({0}).', why), true);
         return;
       }
       if (this.doc.large?.gzip) model.allowKeepAll();
@@ -818,11 +1046,17 @@ export class App {
     for (const r of s.bookmarks) if (move(r) >= 0) nextBm.add(move(r));
     s.bookmarks = nextBm;
     if (!s.bookmarks.size) s.bookmarkedOnly = false;
+    if (s.subsetFilter) {
+      const nextSub = new Set<number>();
+      for (const r of s.subsetFilter.ids) if (move(r) >= 0) nextSub.add(move(r));
+      s.subsetFilter = nextSub.size ? { label: s.subsetFilter.label, ids: nextSub } : null;
+      this.subsetRev++;
+    }
 
-    if (this.editRecord >= 0) {
-      const movedEdit = move(this.editRecord);
+    if (this.mutation.kind === 'record') {
+      const movedEdit = move(this.mutation.record);
       if (movedEdit >= 0) {
-        this.editRecord = movedEdit;
+        this.mutation = { kind: 'record', record: movedEdit, original: this.mutation.original };
         const titleEl = this.root.querySelector('.editpanel .ep-title');
         if (titleEl) titleEl.textContent = t('Edit line {0}', movedEdit + 1);
       }
@@ -852,9 +1086,9 @@ export class App {
     this.renderAll();
     painted = true;
     this.postMode();
-    if (this.pendingOpenRecord >= 0 && this.pendingOpenRecord < n) {
-      const target = this.pendingOpenRecord;
-      this.pendingOpenRecord = -1;
+    if (this.mutation.kind === 'insert-open' && this.mutation.openRecord >= 0 && this.mutation.openRecord < n) {
+      const target = this.mutation.openRecord;
+      this.mutation = { kind: 'idle' };
       this.selectRecord(target, 'set');
       this.activeView.onActiveChanged(true);
       this.openEditor(target);
@@ -905,9 +1139,11 @@ export class App {
   private postMode(): void {
     const src = this.baseModel ?? this.model;
     const isJsonl = src.isJsonl;
-    if (this.lastMode === isJsonl) return;
-    this.lastMode = isJsonl;
-    this.post({ type: 'docMode', isJsonl });
+    const concatenated = src.concatenated;
+    const key = `${isJsonl}:${concatenated}`;
+    if (this.lastModeKey === key) return;
+    this.lastModeKey = key;
+    this.post(concatenated ? { type: 'docMode', isJsonl, concatenated: true } : { type: 'docMode', isJsonl });
   }
 
   private stopJobs(): void {
@@ -915,13 +1151,13 @@ export class App {
     this.stopSearch?.();
     this.stopExpand?.();
     this.stopExpand = undefined;
-    if (this.exporting) {
-      this.post({ type: 'exportData', id: this.exporting.id, data: '', done: false, cancel: true });
-      this.exporting = undefined;
+    if (this.exportState.kind === 'streaming') {
+      this.post({ type: 'exportData', id: this.exportState.id, data: '', done: false, cancel: true });
+      this.exportState = { kind: 'idle' };
     }
     clearTimeout(this.persistTimer);
     this.searching = false;
-    this.lastMode = undefined;
+    this.lastModeKey = '';
   }
 
   private repaint(): void {
@@ -933,14 +1169,16 @@ export class App {
   private fromEditorSelection(lines: number[], active: number, truncated: boolean): void {
     if (!this.model || !this.views || !this.model.isJsonl) return;
     const n = this.model.count;
-    const sel = lines.filter((l) => l < n);
-    if (!sel.length || active >= n) return;
+    const mappedLines = this.model.concatenated ? [...new Set(lines.map((l) => this.model.recordForFileLine(l)))] : lines;
+    const mappedActive = this.model.concatenated ? this.model.recordForFileLine(active) : active;
+    const sel = mappedLines.filter((l) => l < n);
+    if (!sel.length || mappedActive >= n) return;
     const s = this.state;
-    const same = s.active === active && sel.length === s.selected.size && sel.every((l) => s.selected.has(l));
+    const same = s.active === mappedActive && sel.length === s.selected.size && sel.every((l) => s.selected.has(l));
     if (same) return;
     s.selected = new Set(sel);
-    s.active = active;
-    s.anchor = active;
+    s.active = mappedActive;
+    s.anchor = mappedActive;
     this.rangeCapped = truncated;
     if (s.expandMode === 'focus' && s.view === 'formatted') this.activeView.render();
     this.activeView.onActiveChanged(true);
@@ -988,7 +1226,7 @@ export class App {
     s.graph.selectedNode = null;
     if (s.view === 'formatted' || s.view === 'graph') this.activeView.render(r);
     this.activeView.onActiveChanged(false);
-    if (notify && this.model.isJsonl && !this.isProjected) this.post({ type: 'select', line: r });
+    if (notify && this.model.isJsonl && !this.isProjected) this.post({ type: 'select', line: this.model.fileLine(r) });
     this.paintChrome();
     this.stateChanged();
   }
@@ -1091,6 +1329,7 @@ export class App {
 
   /** Call after any change of the view state: it saves the state and (in tests) reports the render. */
   stateChanged(): void {
+    this.syncAxDomAttributes();
     this.persist();
     if (!this.config.reports) return;
     clearTimeout(this.reportTimer);
@@ -1114,10 +1353,10 @@ export class App {
       this.post({ type: 'openAsText' });
       return;
     }
+    this.activateModal('edit');
     const raw = this.model.line(r);
     const p = this.model.get(r);
-    this.editRecord = r;
-    this.editOriginal = raw;
+    this.mutation = { kind: 'record', record: r, original: raw };
     const panel = this.root.querySelector('.editpanel') as HTMLElement;
     const ta = panel.querySelector('textarea') as HTMLTextAreaElement;
     (panel.querySelector('.ep-title') as HTMLElement).textContent = t('Edit line {0}', r + 1);
@@ -1125,16 +1364,17 @@ export class App {
     ta.value = p.kind === 'value' ? prettyJson(raw, this.config.indent) : raw;
     panel.hidden = false;
     ta.focus();
+    this.stateChanged();
   }
 
-  private closeEditor(): void {
-    const panel = this.root.querySelector('.editpanel') as HTMLElement | null;
-    if (panel) panel.hidden = true;
-    this.editRecord = -1;
+  private closeEditor(restoreFocus = true): void {
+    if (this.mutation.kind === 'record') this.mutation = { kind: 'idle' };
+    this.deactivateModal('edit', restoreFocus);
   }
 
   private applyEditor(): void {
-    if (this.editRecord < 0) return;
+    if (this.mutation.kind !== 'record') return;
+    const { record, original } = this.mutation;
     const panel = this.root.querySelector('.editpanel') as HTMLElement;
     const ta = panel.querySelector('textarea') as HTMLTextAreaElement;
     const err = panel.querySelector('.ep-err') as HTMLElement;
@@ -1145,7 +1385,7 @@ export class App {
       return;
     }
     err.textContent = t('Saving…');
-    this.post({ type: 'editLine', line: this.editRecord, original: this.editOriginal, text: ta.value, cell: false });
+    this.post({ type: 'editLine', line: record, original, text: ta.value, cell: false });
   }
 
   private onEditResult(ok: boolean, message?: string, line?: number, text?: string, cell?: boolean, batch?: boolean): void {
@@ -1159,19 +1399,22 @@ export class App {
       this.paintChrome();
       this.stateChanged();
     }
-    if (batch) {
+    if (batch || this.mutation.kind === 'batch') {
+      if (this.mutation.kind === 'batch') this.mutation = { kind: 'idle' };
       if (ok) this.closeBatchPanel();
       else {
         const berr = this.root.querySelector('.batchpanel .ep-err') as HTMLElement | null;
         if (berr && !berr.closest('[hidden]')) berr.textContent = message ?? t('The edit failed.');
         else this.showBanner(message ?? t('The edit failed.'));
       }
+      this.syncAxDomAttributes();
       return;
     }
-    const isCell = cell !== undefined ? cell : this.cellPending;
+    const isCell = cell !== undefined ? cell : this.mutation.kind === 'cell';
     if (isCell) {
-      this.cellPending = false;
+      if (this.mutation.kind === 'cell') this.mutation = { kind: 'idle' };
       if (!ok) this.showBanner(message ?? t('The edit failed.'));
+      this.syncAxDomAttributes();
       return;
     }
     if (ok) {
@@ -1193,7 +1436,8 @@ export class App {
    */
   editCell(record: number, path: (string | number)[], json: string): void {
     const m = this.model;
-    this.cellPending = true;
+    this.mutation = { kind: 'cell', record };
+    this.syncAxDomAttributes();
     if (!m.isJsonl) {
       this.post({ type: 'editValue', path, version: this.version, text: json, cell: true });
       return;
@@ -1201,7 +1445,8 @@ export class App {
     const line = m.line(record);
     const span = valueSpan(line, path);
     if (!span) {
-      this.cellPending = false;
+      this.mutation = { kind: 'idle' };
+      this.syncAxDomAttributes();
       this.showBanner(t('The value is no longer in line {0}.', record + 1));
       return;
     }
@@ -1212,7 +1457,8 @@ export class App {
   /** Inserts a new property on an object row when editing a missing cell in the Grid. */
   insertMissingCell(record: number, fullPath: (string | number)[], key: string, jsonVal: string): void {
     const m = this.model;
-    this.cellPending = true;
+    this.mutation = { kind: 'cell', record };
+    this.syncAxDomAttributes();
     if (!m.isJsonl) {
       this.post({ type: 'editValue', path: fullPath, version: this.version, text: jsonVal, cell: true });
       return;
@@ -1221,7 +1467,8 @@ export class App {
     const v = m.value(record);
     const span = valueSpan(line, []);
     if (!span || v === undefined || !isObj(v)) {
-      this.cellPending = false;
+      this.mutation = { kind: 'idle' };
+      this.syncAxDomAttributes();
       this.showBanner(t('The value is no longer in line {0}.', record + 1));
       return;
     }
@@ -1236,7 +1483,8 @@ export class App {
 
   private insertLineBelow(r: number): void {
     if (this.readOnly || !this.model.isJsonl) return;
-    this.pendingOpenRecord = r + 1;
+    this.mutation = { kind: 'insert-open', openRecord: r + 1 };
+    this.syncAxDomAttributes();
     this.post({ type: 'mutateLines', version: this.version, mutation: { op: 'insert', after: r, text: '{}' } });
   }
 
@@ -1255,6 +1503,7 @@ export class App {
 
   private openBatchRewrite(): void {
     if (this.readOnly || !this.model.isJsonl) return;
+    this.activateModal('batch');
     const panel = this.root.querySelector('.batchpanel') as HTMLElement;
     const hasFilter = !!this.query.text || this.hasGlobalRowFilter();
     let previewEdits: { line: number; original: string; text: string }[] = [];
@@ -1297,17 +1546,26 @@ export class App {
         return;
       }
       if (!c.program || c.error) {
-        errEl.textContent = c.error ?? 'Invalid jq expression';
+        errEl.textContent = c.error ?? t('Invalid jq expression');
         applyBtn.disabled = true;
         return;
       }
       const onlyMatches = !!(panel.querySelector('[data-bscope]') as HTMLInputElement | null)?.checked;
-      const targetIds = onlyMatches
-        ? (this.query.text ? this.matches : Array.from({ length: this.model.count }, (_, i) => i)).filter((i) => !this.hasGlobalRowFilter() || this.passesGlobalRowFilter(i))
-        : Array.from({ length: this.model.count }, (_, i) => i);
+      const app = this;
+      const targetIdsIter = (function* (): Generator<number> {
+        if (onlyMatches && app.query.text) {
+          const hasG = app.hasGlobalRowFilter();
+          for (const i of app.matches) if (!hasG || app.passesGlobalRowFilter(i)) yield i;
+          return;
+        }
+        const checkGlobal = onlyMatches && app.hasGlobalRowFilter();
+        for (let i = 0; i < app.model.count; i++) {
+          if (!checkGlobal || app.passesGlobalRowFilter(i)) yield i;
+        }
+      })();
       const samples: [number, string, string][] = [];
       let checked = 0;
-      for (const i of targetIds) {
+      for (const i of targetIdsIter) {
         if (this.model.isBlank(i)) continue;
         const v = this.model.scanValue(i);
         if (v === undefined) continue;
@@ -1325,7 +1583,7 @@ export class App {
             if (samples.length < 25) samples.push([i, oldText, nextText]);
           }
         } catch (e) {
-          errEl.textContent = `Line ${i + 1}: ${errorMessage(e)}`;
+          errEl.textContent = `${t('Line {0}', i + 1)}: ${errorMessage(e)}`;
           return;
         }
       }
@@ -1362,29 +1620,29 @@ export class App {
       if (!previewEdits.length) return;
       applyBtn.disabled = true;
       errEl.textContent = t('Saving…');
+      this.mutation = { kind: 'batch' };
+      this.syncAxDomAttributes();
       this.post({ type: 'mutateLines', version: this.version, mutation: { op: 'rewrite', edits: previewEdits } });
     });
     panel.querySelector('.batch-close')!.addEventListener('click', () => this.closeBatchPanel());
     exprInput.focus();
+    this.stateChanged();
   }
 
-  private closeBatchPanel(): void {
-    const panel = this.root.querySelector('.batchpanel') as HTMLElement | null;
-    if (panel) {
-      panel.hidden = true;
-      panel.innerHTML = '';
-    }
+  private closeBatchPanel(restoreFocus = true): void {
+    this.deactivateModal('batch', restoreFocus);
   }
 
   // ---------- value inspector & schema generator & context menu ----------
 
-  openValueInspector(r: number, path: (string | number)[], explicitVal?: JVal): void {
+  openValueInspector(r: number, path: (string | number)[], explicitVal?: JVal, forceTab?: string): void {
     const rootVal = this.model.value(this.model.isJsonl ? r : 0);
     const val = explicitVal !== undefined ? explicitVal : rootVal !== undefined ? getAt(rootVal, path) : undefined;
     const panel = this.root.querySelector('.valpanel') as HTMLElement;
     if (val === undefined) {
       const rawLine = this.model.isJsonl && r < this.model.count ? this.model.line(r) : '';
       if (!rawLine) return;
+      this.activateModal('inspector');
       panel.innerHTML = `
         <div class="ep-head"><span class="ep-title">${esc(t('Value inspector'))}</span><span class="dim">${esc(t('Line {0}', r + 1))}</span></div>
         <pre class="val-body mono" tabindex="0">${esc(rawLine)}</pre>
@@ -1393,21 +1651,37 @@ export class App {
       panel.querySelector('.vp-copy')!.addEventListener('click', () => this.post({ type: 'copy', text: rawLine }));
       panel.querySelector('.vp-close')!.addEventListener('click', () => this.closeValueInspector());
       (panel.querySelector('.vp-close') as HTMLElement).focus();
+      this.stateChanged();
       return;
     }
+
+    this.activateModal('inspector');
 
     let prevMs: number | undefined;
     if (this.model.isJsonl && r > 0) prevMs = extractRecordEpochMs(this.model.value(r - 1));
     const decoded = decodeSmartValue(val, prevMs);
     const unpackedJson = typeof val === 'string' ? tryUnpackJsonString(val) : undefined;
+    const conv = detectConversation(unpackedJson ?? val) ?? (path.length === 0 ? detectConversation(rootVal) : undefined);
     const isStr = typeof val === 'string';
     const hasJsonTab = isContainer(val) || unpackedJson !== undefined;
     const tabs: { id: string; label: string }[] = [{ id: 'text', label: t('Text') }];
+    if (conv) tabs.push({ id: 'chat', label: t('Chat') });
     if (isStr) tabs.push({ id: 'md', label: t('Markdown') });
     if (hasJsonTab) tabs.push({ id: 'json', label: t('JSON') });
     if (decoded.length) tabs.push({ id: 'dec', label: t('Decoded') });
 
-    let activeTab = decoded.length ? 'dec' : unpackedJson !== undefined ? 'json' : isStr && (val.includes('\n#') || val.includes('```') || val.includes('**')) ? 'md' : 'text';
+    let activeTab =
+      forceTab && tabs.some((tb) => tb.id === forceTab)
+        ? forceTab
+        : conv
+          ? 'chat'
+          : decoded.length
+            ? 'dec'
+            : unpackedJson !== undefined
+              ? 'json'
+              : isStr && (val.includes('\n#') || val.includes('```') || val.includes('**'))
+                ? 'md'
+                : 'text';
     const pathStr = pathToString(path);
     const pathKey = path.reduce<string>((acc, seg) => childKey(acc, seg), '');
     const canToggleUnpack = isStr && unpackedJson !== undefined && isContainer(unpackedJson) && (this.state.view === 'formatted' || this.state.view === 'grid');
@@ -1463,7 +1737,9 @@ export class App {
         b.setAttribute('aria-selected', String(on));
       });
       const host = panel.querySelector('.vp-host') as HTMLElement;
-      if (activeTab === 'md' && isStr) {
+      if (activeTab === 'chat' && conv) {
+        host.innerHTML = `<div class="val-body chat-host" tabindex="0">${renderConversationHtml(conv)}</div>`;
+      } else if (activeTab === 'md' && isStr) {
         host.innerHTML = `<div class="val-body md-body" tabindex="0">${renderMarkdownSafe(val)}</div>`;
       } else if (activeTab === 'json') {
         const target = unpackedJson !== undefined ? unpackedJson : val;
@@ -1522,15 +1798,11 @@ export class App {
       }
     };
     (panel.querySelector('.vp-close') as HTMLElement).focus();
+    this.stateChanged();
   }
 
-  private closeValueInspector(): void {
-    const panel = this.root.querySelector('.valpanel') as HTMLElement | null;
-    if (panel) {
-      panel.onclick = null;
-      panel.hidden = true;
-      panel.innerHTML = '';
-    }
+  private closeValueInspector(restoreFocus = true): void {
+    this.deactivateModal('inspector', restoreFocus);
   }
 
   private openSchemaGenerator(): void {
@@ -1546,13 +1818,23 @@ export class App {
         }
         return;
       }
-      const ids =
-        app.state.view === 'grid'
-          ? (app.views.grid as GridView).visibleRecordIds()
-          : app.query.text
-            ? app.matches
-            : Array.from({ length: m.count }, (_, i) => i);
-      for (const id of ids) {
+      if (app.state.view === 'grid') {
+        for (const id of (app.views.grid as GridView).visibleRecordIds()) {
+          if (m.isBlank(id)) continue;
+          const v = m.scanValue(id);
+          if (v !== undefined) yield v;
+        }
+        return;
+      }
+      if (app.query.text) {
+        for (const id of app.matches) {
+          if (m.isBlank(id)) continue;
+          const v = m.scanValue(id);
+          if (v !== undefined) yield v;
+        }
+        return;
+      }
+      for (let id = 0; id < m.count; id++) {
         if (m.isBlank(id)) continue;
         const v = m.scanValue(id);
         if (v !== undefined) yield v;
@@ -1560,7 +1842,7 @@ export class App {
     })(this);
 
     const { schema, sampled } = inferSchema(recordsIter);
-    const stem = this.doc.fileName.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '');
+    const stem = this.doc.fileName.replace(/\.(gz|br)$/i, '').replace(/\.[^.]+$/, '');
     const typeName = stem.replace(/[^A-Za-z0-9]+/g, ' ').trim().split(/\s+/).map((w) => (w ? w[0].toUpperCase() + w.slice(1) : '')).join('') || 'RecordItem';
     const safeRoot = /^[0-9]/.test(typeName) ? `T${typeName}` : typeName;
 
@@ -1579,6 +1861,7 @@ export class App {
       }
     };
 
+    this.activateModal('schema');
     const panel = this.root.querySelector('.schemapanel') as HTMLElement;
     panel.innerHTML = `
       <div class="ep-head">
@@ -1627,15 +1910,11 @@ export class App {
       }
     };
     (panel.querySelector('.sp-close') as HTMLElement).focus();
+    this.stateChanged();
   }
 
-  private closeSchemaPanel(): void {
-    const panel = this.root.querySelector('.schemapanel') as HTMLElement | null;
-    if (panel) {
-      panel.onclick = null;
-      panel.hidden = true;
-      panel.innerHTML = '';
-    }
+  private closeSchemaPanel(restoreFocus = true): void {
+    this.deactivateModal('schema', restoreFocus);
   }
 
   openContextMenu(
@@ -1649,8 +1928,14 @@ export class App {
     const unpackable = typeof ctx.value === 'string' && ctx.value.length <= 262_144 && tryUnpackJsonString(ctx.value) !== undefined;
     const alreadyUnpacked = this.unpackedOf(ctx.record).has(pathKey);
 
+    const rootForCtx = this.model.value(m.isJsonl ? ctx.record : 0);
+    const convTarget = detectConversation(ctx.value) ?? (ctx.path.length === 0 ? detectConversation(rootForCtx) : undefined);
+
     if (ctx.hasValue || (m.isJsonl && ctx.record < m.count)) {
       items.push({ id: 'inspect', label: t('Inspect value') });
+    }
+    if (convTarget) {
+      items.push({ id: 'chat', label: t('Open conversation view') });
     }
     if ((unpackable || alreadyUnpacked) && (this.state.view === 'formatted' || this.state.view === 'grid')) {
       items.push({ id: 'unpack', label: t(alreadyUnpacked ? 'Fold unpacked JSON' : 'Unpack JSON') });
@@ -1658,16 +1943,27 @@ export class App {
     if (ctx.hasValue && ctx.value !== undefined) {
       items.push({ id: 'copy-raw', label: t('Copy raw value') });
       items.push({ id: 'copy-json', label: t('Copy as JSON') });
+      items.push({ id: 'copy-redacted', label: t('Copy redacted JSON') });
     } else if (m.isJsonl && ctx.record < m.count) {
       items.push({ id: 'copy-line', label: t('Copy the raw line') });
+      items.push({ id: 'copy-redacted', label: t('Copy redacted JSON') });
     }
     if (ctx.path.length > 0) {
       items.push({ id: 'copy-jpath', label: t('Copy JSONPath'), sepBefore: true });
       items.push({ id: 'copy-jq', label: t('Copy jq path') });
+      const canPromote = (m.isJsonl || (rootForCtx !== undefined && isArr(rootForCtx))) && ctx.path.length >= 2;
+      if (canPromote) {
+        const promId = promotedColId(ctx.path);
+        const alreadyProm = this.state.grid.promotedCols.includes(promId);
+        items.push({ id: 'promote-col', label: t(alreadyProm ? 'Remove Grid column' : 'Add as Grid column') });
+      }
       if (m.isJsonl && ctx.hasValue && ctx.value !== undefined && !isContainer(ctx.value)) {
         const jqP = pathToJq(ctx.path);
         items.push({ id: 'filter-eq', label: t('Filter: {0} = value', jqP) });
         items.push({ id: 'filter-neq', label: t('Filter: {0} != value', jqP) });
+        if (isTraceCandidate(ctx.path, ctx.value)) {
+          items.push({ id: 'trace', label: t('Trace call flow') });
+        }
       }
     }
     if (m.isJsonl && !this.isProjected && ctx.record < m.count) {
@@ -1694,6 +1990,7 @@ export class App {
           `${it.sepBefore ? '<div class="menu-sep" role="separator"></div>' : ''}<button class="menu-item" role="menuitem" data-ctx="${it.id}">${esc(it.label)}</button>`,
       )
       .join('');
+    this.onPopoverOpened('ctx-menu');
     menu.hidden = false;
     const hostRect = this.root.getBoundingClientRect();
     const mw = menu.offsetWidth || 240;
@@ -1708,11 +2005,15 @@ export class App {
       const b = (ev.target as HTMLElement).closest('[data-ctx]') as HTMLElement | null;
       if (!b) return;
       menu.hidden = true;
+      this.onPopoverClosed('ctx-menu');
       const action = b.dataset.ctx;
       const v = ctx.value;
       switch (action) {
         case 'inspect':
           this.openValueInspector(ctx.record, ctx.path, v);
+          break;
+        case 'chat':
+          this.openValueInspector(ctx.record, ctx.path.length ? ctx.path : [], v ?? rootForCtx, 'chat');
           break;
         case 'unpack':
           this.toggleUnpack(ctx.record, pathKey);
@@ -1724,6 +2025,14 @@ export class App {
         case 'copy-json':
           if (v !== undefined) this.post({ type: 'copy', text: stringifyPretty(v, this.config.indent, 5_000_000) });
           break;
+        case 'copy-redacted':
+          if (v !== undefined) {
+            const red = redactValue(v, ctx.path.length ? String(ctx.path[ctx.path.length - 1]) : undefined);
+            this.post({ type: 'copy', text: stringifyPretty(red, this.config.indent, 5_000_000) });
+          } else if (m.isJsonl && ctx.record < m.count) {
+            this.post({ type: 'copy', text: redactJsonLine(m.line(ctx.record)) });
+          }
+          break;
         case 'copy-line':
           this.post({ type: 'copy', text: m.line(ctx.record) });
           break;
@@ -1732,6 +2041,12 @@ export class App {
           break;
         case 'copy-jq':
           this.post({ type: 'copy', text: pathToJq(ctx.path) });
+          break;
+        case 'promote-col':
+          this.promoteNestedColumn(ctx.path);
+          break;
+        case 'trace':
+          if (v !== undefined) this.openTraceWaterfall(ctx.path, v);
           break;
         case 'filter-eq':
         case 'filter-neq':
@@ -1762,6 +2077,542 @@ export class App {
       }
     };
     (menu.querySelector('button') as HTMLElement | null)?.focus();
+  }
+
+  // ---------- pivot, quality, dataset diff, trace waterfall & go-to ----------
+
+  private visibleValuesIter(): Iterable<JVal> {
+    const m = this.model;
+    const app = this;
+    return {
+      *[Symbol.iterator]() {
+        if (!m.isJsonl) {
+          const root = m.value(0);
+          if (root === undefined) return;
+          if (isArr(root)) {
+            for (const it of root) yield it;
+          } else yield root;
+          return;
+        }
+        if (app.state.view === 'grid') {
+          for (const id of (app.views.grid as GridView).visibleRecordIds()) {
+            if (m.isBlank(id)) continue;
+            const v = m.scanValue(id);
+            if (v !== undefined) yield v;
+          }
+          return;
+        }
+        const hasG = app.hasGlobalRowFilter();
+        if (app.query.text) {
+          for (const id of app.matches) {
+            if (m.isBlank(id) || (hasG && !app.passesGlobalRowFilter(id))) continue;
+            const v = m.scanValue(id);
+            if (v !== undefined) yield v;
+          }
+          return;
+        }
+        for (let id = 0; id < m.count; id++) {
+          if (m.isBlank(id) || (hasG && !app.passesGlobalRowFilter(id))) continue;
+          const v = m.scanValue(id);
+          if (v !== undefined) yield v;
+        }
+      },
+    };
+  }
+
+  private openPivotPanel(): void {
+    const panel = this.root.querySelector('.pivotpanel') as HTMLElement;
+    const paths = discoverFieldPaths(this.visibleValuesIter());
+    if (!paths.length) return;
+    this.activateModal('pivot');
+    let groupStr = paths[0].label;
+    let metricStr = paths.find((p) => p.isNumeric && p.label !== groupStr)?.label ?? '';
+    let sortBy: 'count' | 'sum' | 'avg' | 'group' = 'count';
+    let lastRes = computePivot(this.visibleValuesIter(), paths[0].path, metricStr ? (parsePath(metricStr) ?? null) : null, sortBy);
+
+    const groupOpts = paths.map((p) => `<option value="${esc(p.label)}">${esc(p.label)}</option>`).join('');
+    const numOpts = `<option value="">${esc(t('(Count only)'))}</option>` + paths.filter((p) => p.isNumeric).map((p) => `<option value="${esc(p.label)}"${p.label === metricStr ? ' selected' : ''}>${esc(p.label)}</option>`).join('');
+
+    panel.innerHTML = `
+      <div class="ep-head">
+        <span class="ep-title">${icon('pivot', 14)} ${esc(t('Pivot & Group By'))}</span>
+        <span class="dim piv-meta"></span>
+      </div>
+      <div class="batch-bar piv-controls">
+        <label class="piv-ctl"><span>${esc(t('Group by'))}</span><select data-piv-group>${groupOpts}</select></label>
+        <label class="piv-ctl"><span>${esc(t('Metric field'))}</span><select data-piv-metric>${numOpts}</select></label>
+        <div class="seg" role="group">
+          <button class="seg-btn sub on" data-psort="count">${esc(t('Count'))} ↓</button>
+          <button class="seg-btn sub" data-psort="sum">${esc(t('Sum'))} ↓</button>
+          <button class="seg-btn sub" data-psort="avg">${esc(t('Avg'))} ↓</button>
+          <button class="seg-btn sub" data-psort="group">${esc(t('Group'))} ↑</button>
+        </div>
+      </div>
+      <div class="cmp-scroll piv-host"></div>
+      <div class="ep-actions">
+        <button class="btn primary piv-copy-md">${icon('copy', 12)}${esc(t('Copy as Markdown'))}</button>
+        <button class="btn piv-copy-tsv">${esc(t('Copy as TSV'))}</button>
+        <button class="btn piv-close">${esc(t('Close'))} <kbd>Esc</kbd></button>
+      </div>`;
+    panel.hidden = false;
+
+    const host = panel.querySelector('.piv-host') as HTMLElement;
+    const meta = panel.querySelector('.piv-meta') as HTMLElement;
+    const gSel = panel.querySelector('[data-piv-group]') as HTMLSelectElement;
+    const mSel = panel.querySelector('[data-piv-metric]') as HTMLSelectElement;
+
+    const recompute = () => {
+      const gp = parsePath(groupStr) ?? [groupStr];
+      const mp = metricStr ? (parsePath(metricStr) ?? [metricStr]) : null;
+      lastRes = computePivot(this.visibleValuesIter(), gp, mp, sortBy);
+      meta.textContent = t('{0} groups · {1} records', lastRes.groups.length.toLocaleString(), lastRes.totalRecords.toLocaleString());
+      panel.querySelectorAll<HTMLButtonElement>('[data-psort]').forEach((b) => b.classList.toggle('on', b.dataset.psort === sortBy));
+      host.innerHTML = renderPivotTableHtml(lastRes);
+    };
+    recompute();
+
+    gSel.onchange = () => {
+      groupStr = gSel.value;
+      recompute();
+    };
+    mSel.onchange = () => {
+      metricStr = mSel.value;
+      recompute();
+    };
+    panel.onclick = (e) => {
+      const target = e.target as HTMLElement;
+      const row = target.closest('.piv-row') as HTMLElement | null;
+      if (row) {
+        const g = lastRes.groups[Number(row.dataset.pidx)];
+        if (g && g.filterQuery) {
+          this.closePivotPanel(false);
+          this.applyQueryFromUI(g.filterQuery, true);
+        }
+        return;
+      }
+      const btn = target.closest('button') as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.dataset.psort) {
+        sortBy = btn.dataset.psort as typeof sortBy;
+        recompute();
+      } else if (btn.classList.contains('piv-copy-md') || btn.classList.contains('piv-copy-tsv')) {
+        const isMd = btn.classList.contains('piv-copy-md');
+        const head = lastRes.hasMetric ? [groupStr, 'count', 'share', 'sum', 'avg', 'min', 'p50', 'p95', 'max'] : [groupStr, 'count', 'share'];
+        const body = lastRes.groups.map((g) => {
+          const base = [g.label, String(g.count), (g.share * 100).toFixed(1) + '%'];
+          return lastRes.hasMetric
+            ? [...base, String(g.sum), g.avg.toPrecision(6), String(g.min), String(g.p50), String(g.p95), String(g.max)]
+            : base;
+        });
+        const out = isMd
+          ? [mdRow(head), mdDivider(head.length), ...body.map(mdRow)].join('\n') + '\n'
+          : [tsvRow(head), ...body.map(tsvRow)].join('\n') + '\n';
+        this.post({ type: 'copy', text: out });
+      } else if (btn.classList.contains('piv-close')) {
+        this.closePivotPanel();
+      }
+    };
+    (panel.querySelector('.piv-close') as HTMLElement).focus();
+    this.stateChanged();
+  }
+
+  private closePivotPanel(restoreFocus = true): void {
+    this.deactivateModal('pivot', restoreFocus);
+  }
+
+  private openQualityPanel(explicitKey?: string): void {
+    if (!this.model.isJsonl) return;
+    this.activateModal('quality');
+    const panel = this.root.querySelector('.qualitypanel') as HTMLElement;
+    const rep = analyzeDataQuality(this.model, explicitKey);
+    const keyOpts =
+      `<option value="__auto__"${explicitKey === undefined ? ' selected' : ''}>${esc(t('(Auto)'))}${rep.keyField && explicitKey === undefined ? ` · ${esc(rep.keyField)}` : ''}</option>` +
+      rep.keyCandidates.map((k) => `<option value="${esc(k)}"${explicitKey === k ? ' selected' : ''}>${esc(k)}</option>`).join('');
+
+    const cards = rep.issues.length
+      ? rep.issues
+          .map(
+            (iss, idx) => `<div class="dec-card qual-card" data-qidx="${idx}">
+              <div class="dec-head"><span>${esc(iss.title)}</span><span class="dim mono">${esc(iss.detail)}</span></div>
+              <div class="qual-actions">
+                <button class="btn" data-qfilter="${idx}">${esc(t('Filter {0} lines', iss.recordIds.length.toLocaleString()))}</button>
+                ${
+                  iss.deletableIds?.length && !this.readOnly
+                    ? `<button class="btn" data-qdel="${idx}">${icon('trash', 12)}${esc(t('Delete {0} duplicates', iss.deletableIds.length.toLocaleString()))}</button>`
+                    : ''
+                }
+              </div>
+            </div>`,
+          )
+          .join('')
+      : `<div class="empty-note">${esc(t('All {0} records look clean.', rep.scannedRecords.toLocaleString()))}</div>`;
+
+    panel.innerHTML = `
+      <div class="ep-head">
+        <span class="ep-title">${icon('shield', 14)} ${esc(t('Data quality & duplicates'))}</span>
+        <label class="piv-ctl"><span>${esc(t('Primary key'))}</span><select data-qual-key>${keyOpts}</select></label>
+      </div>
+      <div class="val-body dec-list">${cards}</div>
+      <div class="ep-actions">
+        <button class="btn qual-close">${esc(t('Close'))} <kbd>Esc</kbd></button>
+      </div>`;
+    panel.hidden = false;
+
+    const kSel = panel.querySelector('[data-qual-key]') as HTMLSelectElement;
+    kSel.onchange = () => this.openQualityPanel(kSel.value === '__auto__' ? undefined : kSel.value);
+
+    panel.onclick = (e) => {
+      const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.dataset.qfilter !== undefined) {
+        const iss = rep.issues[Number(btn.dataset.qfilter)];
+        if (iss) {
+          this.state.subsetFilter = { label: iss.title, ids: new Set(iss.recordIds) };
+          this.subsetRev++;
+          this.closeQualityPanel(false);
+          this.activeView.render();
+          if (iss.recordIds.length) {
+            this.selectRecord(iss.recordIds[0]);
+            this.activeView.onActiveChanged(true);
+          }
+          this.paintChrome();
+          this.stateChanged();
+        }
+      } else if (btn.dataset.qdel !== undefined) {
+        const iss = rep.issues[Number(btn.dataset.qdel)];
+        if (iss?.deletableIds?.length && !this.readOnly) {
+          this.closeQualityPanel(false);
+          this.post({ type: 'mutateLines', version: this.version, mutation: { op: 'delete', lines: iss.deletableIds } });
+        }
+      } else if (btn.classList.contains('qual-close')) {
+        this.closeQualityPanel();
+      }
+    };
+    (panel.querySelector('.qual-close') as HTMLElement).focus();
+    this.stateChanged();
+  }
+
+  private closeQualityPanel(restoreFocus = true): void {
+    this.deactivateModal('quality', restoreFocus);
+  }
+
+  private openFileDiffPanel(otherName: string, otherText: string): void {
+    this.activateModal('filediff');
+    const panel = this.root.querySelector('.filediffpanel') as HTMLElement;
+    const leftRecords: JVal[] = [];
+    if (this.model.isJsonl) {
+      const lim = Math.min(this.model.count, 50_000);
+      for (let i = 0; i < lim; i++) {
+        const v = this.model.scanValue(i);
+        if (v !== undefined) leftRecords.push(v);
+      }
+    } else {
+      const root = this.model.value(0);
+      if (root !== undefined) {
+        if (isArr(root)) leftRecords.push(...root);
+        else leftRecords.push(root);
+      }
+    }
+    const rightRecords = parseDatasetRecords(otherText);
+    let keyMode: string | null | undefined = undefined;
+    let tabFilter: 'all' | 'modified' | 'added' | 'removed' = 'all';
+
+    const paintDiff = () => {
+      const res = diffDatasets(leftRecords, rightRecords, keyMode);
+      const shown = tabFilter === 'all' ? res.entries : res.entries.filter((e) => e.kind === tabFilter);
+      const alignOpts =
+        `<option value="__auto__"${keyMode === undefined ? ' selected' : ''}>${esc(t('(Auto)'))}${res.keyField && keyMode === undefined ? ` · ${esc(res.keyField)}` : ''}</option>` +
+        `<option value="__line__"${keyMode === null ? ' selected' : ''}>${esc(t('Line number (#)'))}</option>` +
+        res.keyCandidates.map((k) => `<option value="k:${esc(k)}"${keyMode === k ? ' selected' : ''}>${esc(t('Key: {0}', k))}</option>`).join('');
+
+      const metricsHtml = res.metrics.length
+        ? `<div class="fd-metrics dim">${res.metrics
+            .map((m) => `<span class="badge">${esc(m.field)}: ${m.leftAvg.toPrecision(4)} → ${m.rightAvg.toPrecision(4)} (${m.delta >= 0 ? '+' : ''}${m.delta.toPrecision(3)})</span>`)
+            .join(' ')}</div>`
+        : '';
+
+      const rowsHtml = shown.length
+        ? `<table class="cmp fd-tbl"><thead><tr><th>${esc(t('Status'))}</th><th>${esc(t('Key / #'))}</th><th>${esc(this.doc.fileName)}</th><th>${esc(otherName)}</th></tr></thead><tbody>${shown
+            .slice(0, 500)
+            .map((en) => {
+              const cls = en.kind === 'added' ? 'cmp-added' : en.kind === 'removed' ? 'cmp-removed' : 'cmp-changed';
+              const badgeLbl = en.kind === 'added' ? t('Added') : en.kind === 'removed' ? t('Removed') : t('Modified');
+              const leftCell =
+                en.kind === 'modified' && en.changes?.length
+                  ? en.changes.slice(0, 4).map((c) => `${pathToString(c.path)}: ${c.a === undefined ? '–' : compactJson(c.a).slice(0, 80)}`).join('\n')
+                  : en.left !== undefined
+                    ? compactJson(en.left).slice(0, 200)
+                    : '–';
+              const rightCell =
+                en.kind === 'modified' && en.changes?.length
+                  ? en.changes.slice(0, 4).map((c) => `${pathToString(c.path)}: ${c.b === undefined ? '–' : compactJson(c.b).slice(0, 80)}`).join('\n')
+                  : en.right !== undefined
+                    ? compactJson(en.right).slice(0, 200)
+                    : '–';
+              return `<tr class="${cls}"><td><span class="badge">${esc(badgeLbl)}</span></td><td class="mono">${esc(en.keyLabel)}</td><td class="mono">${esc(leftCell)}</td><td class="mono">${esc(rightCell)}</td></tr>`;
+            })
+            .join('')}</tbody></table>`
+        : `<div class="empty-note">${esc(t('No differences between the two files.'))}</div>`;
+
+      panel.innerHTML = `
+        <div class="ep-head">
+          <span class="ep-title">${icon('diff-files', 14)} ${esc(t('Dataset comparison'))}</span>
+          <span class="dim mono">${esc(this.doc.fileName)} ↔ ${esc(otherName)}</span>
+          <div class="spring"></div>
+          <label class="piv-ctl"><span>${esc(t('Align by'))}</span><select data-fd-align>${alignOpts}</select></label>
+        </div>
+        <div class="batch-bar fd-bar">
+          <div class="seg" role="tablist">
+            <button role="tab" class="seg-btn sub${tabFilter === 'all' ? ' on' : ''}" data-fdtab="all">${esc(t('All'))} (${res.added + res.removed + res.modified})</button>
+            <button role="tab" class="seg-btn sub${tabFilter === 'modified' ? ' on' : ''}" data-fdtab="modified">${esc(t('Modified'))} (${res.modified})</button>
+            <button role="tab" class="seg-btn sub${tabFilter === 'added' ? ' on' : ''}" data-fdtab="added">+${esc(t('Added'))} (${res.added})</button>
+            <button role="tab" class="seg-btn sub${tabFilter === 'removed' ? ' on' : ''}" data-fdtab="removed">-${esc(t('Removed'))} (${res.removed})</button>
+          </div>
+          <span class="dim">${esc(t('Unchanged'))}: ${res.unchanged.toLocaleString()}</span>
+          ${metricsHtml}
+        </div>
+        <div class="cmp-scroll">${rowsHtml}</div>
+        <div class="ep-actions">
+          <button class="btn primary fd-open-diff">${esc(t('Open in the diff editor'))}</button>
+          <button class="btn fd-pick-other">${esc(t('Compare with file…'))}</button>
+          <button class="btn fd-close">${esc(t('Close'))} <kbd>Esc</kbd></button>
+        </div>`;
+
+      const selEl = panel.querySelector('[data-fd-align]') as HTMLSelectElement;
+      selEl.onchange = () => {
+        const v = selEl.value;
+        keyMode = v === '__auto__' ? undefined : v === '__line__' ? null : v.slice(2);
+        paintDiff();
+      };
+    };
+
+    panel.hidden = false;
+    paintDiff();
+
+    panel.onclick = (e) => {
+      const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.dataset.fdtab) {
+        tabFilter = btn.dataset.fdtab as typeof tabFilter;
+        paintDiff();
+      } else if (btn.classList.contains('fd-open-diff')) {
+        const leftPretty = leftRecords.slice(0, 2000).map((r) => stringifyPretty(r, this.config.indent, 50_000)).join('\n');
+        const rightPretty = rightRecords.slice(0, 2000).map((r) => stringifyPretty(r, this.config.indent, 50_000)).join('\n');
+        this.post({ type: 'diff', left: { title: this.doc.fileName, text: leftPretty + '\n' }, right: { title: otherName, text: rightPretty + '\n' } });
+      } else if (btn.classList.contains('fd-pick-other')) {
+        this.post({ type: 'compareWithFile' });
+      } else if (btn.classList.contains('fd-close')) {
+        this.closeFileDiffPanel();
+      }
+    };
+    (panel.querySelector('.fd-close') as HTMLElement | null)?.focus();
+    this.stateChanged();
+  }
+
+  private closeFileDiffPanel(restoreFocus = true): void {
+    this.deactivateModal('filediff', restoreFocus);
+  }
+
+  private openTraceWaterfall(path: (string | number)[], val: JVal): void {
+    if (!this.model.isJsonl) return;
+    this.activateModal('trace');
+    const panel = this.root.querySelector('.tracepanel') as HTMLElement;
+    const wf = buildTraceWaterfall(this.model, path, val);
+    const spanInfo = t('{0} spans · {1}', wf.spans.length.toLocaleString(), formatDelta(wf.totalDurationMs).replace(/^\+/, ''));
+    panel.innerHTML = `
+      <div class="ep-head">
+        <span class="ep-title">${icon('waterfall', 14)} ${esc(t('Trace waterfall'))}</span>
+        <span class="mono">${esc(pathToJq(path))} = ${esc(wf.traceValue)}</span>
+        <span class="dim">${esc(spanInfo)}</span>
+      </div>
+      <div class="cmp-scroll">${renderWaterfallHtml(wf)}</div>
+      <div class="ep-actions">
+        <button class="btn primary wf-filter">${icon('filter', 12)}${esc(t('Filter to trace'))}</button>
+        <button class="btn wf-close">${esc(t('Close'))} <kbd>Esc</kbd></button>
+      </div>`;
+    panel.hidden = false;
+
+    panel.onclick = (e) => {
+      const target = e.target as HTMLElement;
+      const row = target.closest('[data-wf-rec]') as HTMLElement | null;
+      if (row) {
+        const recId = Number(row.dataset.wfRec);
+        this.closeTracePanel(false);
+        this.selectRecord(recId);
+        this.activeView.onActiveChanged(true);
+        return;
+      }
+      const btn = target.closest('button') as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.classList.contains('wf-filter')) {
+        this.closeTracePanel(false);
+        this.applyQueryFromUI(wf.jqFilter, true);
+      } else if (btn.classList.contains('wf-close')) {
+        this.closeTracePanel();
+      }
+    };
+    (panel.querySelector('.wf-close') as HTMLElement).focus();
+    this.stateChanged();
+  }
+
+  private closeTracePanel(restoreFocus = true): void {
+    this.deactivateModal('trace', restoreFocus);
+  }
+
+  private openGotoBox(): void {
+    if (!this.model?.isJsonl) return;
+    const box = this.root.querySelector('.goto-box') as HTMLElement | null;
+    if (!box) return;
+    this.onPopoverOpened('goto-box');
+    box.hidden = false;
+    const input = box.querySelector('.goto-in') as HTMLInputElement;
+    input.value = String(this.state.active + 1);
+    input.focus();
+    input.select();
+  }
+
+  private applyGoto(raw: string): void {
+    const m = this.model;
+    if (!m?.isJsonl || m.count === 0) return;
+    const s = raw.trim();
+    if (!s) return;
+    let target: number | undefined;
+    if (s.endsWith('%')) {
+      const pct = Math.max(0, Math.min(100, parseFloat(s.slice(0, -1)) || 0));
+      target = Math.round((pct / 100) * Math.max(0, m.count - 1));
+    } else if (/^[:#]?\d+$/.test(s)) {
+      const ln = parseInt(s.replace(/^[:#]/, ''), 10);
+      target = Math.min(m.count - 1, Math.max(0, ln - 1));
+    } else {
+      // Timestamp or HH:MM(:SS) lookup
+      const fullTs = parseTimestampMs(s);
+      if (fullTs) {
+        let best = 0;
+        let bestDiff = Infinity;
+        const lim = Math.min(m.count, 500_000);
+        for (let i = 0; i < lim; i++) {
+          const ms = extractRecordEpochMs(m.scanValue(i));
+          if (ms === undefined) continue;
+          const diff = Math.abs(ms - fullTs.epochMs);
+          if (diff < bestDiff) {
+            bestDiff = diff;
+            best = i;
+          }
+          if (ms >= fullTs.epochMs) {
+            best = i;
+            break;
+          }
+        }
+        target = best;
+      } else if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(s)) {
+        const padNeedle = s.length === 4 || s.length === 7 ? '0' + s : s;
+        const lim = Math.min(m.count, 500_000);
+        for (let i = 0; i < lim; i++) {
+          const line = m.head(i, 300);
+          if (line.includes(padNeedle) || line.includes(s)) {
+            target = i;
+            break;
+          }
+          const ms = extractRecordEpochMs(m.scanValue(i));
+          if (ms !== undefined) {
+            const d = new Date(ms);
+            const hhmmss = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+            const utcStr = d.toISOString().slice(11, 19);
+            if (hhmmss >= padNeedle || utcStr >= padNeedle) {
+              target = i;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (target !== undefined) {
+      this.selectRecord(target);
+      this.activeView.onActiveChanged(true);
+    }
+  }
+
+  private ensureAutocompleteFields(): FieldInfo[] {
+    const src = this.baseModel ?? this.model;
+    if (this.acModelRef === src && this.acModelRev === src.revision && this.acFields.length > 0) return this.acFields;
+    this.acModelRef = src;
+    this.acModelRev = src.revision;
+    const sample: JVal[] = [];
+    if (!src.isJsonl) {
+      const r = src.value(0);
+      if (r !== undefined) {
+        if (isArr(r)) sample.push(...r.slice(0, 200));
+        else sample.push(r);
+      }
+    } else {
+      const lim = Math.min(src.count, 200);
+      for (let i = 0; i < lim; i++) {
+        const v = src.scanValue(i);
+        if (v !== undefined) sample.push(v);
+      }
+    }
+    this.acFields = collectFieldCandidates(sample);
+    return this.acFields;
+  }
+
+  private updateAutocomplete(input: HTMLInputElement): void {
+    const menu = this.root.querySelector('.ac-menu') as HTMLElement | null;
+    if (!menu) return;
+    if (document.activeElement !== input) {
+      menu.hidden = true;
+      this.acIndex = -1;
+      this.onPopoverClosed('ac-menu');
+      return;
+    }
+    const cursor = input.selectionStart ?? input.value.length;
+    const items = getSearchCompletions(input.value, cursor, this.ensureAutocompleteFields(), {
+      literal: this.state.literal,
+      regex: this.state.regex,
+    });
+    this.acItems = items;
+    this.acIndex = -1;
+    if (!items.length) {
+      menu.hidden = true;
+      this.onPopoverClosed('ac-menu');
+      return;
+    }
+    this.onPopoverOpened('ac-menu');
+    this.paintAutocomplete(menu, input);
+  }
+
+  private paintAutocomplete(menu: HTMLElement, input: HTMLInputElement): void {
+    menu.innerHTML = this.acItems
+      .map(
+        (it, idx) =>
+          `<button class="menu-item ac-item${idx === this.acIndex ? ' on' : ''}" role="option" aria-selected="${idx === this.acIndex}" data-acidx="${idx}"><span class="mono">${esc(it.label)}</span><span class="spring"></span><span class="dim">${esc(it.detail)}</span></button>`,
+      )
+      .join('');
+    menu.hidden = false;
+    const searchWrap = input.closest('.search') as HTMLElement | null;
+    if (searchWrap) {
+      const hostRect = this.root.getBoundingClientRect();
+      const r = searchWrap.getBoundingClientRect();
+      menu.style.left = `${Math.max(4, r.left - hostRect.left)}px`;
+      menu.style.top = `${Math.max(4, r.bottom - hostRect.top + 3)}px`;
+      menu.style.minWidth = `${Math.min(340, Math.max(220, r.width))}px`;
+      menu.style.right = 'auto';
+    }
+  }
+
+  private acceptAutocomplete(input: HTMLInputElement, idx: number): void {
+    const it = this.acItems[idx];
+    const menu = this.root.querySelector('.ac-menu') as HTMLElement | null;
+    if (!it) return;
+    const nextVal = input.value.slice(0, it.replaceFrom) + it.insertText + input.value.slice(it.replaceTo);
+    input.value = nextVal;
+    const caret = it.replaceFrom + it.insertText.length;
+    input.setSelectionRange(caret, caret);
+    if (menu) menu.hidden = true;
+    this.acIndex = -1;
+    this.onPopoverClosed('ac-menu');
+    clearTimeout(this.searchTimer);
+    this.setQuery(nextVal);
+    input.focus();
   }
 
   // ---------- timeline ----------
@@ -1822,6 +2673,7 @@ export class App {
     if (this.baseModel) {
       this.model = this.baseModel;
       this.baseModel = undefined;
+      if (!this.state.query.trim()) this.transformMode = false;
     }
     const before = m.count;
     m.append(data);
@@ -1836,28 +2688,46 @@ export class App {
 
   // ---------- export ----------
 
-  /** Streams rows to the host as JSON Lines, CSV, JSON Array, or Markdown Table. */
-  private exportRows(which: 'rows' | 'selected', format: ExportRowFormat): void {
+  private buildExportData(which: 'rows' | 'selected'): {
+    ids: number[];
+    header: string[];
+    line: (id: number) => string;
+    cells: (id: number) => string[];
+    values: (id: number) => (JVal | undefined)[];
+  } {
     const m = this.model;
-    let ids: number[];
-    let header: string[];
-    let line: (id: number) => string;
-    let cells: (id: number) => string[];
+    const redact = this.redactExports;
     if (this.state.view === 'grid') {
       const src = (this.views.grid as GridView).exportSource();
-      header = src.header;
-      line = src.line;
-      cells = src.cells;
-      if (which === 'selected') {
-        const visibleSel = src.ids.filter((id) => this.state.selected.has(id));
-        ids = visibleSel.length ? visibleSel : [...this.state.selected].filter((id) => id < m.count && !m.isBlank(id)).sort((a, b) => a - b);
-      } else {
-        ids = src.ids;
-      }
-    } else if (!m.isJsonl) {
+      const visibleSel = which === 'selected' ? src.ids.filter((id) => this.state.selected.has(id)) : [];
+      const ids =
+        which === 'selected'
+          ? visibleSel.length
+            ? visibleSel
+            : [...this.state.selected].filter((id) => id < m.count && !m.isBlank(id)).sort((a, b) => a - b)
+          : src.ids;
+      return {
+        ids,
+        header: src.header,
+        line: (id) => (redact ? redactJsonLine(src.line(id)) : src.line(id)),
+        cells: (id) => {
+          if (!redact) return src.cells(id);
+          const vals = src.values(id);
+          return src.header.map((h, k) => {
+            const rv = vals[k] === undefined ? undefined : redactValue(vals[k]!, h);
+            return rv === undefined ? '' : cellString(rv);
+          });
+        },
+        values: (id) => {
+          const vals = src.values(id);
+          return redact ? vals.map((v, k) => (v === undefined ? undefined : redactValue(v, src.header[k]))) : vals;
+        },
+      };
+    }
+    if (!m.isJsonl) {
       const root = m.value(0);
       const items = root !== undefined && isArr(root) ? root : root !== undefined ? [root] : [];
-      ids = items.map((_, idx) => idx);
+      const ids = items.map((_, idx) => idx);
       const colSet = new Set<string>();
       let nonObj = false;
       for (const it of items) {
@@ -1865,36 +2735,88 @@ export class App {
         else for (const k in it) colSet.add(k);
       }
       const cols = [...(nonObj || !colSet.size ? ['(value)'] : []), ...colSet];
-      header = cols;
-      line = (idx) => compactJson(items[idx]);
-      cells = (idx) => {
-        const v = items[idx];
-        return cols.map((c, k) => {
-          if (c === '(value)' && k === 0 && (nonObj || !colSet.size)) return isObj(v) ? '' : cellString(v);
-          return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? cellString((v as JObj)[c]) : '';
-        });
+      const valAt = (idx: number): JVal => (redact ? redactValue(items[idx]) : items[idx]);
+      return {
+        ids,
+        header: cols,
+        line: (idx) => compactJson(valAt(idx)),
+        cells: (idx) => {
+          const v = valAt(idx);
+          return cols.map((c, k) => {
+            if (c === '(value)' && k === 0 && (nonObj || !colSet.size)) return isObj(v) ? '' : cellString(v);
+            return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? cellString((v as JObj)[c]) : '';
+          });
+        },
+        values: (idx) => {
+          const v = valAt(idx);
+          return cols.map((c, k) => {
+            if (c === '(value)' && k === 0 && (nonObj || !colSet.size)) return isObj(v) ? undefined : v;
+            return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? (v as JObj)[c] : undefined;
+          });
+        },
       };
-    } else {
-      const all =
-        which === 'selected'
-          ? [...this.state.selected].sort((a, b) => a - b)
-          : this.query.text
-            ? this.matches.filter((i) => !this.hasGlobalRowFilter() || this.passesGlobalRowFilter(i))
-            : Array.from({ length: m.count }, (_, i) => i).filter((i) => !this.hasGlobalRowFilter() || this.passesGlobalRowFilter(i));
-      ids = all.filter((i) => i < m.count && !m.isBlank(i));
-      const cols = [...(m.hasNonObject ? ['(value)'] : []), ...m.columns];
-      header = cols;
-      line = (id) => m.line(id);
-      cells = (id) => {
-        const v = m.scanValue(id);
+    }
+    const all =
+      which === 'selected'
+        ? [...this.state.selected].sort((a, b) => a - b)
+        : this.query.text
+          ? this.matches.filter((i) => !this.hasGlobalRowFilter() || this.passesGlobalRowFilter(i))
+          : Array.from({ length: m.count }, (_, i) => i).filter((i) => !this.hasGlobalRowFilter() || this.passesGlobalRowFilter(i));
+    const ids = all.filter((i) => i < m.count && !m.isBlank(i));
+    const cols = [...(m.hasNonObject ? ['(value)'] : []), ...m.columns];
+    return {
+      ids,
+      header: cols,
+      line: (id) => (redact ? redactJsonLine(m.line(id)) : m.line(id)),
+      cells: (id) => {
+        const rawV = m.scanValue(id);
+        const v = rawV !== undefined && redact ? redactValue(rawV) : rawV;
         return cols.map((c, k) => {
-          if (v === undefined) return k === 0 ? m.line(id) : '';
+          if (v === undefined) return k === 0 ? (redact ? redactJsonLine(m.line(id)) : m.line(id)) : '';
           if (c === '(value)' && k === 0 && m.hasNonObject) return isObj(v) ? '' : cellString(v);
           return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? cellString(v[c]) : '';
         });
-      };
-    }
+      },
+      values: (id) => {
+        const rawV = m.scanValue(id);
+        const v = rawV !== undefined && redact ? redactValue(rawV) : rawV;
+        return cols.map((c, k) => {
+          if (v === undefined) return k === 0 ? (redact ? redactJsonLine(m.line(id)) : m.line(id)) : undefined;
+          if (c === '(value)' && k === 0 && m.hasNonObject) return isObj(v) ? undefined : v;
+          return isObj(v) && Object.prototype.hasOwnProperty.call(v, c) ? v[c] : undefined;
+        });
+      },
+    };
+  }
+
+  private copyRowsAsTsv(): void {
+    const { ids, header, cells, line } = this.buildExportData('rows');
     const safeHeader = header.length ? header : ['(value)'];
+    const cap = Math.min(ids.length, 50_000);
+    const out = [tsvRow(safeHeader)];
+    for (let i = 0; i < cap; i++) {
+      const c = cells(ids[i]);
+      out.push(tsvRow(c.length ? c : [line(ids[i])]));
+    }
+    this.post({ type: 'copy', text: out.join('\n') + '\n' });
+    this.showBanner(t('Copied {0} rows as TSV.', cap.toLocaleString()));
+  }
+
+  /** Streams rows to the host as JSON Lines, CSV, TSV, JSON Array, Markdown Table, or SQL. */
+  private exportRows(which: 'rows' | 'selected', format: ExportRowFormat): void {
+    const { ids, header, line, cells, values } = this.buildExportData(which);
+    const safeHeader = header.length ? header : ['(value)'];
+    const base = this.doc.fileName.replace(/\.(gz|br)$/i, '').replace(/\.[^.]+$/, '');
+    const sqlTypes =
+      format === 'sql'
+        ? inferSqlColumnTypes(
+            safeHeader.length,
+            ids.slice(0, 200).map((rid) => {
+              const vs = values(rid);
+              return vs.length ? vs : [line(rid)];
+            }),
+          )
+        : [];
     let i = 0;
     let first = true;
     const id = this.nextExport++;
@@ -1919,34 +2841,68 @@ export class App {
         }
         return chunks.join('');
       }
+      if (format === 'sql') {
+        const chunks: string[] = [];
+        let size = 0;
+        if (first) {
+          first = false;
+          const ddl = sqlCreateTable(base, safeHeader, sqlTypes);
+          chunks.push(ddl);
+          size += ddl.length;
+        }
+        while (i < ids.length && size < EXPORT_PIECE) {
+          const batch: (JVal | undefined)[][] = [];
+          for (let b = 0; b < 200 && i < ids.length; b++, i++) {
+            const vs = values(ids[i]);
+            batch.push(vs.length ? vs : [line(ids[i])]);
+          }
+          const stmt = sqlInsertBatch(base, safeHeader, batch);
+          chunks.push(stmt);
+          size += stmt.length;
+        }
+        return chunks.join('\n');
+      }
       const parts: string[] = [];
       let size = 0;
       if (first) {
         first = false;
         if (format === 'csv') parts.push('\ufeff' + csvRow(safeHeader));
+        else if (format === 'tsv') parts.push(tsvRow(safeHeader));
         else if (format === 'md') parts.push(mdRow(safeHeader), mdDivider(safeHeader.length));
       }
       for (; i < ids.length && size < EXPORT_PIECE; i++) {
-        const rowCells = format === 'csv' || format === 'md' ? cells(ids[i]) : [];
+        const rowCells = format === 'csv' || format === 'tsv' || format === 'md' ? cells(ids[i]) : [];
         const padded = rowCells.length ? rowCells : [line(ids[i])];
-        const row = format === 'csv' ? csvRow(padded) : format === 'md' ? mdRow(padded) : line(ids[i]);
+        const row =
+          format === 'csv'
+            ? csvRow(padded)
+            : format === 'tsv'
+              ? tsvRow(padded)
+              : format === 'md'
+                ? mdRow(padded)
+                : line(ids[i]);
         parts.push(row);
         size += row.length + 1;
       }
       return parts.length ? parts.join('\n') + '\n' : '';
     };
-    this.exporting = { id, next };
-    const base = this.doc.fileName.replace(/\.gz$/i, '').replace(/\.[^.]+$/, '');
+    const tr = startExportStream(this.exportState, id, format, next);
+    if (tr.cancelPreviousId !== undefined) {
+      this.post({ type: 'exportData', id: tr.cancelPreviousId, data: '', done: false, cancel: true });
+    }
+    this.exportState = tr.nextState;
+    this.syncAxDomAttributes();
     this.post({ type: 'exportStart', id, format, name: `${base}-${which === 'selected' ? 'selected' : 'rows'}`, rows: ids.length });
     this.showBanner(t('Exporting {0} rows…', ids.length.toLocaleString()));
   }
 
   /** The host is ready for the next piece of the export (or the user cancelled the save dialog). */
   private onExportReady(id: number, ok: boolean): void {
-    const e = this.exporting;
-    if (!e || e.id !== id) return;
+    const e = this.exportState;
+    if (e.kind !== 'streaming' || e.id !== id) return;
     if (!ok) {
-      this.exporting = undefined;
+      this.exportState = { kind: 'idle' };
+      this.syncAxDomAttributes();
       this.banner.hidden = true;
       return;
     }
@@ -1969,6 +2925,7 @@ export class App {
     const menu = this.root.querySelector('.export-menu') as HTMLElement;
     if (!menu.hidden) {
       menu.hidden = true;
+      this.onPopoverClosed('export-menu');
       return;
     }
     const m = this.model;
@@ -1987,42 +2944,54 @@ export class App {
     const sel = m.isJsonl ? [...this.state.selected].filter((r) => r < m.count && !m.isBlank(r)).length : 0;
     const what = grid || this.query.text || this.hasGlobalRowFilter() ? t('{0} rows on screen', rows.toLocaleString()) : t('All {0} rows', rows.toLocaleString());
     const items: [string, string][] = [
+      ['copy:tsv', t('Copy {0} as TSV (Excel / Sheets)', what)],
       ['rows:jsonl', t('{0} as JSON Lines…', what)],
       ['rows:csv', t('{0} as CSV…', what)],
+      ['rows:tsv', t('{0} as TSV…', what)],
       ['rows:json', t('{0} as JSON array…', what)],
       ['rows:md', t('{0} as Markdown table…', what)],
+      ['rows:sql', t('{0} as SQL…', what)],
     ];
     if (sel > 0) {
       if (sel === 1) {
         items.push(
           ['selected:jsonl', t('1 selected line as JSON Lines…')],
           ['selected:csv', t('1 selected line as CSV…')],
+          ['selected:tsv', t('1 selected line as TSV…')],
           ['selected:json', t('1 selected line as JSON array…')],
           ['selected:md', t('1 selected line as Markdown table…')],
+          ['selected:sql', t('1 selected line as SQL…')],
         );
       } else {
         const sc = sel.toLocaleString();
         items.push(
           ['selected:jsonl', t('{0} selected lines as JSON Lines…', sc)],
           ['selected:csv', t('{0} selected lines as CSV…', sc)],
+          ['selected:tsv', t('{0} selected lines as TSV…', sc)],
           ['selected:json', t('{0} selected lines as JSON array…', sc)],
           ['selected:md', t('{0} selected lines as Markdown table…', sc)],
+          ['selected:sql', t('{0} selected lines as SQL…', sc)],
         );
       }
     }
-    menu.innerHTML = items.map(([k, label]) => `<button class="menu-item" role="menuitem" data-export="${k}">${esc(label)}</button>`).join('');
+    const redactOpt = `<label class="menu-opt"><input type="checkbox" data-export-redact${this.redactExports ? ' checked' : ''}> <span>${esc(t('Redact secrets & PII'))}</span></label><div class="menu-sep" role="separator"></div>`;
+    menu.innerHTML =
+      redactOpt + items.map(([k, label]) => `<button class="menu-item" role="menuitem" data-export="${k}">${esc(label)}</button>`).join('');
+    this.onPopoverOpened('export-menu');
     menu.hidden = false;
     const btn = this.toolbar.querySelector('.export-btn') as HTMLElement | null;
     if (btn) this.placeMenuBelow(btn, menu);
-    (menu.querySelector('button') as HTMLElement).focus();
+    (menu.querySelector('.menu-item') as HTMLElement).focus();
   }
 
   private toggleHistoryMenu(): void {
     const menu = this.root.querySelector('.hist-menu') as HTMLElement;
     if (!menu.hidden) {
       menu.hidden = true;
+      this.onPopoverClosed('hist-menu');
       return;
     }
+    this.onPopoverOpened('hist-menu');
     this.paintHistoryMenu();
     menu.hidden = false;
     const btn = this.toolbar.querySelector('.hist-btn') as HTMLElement | null;
@@ -2085,6 +3054,7 @@ export class App {
       this.showBanner(t('Select two valid lines to compare them.'));
       return;
     }
+    this.activateModal('compare');
     const { rows, more } = diffValues(va, vb);
     const panel = this.root.querySelector('.comparepanel') as HTMLElement;
     const cell = (v: JVal | undefined) => (v === undefined ? `<td class="dim">${t('(missing)')}</td>` : `<td class="mono">${esc(compactJson(v).slice(0, 300))}</td>`);
@@ -2105,11 +3075,11 @@ export class App {
       this.post({ type: 'diff', left: side(a), right: side(b) });
     });
     (panel.querySelector('.cmp-close') as HTMLElement).focus();
+    this.stateChanged();
   }
 
-  private closeCompare(): void {
-    const panel = this.root.querySelector('.comparepanel') as HTMLElement | null;
-    if (panel) panel.hidden = true;
+  private closeCompare(restoreFocus = true): void {
+    this.deactivateModal('compare', restoreFocus);
   }
 
   // ---------- shell ----------
@@ -2118,7 +3088,8 @@ export class App {
     if (this.views) for (const v of Object.values(this.views)) v.dispose();
     this.shellGone.abort();
     this.shellGone = new AbortController();
-    this.editRecord = -1;
+    this.overlays.reset();
+    if (this.mutation.kind === 'record') this.mutation = { kind: 'idle' };
     this.root.innerHTML = `
       <div class="toolbar" role="toolbar" aria-label="${t('Better JSONL toolbar')}"></div>
       <div class="timeline-bar" hidden></div>
@@ -2138,6 +3109,15 @@ export class App {
       <div class="valpanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Value inspector')}"></div>
       <div class="schemapanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Schema & Types')}"></div>
       <div class="batchpanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Batch jq rewrite')}"></div>
+      <div class="pivotpanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Pivot & Group By')}"></div>
+      <div class="qualitypanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Data quality & duplicates')}"></div>
+      <div class="filediffpanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Dataset comparison')}"></div>
+      <div class="tracepanel modal-panel" hidden role="dialog" aria-modal="true" aria-label="${t('Trace waterfall')}"></div>
+      <div class="goto-box" hidden role="dialog" aria-label="${t('Go to line (Ctrl/Cmd+G)')}">
+        <input type="text" class="goto-in mono" placeholder="${esc(t('Go to line, % or time…'))}" title="${esc(t('Line number (42), percentage (50%), or time (09:15:00)'))}" spellcheck="false">
+        <button class="btn primary goto-go">${esc(t('Go'))}</button>
+      </div>
+      <div class="ac-menu menu" hidden role="listbox"></div>
       <div class="export-menu menu" hidden role="menu" aria-label="${t('Export')}"></div>
       <div class="hist-menu menu" hidden role="menu" aria-label="${t('Query history and saved queries')}"></div>
       <div class="ctx-menu menu" hidden role="menu"></div>`;
@@ -2148,7 +3128,36 @@ export class App {
     this.status = this.root.querySelector('.status') as HTMLElement;
 
     this.status.addEventListener('click', (e) => {
-      if ((e.target as HTMLElement).closest('[data-clear-all-filters]')) this.clearAllActiveFilters();
+      const tEl = e.target as HTMLElement;
+      if (tEl.closest('[data-clear-all-filters]')) this.clearAllActiveFilters();
+      else if (tEl.closest('[data-goto-open]')) this.openGotoBox();
+    });
+    this.status.addEventListener('keydown', (e) => {
+      if ((e.key === 'Enter' || e.key === ' ') && (e.target as HTMLElement).closest('[data-goto-open]')) {
+        e.preventDefault();
+        this.openGotoBox();
+      }
+    });
+
+    const gotoBox = this.root.querySelector('.goto-box') as HTMLElement;
+    const gotoIn = gotoBox.querySelector('.goto-in') as HTMLInputElement;
+    gotoBox.querySelector('.goto-go')!.addEventListener('click', () => {
+      this.applyGoto(gotoIn.value);
+      gotoBox.hidden = true;
+      this.onPopoverClosed('goto-box');
+    });
+    gotoIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        this.applyGoto(gotoIn.value);
+        gotoBox.hidden = true;
+        this.onPopoverClosed('goto-box');
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        gotoBox.hidden = true;
+        this.onPopoverClosed('goto-box');
+      }
+      e.stopPropagation();
     });
 
     this.setupTimelineEvents();
@@ -2172,12 +3181,34 @@ export class App {
     const exportMenu = this.root.querySelector('.export-menu') as HTMLElement;
     const histMenu = this.root.querySelector('.hist-menu') as HTMLElement;
     const ctxMenu = this.root.querySelector('.ctx-menu') as HTMLElement;
+    const acMenu = this.root.querySelector('.ac-menu') as HTMLElement;
 
+    acMenu.addEventListener('mousedown', (e) => {
+      // Keep focus on the search input when clicking a completion item.
+      e.preventDefault();
+    });
+    acMenu.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest('[data-acidx]') as HTMLElement | null;
+      if (!b) return;
+      const searchIn = this.toolbar.querySelector('.search input') as HTMLInputElement | null;
+      if (searchIn) this.acceptAutocomplete(searchIn, Number(b.dataset.acidx));
+    });
+
+    exportMenu.addEventListener('change', (e) => {
+      const cb = e.target as HTMLInputElement;
+      if (cb.hasAttribute('data-export-redact')) this.redactExports = cb.checked;
+    });
     exportMenu.addEventListener('click', (e) => {
       const b = (e.target as HTMLElement).closest('[data-export]') as HTMLElement | null;
       if (!b) return;
       exportMenu.hidden = true;
-      const [which, format] = (b.dataset.export as string).split(':') as ['rows' | 'selected', ExportRowFormat];
+      this.onPopoverClosed('export-menu');
+      const spec = b.dataset.export as string;
+      if (spec === 'copy:tsv') {
+        this.copyRowsAsTsv();
+        return;
+      }
+      const [which, format] = spec.split(':') as ['rows' | 'selected', ExportRowFormat];
       this.exportRows(which, format);
     });
 
@@ -2195,16 +3226,18 @@ export class App {
       const pick = (e.target as HTMLElement).closest('[data-hq]') as HTMLElement | null;
       if (pick) {
         histMenu.hidden = true;
+        this.onPopoverClosed('hist-menu');
         this.applyQueryFromUI(pick.dataset.hq as string, false);
       }
     });
 
-    const wireMenuKeys = (menu: HTMLElement, openerSel?: string) => {
+    const wireMenuKeys = (menu: HTMLElement, popId: PopoverId, openerSel?: string) => {
       menu.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           e.preventDefault();
           e.stopPropagation();
           menu.hidden = true;
+          this.onPopoverClosed(popId);
           if (openerSel) (this.toolbar.querySelector(openerSel) as HTMLElement | null)?.focus();
           return;
         }
@@ -2219,17 +3252,35 @@ export class App {
         }
       });
     };
-    wireMenuKeys(exportMenu, '.export-btn');
-    wireMenuKeys(histMenu, '.hist-btn');
-    wireMenuKeys(ctxMenu);
+    wireMenuKeys(exportMenu, 'export-menu', '.export-btn');
+    wireMenuKeys(histMenu, 'hist-menu', '.hist-btn');
+    wireMenuKeys(ctxMenu, 'ctx-menu');
 
     document.addEventListener(
       'pointerdown',
       (e) => {
         const target = e.target as HTMLElement;
-        if (!exportMenu.hidden && !exportMenu.contains(target) && !target.closest('.export-btn')) exportMenu.hidden = true;
-        if (!histMenu.hidden && !histMenu.contains(target) && !target.closest('.hist-btn')) histMenu.hidden = true;
-        if (!ctxMenu.hidden && !ctxMenu.contains(target)) ctxMenu.hidden = true;
+        if (!exportMenu.hidden && !exportMenu.contains(target) && !target.closest('.export-btn')) {
+          exportMenu.hidden = true;
+          this.onPopoverClosed('export-menu');
+        }
+        if (!histMenu.hidden && !histMenu.contains(target) && !target.closest('.hist-btn')) {
+          histMenu.hidden = true;
+          this.onPopoverClosed('hist-menu');
+        }
+        if (!ctxMenu.hidden && !ctxMenu.contains(target)) {
+          ctxMenu.hidden = true;
+          this.onPopoverClosed('ctx-menu');
+        }
+        if (!acMenu.hidden && !acMenu.contains(target) && !target.closest('.search')) {
+          acMenu.hidden = true;
+          this.acIndex = -1;
+          this.onPopoverClosed('ac-menu');
+        }
+        if (!gotoBox.hidden && !gotoBox.contains(target) && !target.closest('[data-goto-open]')) {
+          gotoBox.hidden = true;
+          this.onPopoverClosed('goto-box');
+        }
       },
       { signal: this.shellGone.signal },
     );
@@ -2255,6 +3306,7 @@ export class App {
           pathToString(items.path),
         ),
       );
+    else if (this.model.concatenated) this.showBanner(t('Concatenated JSON stream ({0} records)', this.model.count.toLocaleString()));
     else if (this.model.detectedJsonl) this.showBanner(t('This .json file holds one JSON value per line. It is shown as JSON Lines.'));
     else if (this.model.jsonc) this.showBanner(t('Parsed as JSON with Comments (comments or trailing commas found).'));
   }
@@ -2304,6 +3356,12 @@ export class App {
     el.addEventListener('pointerup', () => {
       this.timelineBrushStart = -1;
     });
+    el.addEventListener('pointercancel', () => {
+      this.timelineBrushStart = -1;
+    });
+    el.addEventListener('lostpointercapture', () => {
+      this.timelineBrushStart = -1;
+    });
   }
 
   private clearAllActiveFilters(): void {
@@ -2311,6 +3369,8 @@ export class App {
     s.filterOnly = false;
     s.bookmarkedOnly = false;
     s.timelineRange = null;
+    s.subsetFilter = null;
+    this.subsetRev++;
     s.grid.filters.clear();
     if (s.query) {
       const input = this.toolbar.querySelector('.search input') as HTMLInputElement | null;
@@ -2362,13 +3422,18 @@ export class App {
       <div class="tb-right">
         <div class="stats"></div>
         <button class="icon-btn timeline-btn" hidden aria-pressed="false" aria-label="${t('Timeline')}" title="${t('Toggle timeline distribution bar')}">${icon('timeline')}</button>
+        <button class="icon-btn pivot-btn" hidden aria-label="${t('Pivot & Group By')}" title="${t('Group by field and aggregate metrics')}">${icon('pivot')}</button>
+        <button class="icon-btn quality-btn" hidden aria-label="${t('Data quality & duplicates')}" title="${t('Check duplicates, type drift and missing fields')}">${icon('shield')}</button>
         <button class="icon-btn bm-btn" hidden aria-pressed="false" aria-label="${t('Bookmark')}" title="${t('Show only bookmarked lines')}">${icon('bookmark')}</button>
         <button class="icon-btn cols-btn" hidden aria-pressed="false" aria-label="${t('Columns')}" title="${t('Show, hide, pin or reorder columns')}">${icon('columns')}</button>
+        <span class="tb-sep" role="separator" aria-orientation="vertical"></span>
         <button class="icon-btn schema-btn" aria-label="${t('Generate types / schema')}" title="${t('Infer TypeScript, JSON Schema, Pydantic or Zod from records')}">${icon('schema')}</button>
         <button class="icon-btn wand-btn" hidden aria-label="${t('Batch rewrite with jq…')}" title="${t('Batch rewrite with jq…')}">${icon('wand')}</button>
-        <button class="icon-btn follow-btn" aria-pressed="false" aria-label="${t('Follow the end of the file')}" title="${t('Follow the end of the file: new lines show at once')}">${icon('follow')}</button>
+        <button class="icon-btn filediff-btn" aria-label="${t('Compare with file…')}" title="${t('Compare current dataset with another JSON/JSONL file')}">${icon('diff-files')}</button>
         <button class="icon-btn compare-btn" aria-label="${t('Compare the two selected lines')}" title="${t('Compare the two selected lines')}">${icon('compare')}</button>
-        <button class="icon-btn export-btn" aria-haspopup="menu" aria-label="${t('Export rows')}" title="${t('Export rows as JSON Lines, CSV, JSON or Markdown')}">${icon('download')}</button>
+        <span class="tb-sep" role="separator" aria-orientation="vertical"></span>
+        <button class="icon-btn follow-btn" aria-pressed="false" aria-label="${t('Follow the end of the file')}" title="${t('Follow the end of the file: new lines show at once')}">${icon('follow')}</button>
+        <button class="icon-btn export-btn" aria-haspopup="menu" aria-label="${t('Export rows')}" title="${t('Export rows as JSON Lines, CSV, TSV, JSON, Markdown or SQL')}">${icon('download')}</button>
         <button class="icon-btn wrap-btn" aria-label="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" title="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" aria-pressed="false">${icon('wrap')}</button>
         <button class="icon-btn open-text" aria-label="${t('Open as text')}" title="${t('Open as text')}">${icon('file-code')}</button>
         <button class="icon-btn gear-btn" aria-label="${t('Settings')}" title="${t('Settings')}">${icon('gear')}</button>
@@ -2385,19 +3450,12 @@ export class App {
       else if (btn.classList.contains('case-btn')) {
         this.state.caseSensitive = !this.state.caseSensitive;
         this.rerunSearch();
-      } else if (btn.classList.contains('regex-btn')) {
-        this.state.regex = !this.state.regex;
-        if (this.state.regex) {
-          this.state.literal = false;
-          this.transformMode = false;
-        }
-        this.rerunSearch();
-      } else if (btn.classList.contains('lit-btn')) {
-        this.state.literal = !this.state.literal;
-        if (this.state.literal) {
-          this.state.regex = false;
-          this.transformMode = false;
-        }
+      } else if (btn.classList.contains('regex-btn') || btn.classList.contains('lit-btn')) {
+        const nextMode = toggleQuerySyntax(this.querySyntax, btn.classList.contains('regex-btn') ? 'regex' : 'literal');
+        const flags = syntaxToFlags(nextMode);
+        this.state.regex = flags.regex;
+        this.state.literal = flags.literal;
+        if (nextMode !== 'auto') this.transformMode = false;
         this.rerunSearch();
       } else if (btn.classList.contains('star-btn')) this.toggleSaveQuery();
       else if (btn.classList.contains('hist-btn')) this.toggleHistoryMenu();
@@ -2429,7 +3487,10 @@ export class App {
       } else if (btn.classList.contains('cols-btn')) {
         (this.views.grid as GridView).toggleColPicker();
         this.paintChrome();
-      } else if (btn.classList.contains('schema-btn')) this.openSchemaGenerator();
+      } else if (btn.classList.contains('pivot-btn')) this.openPivotPanel();
+      else if (btn.classList.contains('quality-btn')) this.openQualityPanel();
+      else if (btn.classList.contains('filediff-btn')) this.post({ type: 'compareWithFile' });
+      else if (btn.classList.contains('schema-btn')) this.openSchemaGenerator();
       else if (btn.classList.contains('wand-btn')) this.openBatchRewrite();
       else if (btn.classList.contains('open-text')) this.post({ type: 'openAsText' });
       else if (btn.classList.contains('wrap-btn')) this.setWrap(!this.state.wrap);
@@ -2440,20 +3501,75 @@ export class App {
       else if (btn.classList.contains('err-chip')) this.nextError();
     });
     const input = tb.querySelector('.search input') as HTMLInputElement;
+    const acMenuEl = this.root.querySelector('.ac-menu') as HTMLElement;
     input.value = this.state.query;
     input.addEventListener('input', () => {
+      this.histCursor = -1;
       clearTimeout(this.searchTimer);
       this.searchTimer = setTimeout(() => this.setQuery(input.value), 160);
+      this.updateAutocomplete(input);
+    });
+    input.addEventListener('blur', () => {
+      acMenuEl.hidden = true;
+      this.acIndex = -1;
+      this.onPopoverClosed('ac-menu');
     });
     input.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'g') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.openGotoBox();
+        return;
+      }
+      if (!acMenuEl.hidden && this.acItems.length > 0) {
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          e.stopPropagation();
+          this.acceptAutocomplete(input, this.acIndex >= 0 ? this.acIndex : 0);
+          return;
+        }
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          e.stopPropagation();
+          const d = e.key === 'ArrowDown' ? 1 : -1;
+          this.acIndex =
+            this.acIndex < 0
+              ? d > 0
+                ? 0
+                : this.acItems.length - 1
+              : (this.acIndex + d + this.acItems.length) % this.acItems.length;
+          this.paintAutocomplete(acMenuEl, input);
+          return;
+        }
+        if (e.key === 'Enter' && this.acIndex >= 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          this.acceptAutocomplete(input, this.acIndex);
+          return;
+        }
+        if (e.key === 'Escape' && this.acIndex >= 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          acMenuEl.hidden = true;
+          this.acIndex = -1;
+          this.onPopoverClosed('ac-menu');
+          return;
+        }
+      }
       if (e.key === 'Enter') {
         e.preventDefault();
+        acMenuEl.hidden = true;
+        this.acIndex = -1;
+        this.onPopoverClosed('ac-menu');
         clearTimeout(this.searchTimer);
         if (input.value !== this.state.query) this.setQuery(input.value);
         else this.activeView.stepMatch(e.shiftKey ? -1 : 1);
         this.recordQueryHistory(input.value);
         this.stateChanged();
       } else if (e.key === 'Escape') {
+        acMenuEl.hidden = true;
+        this.acIndex = -1;
+        this.onPopoverClosed('ac-menu');
         input.value = '';
         if (this.transformMode) this.transformMode = false;
         this.setQuery('');
@@ -2863,6 +3979,13 @@ export class App {
     tlBtn.classList.toggle('on', s.timelineOpen || s.timelineRange !== null);
     tlBtn.setAttribute('aria-pressed', String(s.timelineOpen));
 
+    const pivBtn = tb.querySelector('.pivot-btn') as HTMLButtonElement;
+    pivBtn.hidden = !(m.isJsonl ? m.valid > 0 : m.value(0) !== undefined && isArr(m.value(0) as JVal));
+
+    const qualBtn = tb.querySelector('.quality-btn') as HTMLButtonElement;
+    qualBtn.hidden = !m.isJsonl || m.count === 0;
+    qualBtn.classList.toggle('on', s.subsetFilter !== null);
+
     const bmBtn = tb.querySelector('.bm-btn') as HTMLButtonElement;
     bmBtn.hidden = !m.isJsonl || this.isProjected;
     bmBtn.classList.toggle('on', s.bookmarkedOnly);
@@ -2872,7 +3995,7 @@ export class App {
     const gridView = this.views.grid as GridView;
     const colsBtn = tb.querySelector('.cols-btn') as HTMLButtonElement;
     colsBtn.hidden = !(s.view === 'grid' && gridView.canManageCols);
-    colsBtn.classList.toggle('on', gridView.colPickerOpen || s.grid.hiddenCols.size > 0 || s.grid.pinnedCols.size > 0);
+    colsBtn.classList.toggle('on', gridView.colPickerOpen || s.grid.hiddenCols.size > 0 || s.grid.pinnedCols.size > 0 || s.grid.promotedCols.length > 0);
     colsBtn.setAttribute('aria-pressed', String(gridView.colPickerOpen));
 
     const schemaBtn = tb.querySelector('.schema-btn') as HTMLButtonElement;
@@ -2910,6 +4033,7 @@ export class App {
       parts.push(t('Line {0}', s.active + 1));
       if (s.selected.size > 1) parts.push(t('{0} selected', s.selected.size));
       if (s.bookmarks.size > 0) parts.push(s.bookmarkedOnly ? t('Bookmarked ({0})', s.bookmarks.size) : `★ ${s.bookmarks.size}`);
+      if (s.subsetFilter) parts.push(t('Quality filter ({0})', s.subsetFilter.ids.size));
     } else parts.push(m.jsonc ? t('JSON with Comments') : 'JSON');
     if (s.view === 'formatted' && m.isJsonl) parts.push(s.expandMode === 'focus' ? t('Focus: selected lines are expanded') : t('All lines expanded'));
     if (s.view === 'grid') {
@@ -2925,10 +4049,12 @@ export class App {
       (s.filterOnly && !!this.query.text) ||
       s.bookmarkedOnly ||
       s.timelineRange !== null ||
+      s.subsetFilter !== null ||
       (s.view === 'grid' && gridView.hasActiveColumnFilters());
     const clearBtn = anyFilterActive
       ? `<button class="status-act" data-clear-all-filters>${esc(t('Clear all filters'))}</button>`
       : '';
+    const gotoJumpAttr = m.isJsonl ? ` role="button" tabindex="0" data-goto-open title="${esc(t('Go to line (Ctrl/Cmd+G)'))}"` : '';
 
     const canJump = this.canRevealSource;
     const hint =
@@ -2947,7 +4073,7 @@ export class App {
             : canJump
               ? t('Click ▸ to fold · double-click jumps to source')
               : t('Click ▸ to fold');
-    this.status.innerHTML = `<span class="status-main" title="${esc(parts.join(' · '))}">${esc(parts.join(' · '))}</span>${clearBtn}<span class="spring"></span><span class="dim status-hint">${esc(hint)}</span>`;
+    this.status.innerHTML = `<span class="status-main"${gotoJumpAttr}>${esc(parts.join(' · '))}</span>${clearBtn}<span class="spring"></span><span class="dim status-hint">${esc(hint)}</span>`;
   }
 
   /** Limits that hide data right now. */
@@ -3032,7 +4158,7 @@ export class App {
       }
       if (done) {
         this.paintChrome();
-        const opts = { caseSensitive: this.state.caseSensitive, regex: this.state.regex, literal: this.state.literal };
+        const opts = { caseSensitive: this.state.caseSensitive, regex: this.state.regex, literal: this.state.literal, forceJq: this.transformMode };
         const again = parseQuery(this.state.query, model, this.jqModules, opts);
         if (!!again.path !== !!this.query.path || !!again.program !== !!this.query.program) this.startSearch(() => this.repaint());
         this.stateChanged();
@@ -3046,57 +4172,56 @@ export class App {
   // ---------- keyboard ----------
 
   private hasOpenModal(): boolean {
-    if (this.settings?.open) return true;
-    for (const sel of ['.editpanel', '.comparepanel', '.valpanel', '.schemapanel', '.batchpanel']) {
-      const el = this.root.querySelector(sel) as HTMLElement | null;
-      if (el && !el.hidden) return true;
+    return this.overlays.hasModal;
+  }
+
+  private closeActiveModalFromEscape(): void {
+    switch (this.overlays.modal) {
+      case 'pivot':
+        this.closePivotPanel();
+        break;
+      case 'quality':
+        this.closeQualityPanel();
+        break;
+      case 'filediff':
+        this.closeFileDiffPanel();
+        break;
+      case 'trace':
+        this.closeTracePanel();
+        break;
+      case 'inspector':
+        this.closeValueInspector();
+        break;
+      case 'schema':
+        this.closeSchemaPanel();
+        break;
+      case 'batch':
+        this.closeBatchPanel();
+        break;
+      case 'edit':
+        this.closeEditor();
+        break;
+      case 'compare':
+        this.closeCompare();
+        break;
+      case 'settings':
+        this.settings?.close();
+        break;
     }
-    return false;
   }
 
   private onKey(e: KeyboardEvent): void {
     if (e.key === 'Escape') {
-      for (const sel of ['.ctx-menu', '.export-menu', '.hist-menu']) {
-        const m = this.root.querySelector(sel) as HTMLElement | null;
-        if (m && !m.hidden) {
-          e.preventDefault();
-          m.hidden = true;
-          return;
-        }
-      }
-      const valP = this.root.querySelector('.valpanel') as HTMLElement | null;
-      if (valP && !valP.hidden) {
+      if (this.overlays.popover !== null) {
         e.preventDefault();
-        this.closeValueInspector();
+        const pop = this.overlays.popover;
+        this.hidePopoverDom(pop, true);
+        this.onPopoverClosed(pop);
         return;
       }
-      const schP = this.root.querySelector('.schemapanel') as HTMLElement | null;
-      if (schP && !schP.hidden) {
+      if (this.overlays.modal !== null) {
         e.preventDefault();
-        this.closeSchemaPanel();
-        return;
-      }
-      const batP = this.root.querySelector('.batchpanel') as HTMLElement | null;
-      if (batP && !batP.hidden) {
-        e.preventDefault();
-        this.closeBatchPanel();
-        return;
-      }
-      const editP = this.root.querySelector('.editpanel') as HTMLElement | null;
-      if (editP && !editP.hidden) {
-        e.preventDefault();
-        this.closeEditor();
-        return;
-      }
-      const compare = this.root.querySelector('.comparepanel') as HTMLElement | null;
-      if (compare && !compare.hidden) {
-        e.preventDefault();
-        this.closeCompare();
-        return;
-      }
-      if (this.settings?.open) {
-        e.preventDefault();
-        this.settings.close();
+        this.closeActiveModalFromEscape();
         return;
       }
     }
@@ -3108,9 +4233,14 @@ export class App {
       input?.select();
       return;
     }
+    if (mod && e.key.toLowerCase() === 'g' && this.model?.isJsonl && !this.hasOpenModal()) {
+      e.preventDefault();
+      this.openGotoBox();
+      return;
+    }
     const target = e.target as HTMLElement;
     const tag = target.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || !this.model || !this.views || this.hasOpenModal()) return;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !this.model || !this.views || this.hasOpenModal()) return;
     if (target.closest('.toolbar, .menu, .gfilter, .col-picker')) return;
     // Enter and Space on a button press that button; they are not "edit the record".
     if ((e.key === 'Enter' || e.key === ' ') && target.closest('button, [role="button"], [role="columnheader"]')) return;
@@ -3130,26 +4260,50 @@ export class App {
     }
 
     if (this.state.view === 'graph') return;
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (
+      e.key === 'ArrowDown' ||
+      e.key === 'ArrowUp' ||
+      e.key === 'PageDown' ||
+      e.key === 'PageUp' ||
+      e.key === 'Home' ||
+      e.key === 'End'
+    ) {
       e.preventDefault();
-      const d = e.key === 'ArrowDown' ? 1 : -1;
+      const pageStep = Math.max(1, Math.floor((this.body.clientHeight || 480) / this.rh) - 2);
       let r: number | undefined;
       if (this.state.view === 'grid') {
         const order = (this.views.grid as GridView).visibleRecordIds();
         if (!order.length) return;
-        const cur = order.indexOf(this.state.active);
-        r = cur >= 0 ? order[Math.min(order.length - 1, Math.max(0, cur + d))] : order[d > 0 ? 0 : order.length - 1];
+        if (e.key === 'Home') r = order[0];
+        else if (e.key === 'End') r = order[order.length - 1];
+        else {
+          const d = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : e.key === 'PageDown' ? pageStep : -pageStep;
+          const cur = order.indexOf(this.state.active);
+          r = cur >= 0 ? order[Math.min(order.length - 1, Math.max(0, cur + d))] : order[d > 0 ? 0 : order.length - 1];
+        }
       } else {
         const recs = this.formattedRecords();
         if (recs) {
           if (!recs.length) return;
-          const lb = lowerBound(recs, this.state.active);
-          if (lb < recs.length && recs[lb] === this.state.active) {
-            r = recs[Math.min(recs.length - 1, Math.max(0, lb + d))];
-          } else {
-            r = recs[d > 0 ? Math.min(recs.length - 1, lb) : Math.max(0, lb - 1)];
+          if (e.key === 'Home') r = recs[0];
+          else if (e.key === 'End') r = recs[recs.length - 1];
+          else {
+            const d = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : e.key === 'PageDown' ? pageStep : -pageStep;
+            const lb = lowerBound(recs, this.state.active);
+            if (lb < recs.length && recs[lb] === this.state.active) {
+              r = recs[Math.min(recs.length - 1, Math.max(0, lb + d))];
+            } else {
+              r = recs[d > 0 ? Math.min(recs.length - 1, lb) : Math.max(0, lb - 1)];
+            }
           }
-        } else r = Math.min(this.model.count - 1, Math.max(0, this.state.active + d));
+        } else {
+          if (e.key === 'Home') r = 0;
+          else if (e.key === 'End') r = this.model.count - 1;
+          else {
+            const d = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : e.key === 'PageDown' ? pageStep : -pageStep;
+            r = Math.min(this.model.count - 1, Math.max(0, this.state.active + d));
+          }
+        }
       }
       if (r === undefined) return;
       this.selectRecord(r, e.shiftKey ? 'range' : 'set');
@@ -3205,6 +4359,7 @@ export class App {
         filters: head(s.grid.filters, 50).map(([c, f]) => [c, { text: f.text, exclude: head(f.exclude, 500), min: f.min, max: f.max }]),
         hiddenCols: head(s.grid.hiddenCols, 500),
         pinnedCols: head(s.grid.pinnedCols, 50),
+        promotedCols: s.grid.promotedCols.slice(0, 200),
         colOrder: s.grid.colOrder.slice(0, 500),
       },
       graph: { collapsed: head(s.graph.collapsed, 500) },
@@ -3256,6 +4411,7 @@ export class App {
       settingsOpen: !!this.settings?.open,
       lang: this.config.lang,
       version: this.version,
+      machines: this.machineSnapshot(),
     };
     this.activeView.fillReport(r);
     this.post({ type: 'report', report: r });

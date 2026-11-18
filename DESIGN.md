@@ -78,18 +78,27 @@
 ┌───────────────────────▼──── Webview (浏览器, 原生 TS) ───────┐
 │ main.ts        入口（只创建 App）                             │
 │ app.ts         状态、顶栏、视图切换、搜索、后台扫描、状态保存   │
-│ model.ts       行存储（文本 / 字节）、惰性解析、缓存、列集合    │
+│ stateMachines.ts 显式有限状态机（浮层互斥与焦点恢复、语法模式、 │
+│                  生命周期、行/格编辑事务、流式导出握手与 AX 快照）│
+│ model.ts       行存储（文本 / 字节）、惰性解析、拼接 JSON 流    │
 │ query.ts       jq 子集与 JSONPath（RFC 9535）                  │
+│ autocomplete.ts 基于数据结构与枚举值的搜索 / jq 实时自动补全    │
+│ pivot.ts       嵌套字段自动发现与分组聚合透视表（P50/P95/Sum） │
+│ quality.ts     单趟 O(N) 数据体检、双哈希无串驻留查重与类型漂移 │
+│ datasetDiff.ts 跨文件 JSON/JSONL 主键对齐与行号对齐差异对比     │
+│ waterfall.ts   基于 trace_id 的调用链时间轴甘特瀑布图           │
+│ chatReader.ts  OpenAI / Anthropic / Gemini / SFT 对话轨迹阅读器 │
+│ redact.ts      PII 与密钥（Bearer/JWT/API Key/邮箱）自动脱敏    │
 │ byteJson.ts    从字节解析超过一个字符串上限的 JSON 值           │
-│ diff.ts        两条记录的字段级差异；exporter.ts：CSV / MD 表格  │
-│ inspect.ts     嵌套 JSON 字符串解包、安全 Markdown 与语义解码     │
+│ diff.ts        两条记录的字段级差异；exporter.ts：CSV/TSV/MD/SQL│
+│ inspect.ts     嵌套 JSON 解包（带缓存）、安全 Markdown 与解码   │
 │ schema.ts      TypeScript / JSON Schema / Pydantic / Zod 推断   │
 │ timeline.ts    时间戳列自动检测与 48 桶时间分布图                │
 │ json.ts        大整数与高精度小数、路径键、语法高亮              │
 │ settings.ts    设置面板                                       │
 │ views/formatted.ts  虚拟列表（卡片 + 折叠 + 自动换行）          │
 │ views/lines.ts      值 → 显示行（迭代实现，支持默认折叠深度）    │
-│ views/grid.ts       记录表格 + 行内子表格 + 列过滤              │
+│ views/grid.ts       记录表格 + 提升嵌套列 + 行内子表格 + 列过滤  │
 │ views/graph.ts      树布局 + SVG + 平移缩放 + 检查器            │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -129,6 +138,15 @@
 - 文档关闭：会话重新打开一次，使视图与磁盘内容一致。
 - 文档已关闭时磁盘文件变化：文件监视器触发重新打开和更新。
 - 回写（单条编辑）和定位：先取"现在"的文档，再比对原行文本（F13）。
+
+### 5.5 显式状态机与 UX / DX / AX 三位一体契约
+
+为消除布尔标志散落带来的非法组合状态，核心交互和异步协议统一收敛为显式判别联合状态机（`src/webview/stateMachines.ts` 与 `ViewerSession.snapshot()`）：
+
+1. **浮层互斥与焦点闭环机（`OverlayController`）**：统一管理 10 个模态层（`edit`、`compare`、`inspector`、`schema`、`batch`、`pivot`、`quality`、`filediff`、`trace`、`settings`）与 7 个瞬态浮层（`ctx-menu`、`export-menu`、`hist-menu`、`ac-menu`、`goto-box`、`grid-filter`、`col-picker`）。打开任意模态层自动关闭旧模态层与瞬态浮层，启用 `Tab` 焦点环捕获，并在 `Escape` 或关闭时把焦点归还给触发控件（**UX**）。
+2. **查询语法与投影机（`QuerySyntaxMode` + `ProjectionState`）**：将互斥的正则 / 字面量开关收敛为 `'auto' | 'regex' | 'literal'`，根除 `{ regex: true, literal: true }` 非法状态；将 `transformMode` 与底层源模型 `baseModel` 绑定，后台扫描与文件追加时保持一致（**DX**）。
+3. **文档生命周期、编辑事务与流式导出机（`DocLifecyclePhase` / `MutationState` / `ExportStreamState`）**：明确区分 `'booting' | 'streaming' | 'parsing-json' | 'scanning' | 'ready' | 'error'`，按事务种类路由 `editResult`，并在新导出启动时自动发 `cancel: true` 终止未完成的旧导出，防止句柄泄漏。
+4. **自描述可观测契约（AX）**：根节点 `#app` 实时同步 `data-lifecycle`、`data-active-view`、`data-modal`、`data-popover`、`data-query-mode`、`data-projection` 与 `aria-busy`；`RenderReport.machines` 与宿主扩展 API `api.inspect()` 直接导出结构化状态机快照，使测试与智能体无需轮询内部计时器即可精确感知状态。
 
 ## 6. 三种视图
 

@@ -5,20 +5,28 @@ import { Readable } from 'stream';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
 import { t } from './shared/i18n';
+import type { Compression } from './fileEdit';
 
 /** A large file goes to the webview in pieces of about this size. */
 export const CHUNK = 4 * 1024 * 1024;
 
-/** Compressed files Better JSONL opens: the name without ".gz" says JSON or JSON Lines. */
+/** Compressed files Better JSONL opens (.gz or .br): the inner name says JSON or JSON Lines. */
 const GZIP = /\.(jsonl|ndjson|jsonlines|json)\.gz$/i;
+const BROTLI = /\.(jsonl|ndjson|jsonlines|json)\.br$/i;
 
-export function isGzipPath(p: string): boolean {
-  return GZIP.test(p);
+export function compressionOfPath(p: string): Compression {
+  if (GZIP.test(p)) return 'gzip';
+  if (BROTLI.test(p)) return 'brotli';
+  return null;
 }
 
-/** The name without ".gz". */
+export function isGzipPath(p: string): boolean {
+  return compressionOfPath(p) !== null;
+}
+
+/** The name without ".gz" or ".br". */
 export function innerName(p: string): string {
-  return p.replace(/\.gz$/i, '');
+  return p.replace(/\.(gz|br)$/i, '');
 }
 
 /**
@@ -55,6 +63,7 @@ const LABELS: Record<string, string> = {
 
 export interface SourceOptions {
   gzip: boolean;
+  compression?: Compression;
   /** WHATWG label; UTF-8 is passed through as it is. */
   encoding: string;
   /** Start here (a byte offset in the file). Not for compressed files. */
@@ -96,8 +105,14 @@ export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncG
   const raw = await rawStream(uri, from, options.to);
   let read = 0;
   raw.on('data', (b: Buffer) => (read += b.length));
+  const comp: Compression = options.compression !== undefined ? options.compression : options.gzip ? 'gzip' : null;
   // A file that is still being written (a compressed log) ends in the middle: the output so far is used.
-  const source: Readable = options.gzip ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH })) : raw;
+  const source: Readable =
+    comp === 'brotli'
+      ? raw.pipe(zlib.createBrotliDecompress({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH }))
+      : comp === 'gzip'
+        ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH }))
+        : raw;
   raw.on('error', (e) => source.destroy(e));
   let decoder: TextDecoder | null | undefined;
   let resolved = options.encoding;
@@ -167,4 +182,17 @@ function concat(parts: Buffer[], size: number): Uint8Array {
   return out;
 }
 
-export { compare, fileState, LineConflict, mutateFileLines, replaceLine, TAIL, type FileState } from './fileEdit';
+/** Reads a plain or compressed (.gz / .br) file into a UTF-8 string up to `maxDecodedBytes`. */
+export async function readAllUtf8(uri: vscode.Uri, maxDecodedBytes = 50 * 1024 * 1024): Promise<string> {
+  const comp = compressionOfPath(uri.path);
+  const parts: Buffer[] = [];
+  let total = 0;
+  for await (const piece of readUtf8(uri, { gzip: comp !== null, compression: comp, encoding: encodingFor(uri) })) {
+    total += piece.data.byteLength;
+    if (total > maxDecodedBytes) throw new Error(t('File exceeds 50 MB comparison limit.'));
+    parts.push(Buffer.from(piece.data.buffer, piece.data.byteOffset, piece.data.byteLength));
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
+export { compare, fileState, LineConflict, mutateFileLines, replaceLine, TAIL, type Compression, type FileState } from './fileEdit';

@@ -1113,14 +1113,19 @@ await scenario('W43', 'Export: rows as CSV or JSON Lines, sent in pieces when th
   await page.click('.export-btn');
   const items = await page.$$eval('.export-menu .menu-item', (els) => els.map((e) => e.dataset.export));
   check.eq('menu: all rows, and the selected line', items, [
+    'copy:tsv',
     'rows:jsonl',
     'rows:csv',
+    'rows:tsv',
     'rows:json',
     'rows:md',
+    'rows:sql',
     'selected:jsonl',
     'selected:csv',
+    'selected:tsv',
     'selected:json',
     'selected:md',
+    'selected:sql',
   ]);
   await shot('Export menu');
   await page.click('[data-export="rows:csv"]');
@@ -1561,6 +1566,178 @@ await scenario('W52', 'v0.8 features: JSON unpack, multiline & Markdown inspecto
   await page.waitForFunction((id) => window.harness.posted('exportData').some((m) => m.id === id), expStart.id);
   const mdOut = (await posted(page, 'exportData')).find((m) => m.id === expStart.id).data;
   check.ok('Markdown pipe table header emitted', mdOut.startsWith('| id | ts | ms |'), mdOut.slice(0, 80));
+});
+
+await scenario('W53', 'v0.9 features: promoted nested Grid columns, Pivot summary, autocomplete, LLM Chat reader, Data Quality, Dataset Diff, Trace Waterfall, Cmd+G Go-To, Redaction, TSV/SQL export & Concatenated JSON stream', [], async ({ page, check, shot }) => {
+  const v09Sample = [
+    JSON.stringify({
+      id: 'r1',
+      ts: '2026-10-27T09:00:00.000Z',
+      trace_id: 'tr-100',
+      service: 'gateway',
+      ms: 40,
+      api_key: 'sk-1234567890abcdefghijklmnop',
+      user: { name: 'Ada', tier: 'pro' },
+      messages: [
+        { role: 'user', content: 'Check Tokyo weather' },
+        {
+          role: 'assistant',
+          thinking: 'Calling weather tool',
+          content: '',
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'weather', arguments: '{"city":"Tokyo"}' } }],
+        },
+        { role: 'tool', tool_call_id: 'c1', name: 'weather', content: '{"temp":22}' },
+      ],
+      usage: { total_tokens: 96 },
+    }),
+    JSON.stringify({
+      id: 'r2',
+      ts: '2026-10-27T09:00:00.015Z',
+      trace_id: 'tr-100',
+      service: 'worker',
+      ms: 120,
+      level: 'error',
+      api_key: 'sk-9999999999abcdefghijklmnop',
+      user: { name: 'Grace', tier: 'pro' },
+    }),
+    JSON.stringify({
+      id: 'r2',
+      ts: '2026-10-27T09:05:00.000Z',
+      trace_id: 'tr-200',
+      service: 'worker',
+      ms: 80,
+      api_key: 'sk-8888888888abcdefghijklmnop',
+      user: { name: 'Linus', tier: 'free' },
+    }),
+  ].join('\n') + '\n';
+
+  await open(page, 'v09.jsonl', { text: v09Sample });
+  let r = await complete(page);
+  check.eq('3 valid records loaded', r.stats.valid, 3);
+
+  // 1. LLM Conversation & Agent Trace Reader (`Chat (N)` pill -> `.valpanel .chat-reader`).
+  await page.locator('.formatted .chat-btn').first().click();
+  await page.locator('.valpanel .chat-reader').waitFor({ state: 'visible' });
+  const chatText = await page.locator('.valpanel .chat-reader').innerText();
+  check.ok('Chat reader renders turns, tool call and token count', chatText.includes('Check Tokyo weather') && chatText.includes('weather'), chatText.slice(0, 120));
+  await shot('LLM Conversation & Agent Trace Reader');
+  await page.keyboard.press('Escape');
+
+  // 2. Schema-Aware Search & jq Autocomplete (`.ac-menu` + Tab accept).
+  await page.locator('.search input').focus();
+  await page.keyboard.type('.user.n');
+  await page.locator('.ac-menu').waitFor({ state: 'visible' });
+  await page.keyboard.press('Tab');
+  check.eq('Tab accepts autocomplete field path', await page.locator('.search input').inputValue(), '.user.name');
+  await page.fill('.search input', '');
+  await report(page, (x) => !x.query);
+
+  // 3. Trace / Request Waterfall View (right-click `trace_id` -> `Trace call flow`).
+  await page.locator('.formatted .row[data-r="0"]').filter({ hasText: 'tr-100' }).click({ button: 'right' });
+  await page.locator('.ctx-menu [data-ctx="trace"]').click();
+  await page.locator('.tracepanel').waitFor({ state: 'visible' });
+  check.eq('Trace waterfall correlates 2 spans for tr-100', await page.locator('.tracepanel .wf-row').count(), 2);
+  await shot('Trace Waterfall modal');
+  await page.locator('.tracepanel .wf-row[data-wf-rec="1"]').click();
+  r = await report(page, (x) => x.active === 1);
+  check.eq('clicking a waterfall span jumps to record 2', r.active, 1);
+
+  // 4. Go to Line / % / Timestamp (`Cmd/Ctrl+G` `.goto-box`) + Home / End keys.
+  await page.click('[data-goto-open]');
+  await page.locator('.goto-box').waitFor({ state: 'visible' });
+  await page.fill('.goto-in', '100%');
+  await page.click('.goto-go');
+  r = await report(page, (x) => x.active === 2);
+  check.eq('Go to 100% jumps to last record', r.active, 2);
+  await page.locator('.formatted .scroller').focus();
+  await page.keyboard.press('Home');
+  r = await report(page, (x) => x.active === 0);
+  check.eq('Home key jumps to first record', r.active, 0);
+
+  // 5. Pivot & Group-By Summary Panel (`.pivot-btn` -> `.piv-row` drill-down filter).
+  await page.click('.pivot-btn');
+  await page.locator('.pivotpanel').waitFor({ state: 'visible' });
+  await page.selectOption('[data-piv-group]', 'service');
+  await page.selectOption('[data-piv-metric]', 'ms');
+  const pivText = await page.locator('.pivotpanel .piv-host').innerText();
+  check.ok('Pivot groups by service and computes Sum/Avg', pivText.includes('worker') && pivText.includes('200'), pivText);
+  await shot('Pivot & Group-By summary');
+  await page.locator('.pivotpanel .piv-row').first().click();
+  r = await report(page, (x) => x.matches === 2);
+  check.eq('clicking Pivot row drills down to matching records', r.matches, 2);
+  await page.click('[data-clear-all-filters]');
+  await report(page, (x) => !x.query && x.stats.lines === 3);
+
+  // 6. Data Quality & Duplicate Finder (`.quality-btn` -> `Filter N lines` on duplicate `id`).
+  await page.click('.quality-btn');
+  await page.locator('.qualitypanel').waitFor({ state: 'visible' });
+  check.ok('Data quality detects duplicate primary key r2', (await page.locator('.qualitypanel').innerText()).includes('r2'));
+  await page.locator('.qualitypanel [data-qfilter="0"]').click();
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .row.first').length === 2);
+  check.eq('Quality issue filter narrows view to the 2 duplicate-id lines', await page.locator('.formatted .row.first').count(), 2);
+  await page.click('[data-clear-all-filters]');
+  await page.waitForFunction(() => document.querySelectorAll('.formatted .row.first').length === 3);
+
+  // 7. Promote Nested Path to Top-Level Grid Column (`user.name` + `Flatten 1 level`).
+  await tabBtn(page, 'grid').click();
+  r = await report(page, (x) => x.view === 'grid');
+  await page.click('.cols-btn');
+  await page.locator('.col-picker').waitFor({ state: 'visible' });
+  await page.fill('[data-cpromote-in]', 'user.name');
+  await page.click('[data-cpromote-btn]');
+  r = await report(page, (x) => x.grid.columns.includes('user.name'));
+  check.ok('promoted nested path user.name appears as a Grid column', r.grid.columns.includes('user.name'));
+  await page.click('[data-cflatten]');
+  r = await report(page, (x) => x.grid.columns.includes('user.tier'));
+  check.ok('Flatten 1 level adds user.tier and usage.total_tokens', r.grid.columns.includes('user.tier') && r.grid.columns.includes('usage.total_tokens'));
+  await page.keyboard.press('Escape');
+
+  // 8. Cross-File Dataset Diff (`fileDiff` host message -> key-aligned diff).
+  const otherText = [
+    JSON.stringify({ id: 'r1', ms: 55, service: 'gateway' }),
+    JSON.stringify({ id: 'r4', ms: 10, service: 'billing' }),
+  ].join('\n');
+  await send(page, { type: 'fileDiff', otherName: 'v09-next.jsonl', otherText });
+  await page.locator('.filediffpanel').waitFor({ state: 'visible' });
+  await page.selectOption('[data-fd-align]', 'k:id');
+  const fdText = await page.locator('.filediffpanel').innerText();
+  check.ok('Dataset comparison aligns by id and shows Modified/Added/Removed', fdText.includes('id=r4') && fdText.includes('id=r1'), fdText.slice(0, 140));
+  await page.keyboard.press('Escape');
+
+  // 9. PII & Secret Redaction + TSV clipboard copy + SQL export.
+  await page.click('.export-btn');
+  await page.check('[data-export-redact]');
+  await page.click('[data-export="copy:tsv"]');
+  await page.waitForFunction(() => window.harness.posted('copy').length >= 1);
+  const tsvClip = (await posted(page, 'copy')).at(-1).text;
+  check.ok('TSV copy redacts sk-... API keys while keeping user.name', !tsvClip.includes('sk-1234567890') && tsvClip.includes('Ada'), tsvClip.slice(0, 160));
+
+  await page.click('.export-btn');
+  await page.click('[data-export="rows:sql"]');
+  const sqlStart = (await posted(page, 'exportStart')).at(-1);
+  check.eq('SQL export started', sqlStart.format, 'sql');
+  await send(page, { type: 'exportReady', id: sqlStart.id, ok: true });
+  await page.waitForFunction((id) => window.harness.posted('exportData').some((m) => m.id === id), sqlStart.id);
+  const sqlOut = (await posted(page, 'exportData')).find((m) => m.id === sqlStart.id).data;
+  check.ok('SQL DDL + INSERT generated with redaction', sqlOut.includes('CREATE TABLE IF NOT EXISTS "v09"') && sqlOut.includes('INSERT INTO "v09"') && !sqlOut.includes('sk-1234567890'), sqlOut.slice(0, 200));
+
+  // 10. Concatenated multi-line JSON stream auto-detection + Explicit State Machine UX/AX contract.
+  await open(page, 'stream.json', { isJsonl: false, text: '{\n  "id": 1,\n  "v": "first"\n}\n{\n  "id": 2,\n  "v": "second"\n}\n' });
+  r = await complete(page);
+  check.eq('concatenated multi-line JSON stream parsed as 2 JSONL records', [r.isJsonl, r.stats.valid], [true, 2]);
+  check.eq('AX data-lifecycle and data-modal attributes reflect ready idle state', await page.evaluate(() => [document.getElementById('app').dataset.lifecycle, document.getElementById('app').dataset.modal]), ['ready', 'none']);
+
+  // Opening a second modal automatically closes the first modal and Escape restores focus to the trigger button.
+  await page.locator('.schema-btn').focus();
+  await page.click('.schema-btn');
+  r = await report(page, (x) => x.machines?.modal === 'schema');
+  check.eq('machines snapshot reports schema modal', r.machines.modal, 'schema');
+  await page.click('.pivot-btn');
+  r = await report(page, (x) => x.machines?.modal === 'pivot');
+  check.ok('opening Pivot modal automatically closes Schema modal (no stacked modals)', (await page.locator('.schemapanel').isHidden()) && (await page.locator('.pivotpanel').isVisible()));
+  await page.keyboard.press('Escape');
+  r = await report(page, (x) => x.machines?.modal === null);
+  check.eq('Escape closes modal and returns focus to initial trigger button', await page.evaluate(() => document.activeElement?.classList.contains('schema-btn')), true);
 });
 
 await browser.close();

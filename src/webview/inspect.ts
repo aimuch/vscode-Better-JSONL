@@ -3,21 +3,42 @@
 import { childKey, decodeKey, esc, isContainer, isObj, parseJson, RawNum, stringifyPretty, type JObj, type JVal } from './json';
 
 const MAX_UNPACK_LEN = 2 * 1024 * 1024;
+const MAX_MEMO_STR_LEN = 262_144;
+const MAX_MEMO_ENTRIES = 512;
+const unpackMemo = new Map<string, JVal | null>();
 
 /**
  * If `s` holds serialized JSON (an object `{...}`, an array `[...]`, or multi-line JSONL),
  * returns the parsed value so views can unpack stringified payloads in place.
+ * Memoized for strings <= 256 KB so virtual-scroll repaints never re-parse on every frame.
  */
 export function tryUnpackJsonString(s: string): JVal | undefined {
   if (s.length < 2 || s.length > MAX_UNPACK_LEN) return undefined;
+  const c0 = s.charCodeAt(0);
+  // Fast path: 99% of strings do not start with `{`, `[`, or leading whitespace.
+  if (c0 !== 123 && c0 !== 91 && c0 > 32) return undefined;
+  const useMemo = s.length <= MAX_MEMO_STR_LEN;
+  if (useMemo && unpackMemo.has(s)) {
+    return unpackMemo.get(s) ?? undefined;
+  }
+  const store = (res: JVal | undefined): JVal | undefined => {
+    if (useMemo) {
+      if (unpackMemo.size >= MAX_MEMO_ENTRIES) {
+        const oldest = unpackMemo.keys().next().value;
+        if (oldest !== undefined) unpackMemo.delete(oldest);
+      }
+      unpackMemo.set(s, res ?? null);
+    }
+    return res;
+  };
   const trimmed = s.trim();
-  if (trimmed.length < 2) return undefined;
+  if (trimmed.length < 2) return store(undefined);
   const first = trimmed[0];
   const last = trimmed[trimmed.length - 1];
   if ((first === '{' && last === '}') || (first === '[' && last === ']')) {
     try {
       const v = parseJson(trimmed);
-      if (isContainer(v)) return v;
+      if (isContainer(v)) return store(v);
     } catch {
       // Check if it is multi-line JSONL (`{...}\n{...}`).
     }
@@ -26,13 +47,13 @@ export function tryUnpackJsonString(s: string): JVal | undefined {
     const lines = trimmed.split(/\r?\n/).filter((l) => l.trim().length > 0);
     if (lines.length >= 2 && lines.length <= 5000 && lines.every((l) => l.trim().startsWith('{'))) {
       try {
-        return lines.map((l) => parseJson(l));
+        return store(lines.map((l) => parseJson(l)));
       } catch {
-        return undefined;
+        return store(undefined);
       }
     }
   }
-  return undefined;
+  return store(undefined);
 }
 
 /** Resolves a value along `pathKey`, stepping into unpacked JSON strings when `unpacked` contains an ancestor path. */

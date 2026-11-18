@@ -5,7 +5,22 @@ import * as vscode from 'vscode';
 import { isJsonlDocument, isJsonlPath, readConfig, syncSelectionEnabled } from './config';
 import { EncodeError } from './encoding';
 import type { Written } from './fileEdit';
-import { compare, encodingFor, fileState, innerName, LineConflict, mutateFileLines, readUtf8, replaceLine, TAIL, type FileState } from './largeFile';
+import {
+  compare,
+  compressionOfPath,
+  encodingFor,
+  fileState,
+  innerName,
+  isGzipPath,
+  LineConflict,
+  mutateFileLines,
+  readAllUtf8,
+  readUtf8,
+  replaceLine,
+  TAIL,
+  type Compression,
+  type FileState,
+} from './largeFile';
 import { locatePath, valueSpan } from './locate';
 import { t } from './shared/i18n';
 import { errorMessage, minifyJson } from './shared/jsonText';
@@ -19,10 +34,22 @@ import {
   type RenderReport,
   type SettingKey,
   type TextChange,
+  type WebviewMachineSnapshot,
   type WebviewMessage,
 } from './shared/protocol';
 
 type Waiter = { pred: (r: RenderReport) => boolean; resolve: (r: RenderReport) => void };
+
+export interface SessionStateSnapshot {
+  uri: string | undefined;
+  host: 'editor' | 'preview';
+  syncPhase: 'booting' | 'synced' | 'update-pending' | 'hidden-dirty' | 'large-file' | 'disposed';
+  streamPhase: 'none' | 'streaming' | 'ready' | 'appending';
+  isJsonl: boolean;
+  concatenated: boolean;
+  activeExports: number;
+  webview?: WebviewMachineSnapshot;
+}
 
 /** What a session needs from the extension. */
 export interface SessionEnv {
@@ -41,6 +68,7 @@ export type Target = { doc: vscode.TextDocument } | { uri: vscode.Uri; bytes: nu
 interface Large {
   bytes: number;
   gzip: boolean;
+  compression: Compression;
   encoding: string;
   /** Size, time and last bytes of the file when it was read: a file that only grew can be followed. */
   state?: FileState;
@@ -133,8 +161,12 @@ export class ViewerSession implements vscode.Disposable {
   >();
   /** The E2E tests set this: the export goes there, with no save dialog. */
   testExportTarget: vscode.Uri | undefined;
+  /** The E2E tests set this: compareWithFile reads this URI without opening a file picker. */
+  testCompareTarget: vscode.Uri | undefined;
   /** What the webview shows the document as. The webview decides (a .json file can hold JSON Lines). */
   private jsonl = false;
+  private concatenated = false;
+  private streamingLarge = false;
   private ready = false;
   private disposed = false;
   private readonly disposables: vscode.Disposable[] = [];
@@ -252,16 +284,49 @@ export class ViewerSession implements vscode.Disposable {
     } else {
       this.doc = undefined;
       this.uri = target.uri;
-      const gzip = !!target.gzip;
-      this.large = { bytes: target.bytes, gzip, encoding: encodingFor(target.uri), follow: this.large?.follow ?? false };
+      const compression = compressionOfPath(target.uri.path) ?? (target.gzip ? 'gzip' : null);
+      const gzip = compression !== null;
+      this.large = { bytes: target.bytes, gzip, compression, encoding: encodingFor(target.uri), follow: this.large?.follow ?? false };
       this.jsonl = isJsonlPath(gzip ? innerName(target.uri.path) : target.uri.path);
     }
+    this.concatenated = false;
     this.selfOpened = false;
     this.lastReport = undefined;
     this.expected = undefined;
     if (this.host === 'preview') this.panel.title = `Better JSONL · ${path.posix.basename(this.uri.path)}`;
     this.watch();
     if (this.ready) this.sendInit();
+  }
+
+  snapshot(): SessionStateSnapshot {
+    const syncPhase: SessionStateSnapshot['syncPhase'] = this.disposed
+      ? 'disposed'
+      : !this.ready
+        ? 'booting'
+        : this.large
+          ? 'large-file'
+          : this.dirty
+            ? 'hidden-dirty'
+            : this.updatePending
+              ? 'update-pending'
+              : 'synced';
+    const streamPhase: SessionStateSnapshot['streamPhase'] = !this.large
+      ? 'none'
+      : this.appending
+        ? 'appending'
+        : this.streamingLarge
+          ? 'streaming'
+          : 'ready';
+    return {
+      uri: this.uri?.toString(),
+      host: this.host,
+      syncPhase,
+      streamPhase,
+      isJsonl: this.jsonl,
+      concatenated: this.concatenated,
+      activeExports: this.exports.size,
+      webview: this.lastReport?.machines,
+    };
   }
 
   post(msg: HostMessage): void {
@@ -402,12 +467,13 @@ export class ViewerSession implements vscode.Disposable {
     const large = this.large;
     if (!large) return;
     const current = () => !this.disposed && generation === this.generation && this.large === large;
+    this.streamingLarge = true;
     try {
       const state = uri.scheme === 'file' ? await fileState(uri.fsPath) : undefined;
       let prev: { data: Uint8Array; read: number } | undefined;
       let decoded = 0;
       let tail: Buffer = Buffer.alloc(0);
-      for await (const piece of readUtf8(uri, { gzip: large.gzip, encoding: large.encoding, to: state?.size })) {
+      for await (const piece of readUtf8(uri, { gzip: large.gzip, compression: large.compression, encoding: large.encoding, to: state?.size })) {
         if (!current()) return;
         large.encoding = piece.encoding;
         if (prev) await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev.data, done: false, read: prev.read } satisfies HostMessage);
@@ -422,6 +488,8 @@ export class ViewerSession implements vscode.Disposable {
       await this.panel.webview.postMessage({ type: 'chunk', version: generation, data: prev?.data ?? new Uint8Array(0), done: true, read: prev?.read ?? 0 } satisfies HostMessage);
     } catch (e) {
       if (current()) this.post({ type: 'notice', message: t('Better JSONL could not read the file: {0}', errorMessage(e)) });
+    } finally {
+      if (current()) this.streamingLarge = false;
     }
   }
 
@@ -442,7 +510,7 @@ export class ViewerSession implements vscode.Disposable {
     let pos = 0;
     let checked = tail.length === 0;
     let last: Buffer = Buffer.alloc(0);
-    for await (const piece of readUtf8(uri, { gzip: true, encoding: large.encoding, to: now.size })) {
+    for await (const piece of readUtf8(uri, { gzip: true, compression: large.compression, encoding: large.encoding, to: now.size })) {
       if (this.disposed || generation !== this.generation || this.large !== large) return true;
       const d = Buffer.from(piece.data.buffer, piece.data.byteOffset, piece.data.byteLength);
       const start = pos;
@@ -586,8 +654,8 @@ export class ViewerSession implements vscode.Disposable {
   /** The webview now has the text of `doc` at its version: changes are collected from here. */
   private synced(doc: vscode.TextDocument): void {
     this.syncedVersion = doc.version;
-    // Only JSON Lines documents are patched: one JSON value is parsed again as a whole anyway.
-    this.edits = isJsonlDocument(doc) || this.jsonl ? [] : undefined;
+    // Only 1-line-per-record JSON Lines documents are patched: multi-line concatenated streams & single JSON parse whole.
+    this.edits = (isJsonlDocument(doc) || this.jsonl) && !this.concatenated ? [] : undefined;
     this.editChars = 0;
   }
 
@@ -665,10 +733,11 @@ export class ViewerSession implements vscode.Disposable {
           this.sendInit();
           break;
         case 'docMode': {
-          const changed = this.jsonl !== m.isJsonl;
+          const changed = this.jsonl !== m.isJsonl || this.concatenated !== !!m.concatenated;
           this.jsonl = m.isJsonl;
+          this.concatenated = !!m.concatenated;
           if (changed && this.doc && this.doc.version === this.syncedVersion) {
-            this.edits = this.jsonl ? (this.edits ?? []) : undefined;
+            this.edits = this.jsonl && !this.concatenated ? (this.edits ?? []) : undefined;
           }
           const editor = this.visibleEditor();
           if (changed && editor) this.sendSelection(editor.selections);
@@ -714,6 +783,9 @@ export class ViewerSession implements vscode.Disposable {
           break;
         case 'diff':
           await this.env.showDiff(m.left, m.right);
+          break;
+        case 'compareWithFile':
+          await this.compareWithFile();
           break;
         case 'readModules':
           this.post({ type: 'modules', files: await this.readModules(m.keys) });
@@ -848,11 +920,17 @@ export class ViewerSession implements vscode.Disposable {
     const doc = await this.liveDoc();
     if (!doc) return;
     let range: vscode.Range;
-    if (this.jsonl) {
+    if (this.jsonl && !this.concatenated) {
       if (line >= doc.lineCount) return;
       const text = doc.lineAt(line).text;
       const span = locatePath(text, jsonPath) ?? { offset: 0, length: text.length };
       range = new vscode.Range(line, span.offset, line, span.offset + span.length);
+    } else if (this.jsonl && this.concatenated) {
+      const safeLine = Math.min(Math.max(0, line), Math.max(0, doc.lineCount - 1));
+      const startOff = doc.offsetAt(doc.lineAt(safeLine).range.start);
+      const tailText = doc.getText().slice(startOff);
+      const span = locatePath(tailText, jsonPath) ?? { offset: 0, length: 0 };
+      range = new vscode.Range(doc.positionAt(startOff + span.offset), doc.positionAt(startOff + span.offset + span.length));
     } else {
       const text = doc.getText();
       const span = locatePath(text, jsonPath) ?? { offset: 0, length: 0 };
@@ -902,7 +980,7 @@ export class ViewerSession implements vscode.Disposable {
     if (this.readOnly) return fail(t('This file is read-only here: it is not on this computer.'));
     if (!large.state || (await compare(uri.fsPath, large.state)) !== 'same') return fail(t('The file changed on disk. Reload it, then edit again.'));
     try {
-      const done = await replaceLine(uri.fsPath, line, original, text, { gzip: large.gzip, encoding: large.encoding });
+      const done = await replaceLine(uri.fsPath, line, original, text, { gzip: large.gzip, compression: large.compression, encoding: large.encoding });
       large.state = { size: done.size, mtimeMs: done.mtimeMs, tail: done.tail };
       large.bytes = done.size;
       if (large.decoded !== undefined) large.decoded += Buffer.byteLength(text, 'utf8') - Buffer.byteLength(original, 'utf8');
@@ -971,7 +1049,7 @@ export class ViewerSession implements vscode.Disposable {
         return fail(t('The file changed on disk. Reload it, then edit again.'));
       }
       try {
-        await mutateFileLines(uri.fsPath, normalized, { gzip: large.gzip, encoding: large.encoding });
+        await mutateFileLines(uri.fsPath, normalized, { gzip: large.gzip, compression: large.compression, encoding: large.encoding });
       } catch (e) {
         return fail(e instanceof EncodeError ? t('Nothing was written: {0}.', errorMessage(e)) : errorMessage(e));
       }
@@ -1032,11 +1110,15 @@ export class ViewerSession implements vscode.Disposable {
     const filters: Record<string, string[]> =
       format === 'csv'
         ? { CSV: ['csv'] }
-        : format === 'json'
-          ? { [t('JSON array')]: ['json'] }
-          : format === 'md'
-            ? { [t('Markdown table')]: ['md'] }
-            : { 'JSON Lines': ['jsonl', 'ndjson'] };
+        : format === 'tsv'
+          ? { [t('TSV table')]: ['tsv'] }
+          : format === 'sql'
+            ? { [t('SQL script')]: ['sql'] }
+            : format === 'json'
+              ? { [t('JSON array')]: ['json'] }
+              : format === 'md'
+                ? { [t('Markdown table')]: ['md'] }
+                : { 'JSON Lines': ['jsonl', 'ndjson'] };
     const target =
       this.testExportTarget ??
       (await vscode.window.showSaveDialog({
@@ -1104,6 +1186,32 @@ export class ViewerSession implements vscode.Disposable {
       this.exports.delete(id);
       await e.abort();
       this.post({ type: 'exportDone', id, ok: false, message: t('The export failed: {0}', errorMessage(err)) });
+    }
+  }
+
+  async compareWithFile(otherUri?: vscode.Uri): Promise<void> {
+    let chosen = otherUri ?? this.testCompareTarget;
+    if (!chosen) {
+      const defaultUri = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        defaultUri,
+        openLabel: t('Select JSON / JSONL file to compare'),
+        filters: {
+          'JSON / JSON Lines': ['jsonl', 'ndjson', 'jsonlines', 'json', 'jsonc', 'gz', 'br'],
+        },
+      });
+      chosen = picked?.[0];
+    }
+    if (!chosen) return;
+    try {
+      const openDoc = !isGzipPath(chosen.path)
+        ? vscode.workspace.textDocuments.find((d) => d.uri.toString() === chosen!.toString() && !d.isClosed)
+        : undefined;
+      const otherText = openDoc ? openDoc.getText() : await readAllUtf8(chosen);
+      this.post({ type: 'fileDiff', otherName: path.posix.basename(chosen.path), otherText });
+    } catch (e) {
+      void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', errorMessage(e)));
     }
   }
 

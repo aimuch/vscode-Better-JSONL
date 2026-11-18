@@ -54,6 +54,7 @@ export class SettingsPanel {
 
   show(): void {
     if (!this.open && document.activeElement instanceof HTMLElement) this.opener = document.activeElement;
+    this.app.onSettingsWillOpen();
     this.open = true;
     this.refresh();
     this.el.classList.add('active');
@@ -65,6 +66,7 @@ export class SettingsPanel {
     if (!this.open) return;
     this.open = false;
     this.el.classList.remove('active');
+    this.app.onSettingsDidClose();
     const back = this.opener;
     this.opener = null;
     if (back && document.contains(back)) back.focus({ preventScroll: true });

@@ -2568,3 +2568,412 @@ body.vscode-high-contrast-light .menu-item:focus-visible {
   font-size: 12px;
   cursor: pointer;
 }
+
+/* ---------- 0.9: promoted cols, chat reader, pivot, quality, dataset diff, waterfall, goto & autocomplete ---------- */
+
+.tb-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* Collapse separator if no visible button precedes it after .stats */
+.stats + .icon-btn[hidden] + .icon-btn[hidden] + .icon-btn[hidden] + .icon-btn[hidden] + .icon-btn[hidden] + .tb-sep {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .tb-sep {
+    display: none;
+  }
+}
+
+[data-goto-open]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+body.vscode-high-contrast .piv-bar,
+body.vscode-high-contrast-light .piv-bar,
+body.vscode-high-contrast .wf-bar,
+body.vscode-high-contrast-light .wf-bar {
+  outline: 1px solid var(--vscode-contrastActiveBorder, var(--accent));
+}
+
+body.vscode-high-contrast .chat-turn,
+body.vscode-high-contrast-light .chat-turn {
+  border-color: var(--vscode-contrastBorder, var(--border));
+}
+
+.pivot-btn .ic {
+  color: var(--ic-mint);
+  --ic-2: var(--ic-cyan);
+}
+
+.quality-btn .ic {
+  color: var(--ic-mint);
+  --ic-2: var(--ic-amber);
+}
+
+.filediff-btn .ic {
+  color: var(--ic-blue);
+  --ic-2: var(--ic-violet);
+}
+
+.pill.chat-btn {
+  color: var(--ic-violet);
+  border-color: color-mix(in srgb, var(--ic-violet) 42%, var(--border));
+}
+
+.cp-add {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.cp-add input {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+}
+
+.cp-add input:focus {
+  border-color: var(--accent);
+}
+
+.cp-add .btn {
+  height: 24px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.menu-opt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.menu-opt:hover {
+  background: var(--hover);
+}
+
+.menu-opt input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--vscode-button-background, var(--accent));
+}
+
+.ac-menu {
+  min-width: 220px;
+  max-height: 240px;
+  z-index: 15;
+}
+
+.ac-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.ac-item.on {
+  background: var(--vscode-list-activeSelectionBackground, var(--sel));
+  color: var(--vscode-list-activeSelectionForeground, var(--fg));
+}
+
+body.vscode-high-contrast .ac-item.on,
+body.vscode-high-contrast-light .ac-item.on {
+  outline: 1px solid var(--vscode-contrastActiveBorder, var(--accent));
+  outline-offset: -1px;
+}
+
+[data-goto-open] {
+  cursor: pointer;
+}
+
+[data-goto-open]:hover {
+  text-decoration: underline;
+  color: var(--vscode-textLink-foreground, var(--accent));
+}
+
+.goto-box {
+  position: absolute;
+  left: 50%;
+  top: 42px;
+  transform: translateX(-50%);
+  z-index: 16;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--bg));
+  box-shadow: 0 4px 18px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+}
+
+.goto-box[hidden] {
+  display: none;
+}
+
+.goto-in {
+  width: 240px;
+  max-width: calc(100vw - 110px);
+  height: 26px;
+  padding: 0 8px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 4px;
+  font-size: 12px;
+  outline: none;
+}
+
+.goto-in:focus {
+  border-color: var(--accent);
+}
+
+.chat-reader {
+  white-space: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 5px;
+  background: var(--chrome);
+}
+
+.chat-turn.role-system {
+  border-left-color: var(--ic-slate);
+}
+
+.chat-turn.role-user {
+  border-left-color: var(--ic-blue);
+}
+
+.chat-turn.role-assistant {
+  border-left-color: var(--ic-mint);
+}
+
+.chat-turn.role-tool {
+  border-left-color: var(--ic-amber);
+}
+
+.chat-turn.role-chosen {
+  border-left-color: var(--ic-mint);
+}
+
+.chat-turn.role-rejected {
+  border-left-color: var(--err);
+}
+
+.chat-role {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.chat-think {
+  padding: 5px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  font-size: 12px;
+}
+
+.chat-think > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-weight: 600;
+  user-select: none;
+}
+
+.chat-think-body {
+  margin-top: 6px;
+}
+
+.chat-tool {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.chat-tool.err {
+  border-color: var(--err);
+}
+
+.chat-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.piv-controls {
+  gap: 10px;
+}
+
+.piv-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.piv-ctl select {
+  height: 26px;
+  max-width: 220px;
+  padding: 0 6px;
+  background: var(--vscode-dropdown-background, var(--vscode-input-background));
+  color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+  border: 1px solid var(--vscode-dropdown-border, var(--border));
+  border-radius: 4px;
+  font: inherit;
+  outline: none;
+}
+
+.piv-ctl select:focus {
+  border-color: var(--accent);
+}
+
+.piv-row {
+  cursor: pointer;
+}
+
+.piv-row:hover {
+  background: var(--hover);
+}
+
+.piv-tbl .num,
+.wf-tbl .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.piv-share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 120px;
+}
+
+.piv-bar-wrap {
+  flex: 1 1 60px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--ctl);
+  overflow: hidden;
+}
+
+.piv-bar {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ic-cyan) 78%, transparent);
+}
+
+.qual-card {
+  gap: 8px;
+}
+
+.qual-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.fd-bar {
+  gap: 10px;
+}
+
+.fd-metrics {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.fd-tbl td {
+  white-space: pre-wrap;
+}
+
+.wf-row {
+  cursor: pointer;
+}
+
+.wf-row:hover {
+  background: var(--hover);
+}
+
+.wf-row.wf-err td {
+  background: var(--err-bg);
+}
+
+.wf-bar-cell {
+  width: 34%;
+  min-width: 140px;
+  vertical-align: middle !important;
+}
+
+.wf-track {
+  position: relative;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--ctl);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.wf-bar {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  border-radius: 2px;
+  background: var(--ic-cyan);
+}
+
+.wf-bar.err {
+  background: var(--err);
+}
+

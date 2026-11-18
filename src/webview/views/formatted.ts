@@ -812,6 +812,11 @@ export class FormattedView implements View {
       else if (act.classList.contains('a-goto')) app.reveal(r, []);
       return;
     }
+    const chatEl = target.closest('[data-chat]') as HTMLElement | null;
+    if (chatEl) {
+      app.openValueInspector(r, [], app.model.value(r), 'chat');
+      return;
+    }
     const unpackEl = target.closest('[data-unpack]') as HTMLElement | null;
     if (unpackEl) {
       app.toggleUnpack(r, unpackEl.dataset.unpack as string);
@@ -848,7 +853,7 @@ export class FormattedView implements View {
 
   private onDblClick(e: MouseEvent): void {
     const rowEl = (e.target as HTMLElement).closest('.row') as HTMLElement | null;
-    if (!rowEl || (e.target as HTMLElement).closest('.rbtn,[data-k],[data-unpack],[data-ml]')) return;
+    if (!rowEl || (e.target as HTMLElement).closest('.rbtn,[data-k],[data-unpack],[data-ml],[data-chat]')) return;
     const r = Number(rowEl.dataset.r);
     const pathKey = rowEl.dataset.p ?? '';
     const path = pathKey ? decodeKey(pathKey) : [];

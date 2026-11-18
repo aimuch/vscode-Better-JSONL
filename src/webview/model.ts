@@ -1,5 +1,5 @@
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
-import { errorMessage, errorOffset, stripBom } from '../shared/jsonText';
+import { errorMessage, errorOffset, minifyJson, splitJsonValues, stripBom } from '../shared/jsonText';
 import type { JsonPath, TextChange } from '../shared/protocol';
 import type { ItemStore } from './items';
 import { compactJson, compileQuery, type Program } from './query';
@@ -330,6 +330,9 @@ export class DocModel {
   errorsVersion = 0;
   /** Grows on in-place mutations (`replaceLine` / `append`) so views invalidate cached lines/columns. */
   revision = 0;
+  /** True when multi-line concatenated JSON values were unpacked into virtual records. */
+  concatenated = false;
+  private concatFileLines: Int32Array | undefined;
 
   /** `src`: the text, the byte store of a large file, or the records of a JSON Lines document (with `endsWithEol`). */
   constructor(src: string | ByteStore | ItemStore | string[], isJsonl: boolean, bytes?: number, endsWithEol = false, preferJsonl = false) {
@@ -358,6 +361,23 @@ export class DocModel {
     if (isJsonl) {
       const lines = text.split(EOL);
       this.endsWithEol = dropLastEmpty(lines);
+      const firstNonBlank = lines.find((l) => /\S/.test(l));
+      if (
+        text.length <= FALLBACK_CHARS &&
+        lines.length >= 2 &&
+        firstNonBlank !== undefined &&
+        /^[\s]*[{[]/.test(firstNonBlank) &&
+        tryParse(firstNonBlank).kind === 'error'
+      ) {
+        const concat = trySplitConcatenated(text, 1);
+        if (concat) {
+          this.concatenated = true;
+          this.concatFileLines = concat.startLines;
+          this.store = new StringStore(concat.lines);
+          this.kinds = new Uint8Array(concat.lines.length);
+          return;
+        }
+      }
       this.store = new StringStore(lines);
       this.kinds = new Uint8Array(lines.length);
       return;
@@ -373,6 +393,16 @@ export class DocModel {
         this.endsWithEol = endsWithEol;
         this.store = new StringStore(lines);
         this.kinds = new Uint8Array(lines.length);
+        return;
+      }
+      const concat = trySplitConcatenated(text, 2);
+      if (concat) {
+        this.isJsonl = true;
+        this.detectedJsonl = true;
+        this.concatenated = true;
+        this.concatFileLines = concat.startLines;
+        this.store = new StringStore(concat.lines);
+        this.kinds = new Uint8Array(concat.lines.length);
         return;
       }
     }
@@ -473,8 +503,16 @@ export class DocModel {
 
   /** The line in the file where record i starts. */
   fileLine(i: number): number {
+    if (this.concatFileLines) return this.concatFileLines[Math.min(Math.max(0, i), this.concatFileLines.length - 1)] ?? 0;
     const s = this.store as Partial<ItemStore>;
     return s.fileLine ? s.fileLine(i) : i;
+  }
+
+  /** Maps a 0-based text editor line back to the record index containing it. */
+  recordForFileLine(editorLine: number): number {
+    if (!this.concatFileLines || !this.concatFileLines.length) return editorLine;
+    const lb = lowerBound(this.concatFileLines, editorLine + 1);
+    return Math.max(0, lb - 1);
   }
 
   /** True while a byte store still receives data. */
@@ -501,7 +539,7 @@ export class DocModel {
    * included), as a new list. Undefined when the document is not JSON Lines from text.
    */
   editorLines(): string[] | undefined {
-    if (!this.isJsonl || !(this.store instanceof StringStore)) return undefined;
+    if (!this.isJsonl || this.concatenated || !(this.store instanceof StringStore)) return undefined;
     const lines = this.store.lines.slice();
     if (this.endsWithEol) lines.push('');
     return lines;
@@ -712,6 +750,47 @@ export function dropLastEmpty(lines: string[]): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Splits a jq-style concatenated multi-line JSON stream (`{\n  "a": 1\n}\n{\n  "b": 2\n}`)
+ * into compact per-record strings + starting 0-based file line numbers when every value is valid JSON
+ * and only whitespace separates values.
+ */
+function trySplitConcatenated(text: string, minValues: number): { lines: string[]; startLines: Int32Array } | undefined {
+  const spans = splitJsonValues(text);
+  if (spans.length < minValues) return undefined;
+  let prevEnd = 0;
+  let hasMultiLine = false;
+  for (const sp of spans) {
+    if (/\S/.test(text.slice(prevEnd, sp.start))) return undefined;
+    const piece = text.slice(sp.start, sp.end);
+    if (piece.includes('\n') || piece.includes('\r')) hasMultiLine = true;
+    prevEnd = sp.end;
+  }
+  if (!hasMultiLine || /\S/.test(text.slice(prevEnd))) return undefined;
+
+  const lines: string[] = [];
+  const startLines = new Int32Array(spans.length);
+  let scanPos = 0;
+  let curLine = 0;
+  for (let idx = 0; idx < spans.length; idx++) {
+    const sp = spans[idx];
+    while (scanPos < sp.start) {
+      const ch = text.charCodeAt(scanPos);
+      if (ch === 10) curLine++;
+      else if (ch === 13) {
+        curLine++;
+        if (text.charCodeAt(scanPos + 1) === 10) scanPos++;
+      }
+      scanPos++;
+    }
+    startLines[idx] = curLine;
+    const piece = text.slice(sp.start, sp.end);
+    if (tryParse(piece).kind !== 'value') return undefined;
+    lines.push(minifyJson(piece));
+  }
+  return { lines, startLines };
 }
 
 function utf8Length(s: string): number {

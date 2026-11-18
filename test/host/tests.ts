@@ -91,6 +91,7 @@ describe('Better JSONL · extension host', () => {
       'betterJsonl.expandLines',
       'betterJsonl.compactLines',
       'betterJsonl.convertFormat',
+      'betterJsonl.compareFiles',
     ]) {
       assert.ok(all.includes(id), id);
     }
@@ -882,6 +883,68 @@ describe('Better JSONL · extension host', () => {
 
       await vscode.window.showTextDocument(jlDoc, { viewColumn: vscode.ViewColumn.One, preview: false });
       await vscode.commands.executeCommand('workbench.action.files.revert');
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H35 v0.9 Brotli .jsonl.br streaming & editLine, compareFiles, TSV/SQL exports, concatenated stream reveal & AX inspect()', async function () {
+    this.timeout(40000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-v09-'));
+    try {
+      // 1. Brotli (.jsonl.br) open in CompressedEditorProvider + record-by-record editLine on disk.
+      const brPath = path.join(dir, 'logs.jsonl.br');
+      fs.writeFileSync(brPath, zlib.brotliCompressSync(Buffer.from('{"id":1,"msg":"hello"}\n{"id":2,"msg":"world"}\n', 'utf8')));
+      const brUri = vscode.Uri.file(brPath);
+      await vscode.commands.executeCommand('vscode.open', brUri);
+      const brSess = await waitFor(
+        () => api.sessions().find((x) => x.isLarge && x.resource?.fsPath.toLowerCase() === brUri.fsPath.toLowerCase()),
+        'compressed session for logs.jsonl.br',
+        20000,
+      );
+      const brRep = await brSess.waitForReport((x) => x.fileName === 'logs.jsonl.br' && !x.loading && parsed(x), 15000);
+      assert.strictEqual(brRep.stats.valid, 2);
+      assert.strictEqual(brRep.machines?.lifecycle, 'ready');
+      await brSess.handle({ type: 'editLine', line: 0, original: '{"id":1,"msg":"hello"}', text: '{"id":1,"msg":"brotli-edited"}' });
+      await brSess.waitForReport((x) => x.activeText === '{"id":1,"msg":"brotli-edited"}', 15000);
+      assert.strictEqual(
+        zlib.brotliDecompressSync(fs.readFileSync(brPath)).toString('utf8'),
+        '{"id":1,"msg":"brotli-edited"}\n{"id":2,"msg":"world"}\n',
+      );
+
+      // 2. TSV & SQL streaming exports + Cross-file dataset comparison (`betterJsonl.compareFiles`).
+      const tsvOut = path.join(dir, 'logs.tsv');
+      brSess.testExportTarget = vscode.Uri.file(tsvOut);
+      brSess.post({ type: 'exportRows', which: 'rows', format: 'tsv' });
+      await waitFor(() => fs.existsSync(tsvOut) && fs.statSync(tsvOut).size > 10, 'tsv export');
+      assert.strictEqual(fs.readFileSync(tsvOut, 'utf8'), 'id\tmsg\n1\tbrotli-edited\n2\tworld\n');
+
+      const sqlOut = path.join(dir, 'logs.sql');
+      brSess.testExportTarget = vscode.Uri.file(sqlOut);
+      brSess.post({ type: 'exportRows', which: 'rows', format: 'sql' });
+      await waitFor(() => fs.existsSync(sqlOut) && fs.readFileSync(sqlOut, 'utf8').includes('INSERT INTO'), 'sql export');
+      assert.ok(fs.readFileSync(sqlOut, 'utf8').includes('CREATE TABLE IF NOT EXISTS "logs"'));
+
+      const otherPath = path.join(dir, 'logs-v2.jsonl');
+      fs.writeFileSync(otherPath, '{"id":1,"msg":"changed"}\n{"id":3,"msg":"added"}\n');
+      brSess.testCompareTarget = vscode.Uri.file(otherPath);
+      await vscode.commands.executeCommand('betterJsonl.compareFiles');
+      await brSess.waitForReport((x) => x.machines?.modal === 'filediff', 15000);
+      const snaps = api.inspect();
+      assert.ok(snaps.some((sn) => sn.uri?.toLowerCase() === brUri.toString().toLowerCase() && sn.webview?.modal === 'filediff'));
+      brSess.panel.dispose();
+
+      // 3. Concatenated multi-line JSON stream in a `.json` file: revealPath highlights exact nested field on second record.
+      const concatPath = path.join(dir, 'concat.json');
+      fs.writeFileSync(concatPath, '{\n  "id": 1,\n  "name": "Ada"\n}\n{\n  "id": 2,\n  "name": "Grace"\n}\n');
+      const concatDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(concatPath));
+      const editor = await vscode.window.showTextDocument(concatDoc, { viewColumn: vscode.ViewColumn.One, preview: false });
+      await vscode.commands.executeCommand('betterJsonl.openPreviewToSide', concatDoc.uri);
+      const cs = await waitFor(() => (api.preview()?.document === concatDoc ? api.preview() : undefined), 'preview for concat.json');
+      await cs.waitForReport((x) => x.fileName === 'concat.json' && x.isJsonl && x.stats.valid === 2);
+      assert.strictEqual(cs.snapshot().concatenated, true);
+      await cs.handle({ type: 'reveal', line: 4, path: ['name'] });
+      assert.strictEqual(concatDoc.getText(editor.selection), '"name": "Grace"');
     } finally {
       removeDir(dir);
     }

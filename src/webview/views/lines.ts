@@ -198,6 +198,9 @@ export function lineHtml(l: PLine, indent: number, indentText = true): string {
       if (l.unpackedRoot && l.kind !== 'close') {
         parts.push(` <button class="pill unpack-btn on" data-unpack="${esc(l.path)}" aria-expanded="true" title="${esc(t('Fold unpacked JSON'))}">JSON ↩</button>`);
       }
+      if (l.kind === 'open' && l.br === '[' && (l.key === 'messages' || l.key === 'conversations' || l.key === 'contents') && (l.count ?? 0) > 0) {
+        parts.push(` <button class="pill chat-btn" data-chat="${esc(l.path)}" title="${esc(t('Open conversation view'))}">${esc(t('Chat'))} (${l.count})</button>`);
+      }
       break;
     case 'folded': {
       const what = l.br === '[]' ? t(l.count === 1 ? '{0} item' : '{0} items', l.count as number) : t(l.count === 1 ? '{0} key' : '{0} keys', l.count as number);
@@ -206,6 +209,9 @@ export function lineHtml(l: PLine, indent: number, indentText = true): string {
       );
       if (l.unpackedRoot) {
         parts.push(` <button class="pill unpack-btn on" data-unpack="${esc(l.path)}" aria-expanded="true" title="${esc(t('Fold unpacked JSON'))}">JSON ↩</button>`);
+      }
+      if (l.br === '[]' && (l.key === 'messages' || l.key === 'conversations' || l.key === 'contents') && (l.count ?? 0) > 0) {
+        parts.push(` <button class="pill chat-btn" data-chat="${esc(l.path)}" title="${esc(t('Open conversation view'))}">${esc(t('Chat'))} (${l.count})</button>`);
       }
       break;
     }

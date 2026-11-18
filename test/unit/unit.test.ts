@@ -14,7 +14,23 @@ import { locatePath, valueSpan } from '../../src/locate';
 import { indexItems, ItemStore } from '../../src/webview/items';
 import { ByteJsonError, parseJsonBytes } from '../../src/webview/byteJson';
 import { diffValues } from '../../src/webview/diff';
-import { csvField, csvRow, mdDivider, mdRow } from '../../src/webview/exporter';
+import { csvField, csvRow, inferSqlColumnTypes, mdDivider, mdRow, sqlCreateTable, sqlInsertBatch, tsvRow } from '../../src/webview/exporter';
+import { collectFieldCandidates, getSearchCompletions } from '../../src/webview/autocomplete';
+import { detectConversation, renderConversationHtml } from '../../src/webview/chatReader';
+import { diffDatasets, parseDatasetRecords } from '../../src/webview/datasetDiff';
+import { computePivot, discoverFieldPaths } from '../../src/webview/pivot';
+import { analyzeDataQuality } from '../../src/webview/quality';
+import { redactJsonLine, redactValue } from '../../src/webview/redact';
+import { buildTraceWaterfall, isTraceCandidate } from '../../src/webview/waterfall';
+import {
+  buildMachineSnapshot,
+  deriveDocLifecycle,
+  normalizeQuerySyntax,
+  OverlayController,
+  startExportStream,
+  syntaxToFlags,
+  toggleQuerySyntax,
+} from '../../src/webview/stateMachines';
 import { decodeSmartValue, renderMarkdownSafe, resolveAtPathKey, tryUnpackJsonString } from '../../src/webview/inspect';
 import { emitJsonSchema, emitPydantic, emitTypeScript, emitZod, inferSchema } from '../../src/webview/schema';
 import { buildTimeline, detectTimeColumn } from '../../src/webview/timeline';
@@ -996,4 +1012,239 @@ test('v0.8 search modes, >= / <= path queries, unpacked/multiline lines, inspect
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('v0.9 redaction, TSV/SQL export, LLM conversation reader, pivot & autocomplete', () => {
+  // 1. PII & Secret Redaction (masks secrets/PII, preserves token count numbers & RawNum)
+  const sampleSecret: JVal = {
+    id: parseNumLiteral('9007199254740993'),
+    api_key: 'sk-1234567890abcdefghijklmnop',
+    usage: { total_tokens: 512, input_tokens: 400 },
+    auth: 'Bearer secret_live_token_987654321',
+    contact: 'Email alice.smith@example.com or https://api.example.com/v1?access_token=xyz12345&ok=1',
+  };
+  const red = redactValue(sampleSecret) as Record<string, unknown>;
+  assert.equal(red.id instanceof RawNum && red.id.src === '9007199254740993', true);
+  assert.equal(red.api_key, '***REDACTED***');
+  assert.deepEqual(red.usage, { total_tokens: 512, input_tokens: 400 });
+  assert.equal(red.auth, 'Bearer ***REDACTED***');
+  assert.equal(String(red.contact).includes('alice.smith'), false);
+  assert.equal(String(red.contact).includes('xyz12345'), false);
+  assert.equal(String(red.contact).includes('ok=1'), true);
+  const redLine = redactJsonLine('{"password":"my-super-secret","user":"bob"}');
+  assert.equal(redLine, '{"password":"***REDACTED***","user":"bob"}');
+
+  // 2. TSV & SQL (CREATE TABLE + INSERT) export helpers
+  assert.equal(tsvRow(['a\tb', 'c\nd', 'ok']), 'a b\tc d\tok');
+  const sqlRows: (JVal | undefined)[][] = [
+    [parseNumLiteral('9007199254740993'), 'Ada\'s "log"', 12.5, true, { k: 1 }],
+    [2, 'Bob', 8, false, null],
+  ];
+  const types = inferSqlColumnTypes(5, sqlRows);
+  assert.deepEqual(types, ['BIGINT', 'TEXT', 'DOUBLE PRECISION', 'BOOLEAN', 'JSON']);
+  const ddl = sqlCreateTable('app-events', ['id', 'name', 'latency', 'ok', 'meta'], types);
+  assert.match(ddl, /CREATE TABLE IF NOT EXISTS "app_events"/);
+  assert.match(ddl, /"id" BIGINT/);
+  const ins = sqlInsertBatch('app-events', ['id', 'name', 'latency', 'ok', 'meta'], sqlRows);
+  assert.match(ins, /9007199254740993, 'Ada''s "log"', 12\.5, TRUE, '\{"k":1\}'/);
+
+  // 3. LLM Conversation & Agent Trace Reader (OpenAI + Anthropic thinking/tool_use + DPO)
+  const oaiSample = parseJson(
+    JSON.stringify({
+      model: 'gpt-4o',
+      system: 'You are helpful.',
+      messages: [
+        { role: 'user', content: 'Run weather tool' },
+        {
+          role: 'assistant',
+          thinking: 'Need city weather',
+          content: '',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Tokyo"}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', name: 'get_weather', content: '{"temp":22}' },
+      ],
+      usage: { total_tokens: 128 },
+    }),
+  );
+  const conv = detectConversation(oaiSample);
+  assert.ok(conv);
+  assert.equal(conv.model, 'gpt-4o');
+  assert.equal(conv.actualTokens, 128);
+  assert.equal(conv.turns.length, 4);
+  const chatHtml = renderConversationHtml(conv);
+  assert.match(chatHtml, /chat-think/);
+  assert.match(chatHtml, /get_weather/);
+
+  const dpoSample = parseJson(JSON.stringify({ prompt: '2+2?', chosen: '4', rejected: '5' }));
+  const dpoConv = detectConversation(dpoSample);
+  assert.ok(dpoConv && dpoConv.turns.length === 3 && dpoConv.turns[1].role === 'chosen' && dpoConv.turns[2].role === 'rejected');
+
+  // 4. Pivot & Group-By aggregation (nested paths, share, sum/avg/p50/p95)
+  const pivRecords = [
+    parseJson('{"service":"auth","meta":{"tier":"pro"},"ms":10}'),
+    parseJson('{"service":"auth","meta":{"tier":"pro"},"ms":30}'),
+    parseJson('{"service":"pay","meta":{"tier":"free"},"ms":100}'),
+  ];
+  const paths = discoverFieldPaths(pivRecords);
+  assert.equal(paths.some((p) => p.label === 'meta.tier'), true);
+  const piv = computePivot(pivRecords, ['meta', 'tier'], ['ms'], 'count');
+  assert.equal(piv.groups.length, 2);
+  assert.equal(piv.groups[0].label, 'pro');
+  assert.equal(piv.groups[0].count, 2);
+  assert.equal(piv.groups[0].sum, 40);
+  assert.equal(piv.groups[0].avg, 20);
+  assert.equal(piv.groups[0].filterQuery, '.meta.tier == "pro"');
+
+  // 5. Schema-Aware Search & jq Autocomplete
+  const acRecs = [
+    parseJson('{"user":{"name":"Ada"},"level":"info"}'),
+    parseJson('{"user":{"name":"Grace"},"level":"error"}'),
+  ];
+  const fields = collectFieldCandidates(acRecs);
+  const dotSuggestions = getSearchCompletions('.u', 2, fields);
+  assert.equal(dotSuggestions.some((s) => s.insertText === '.user.name'), true);
+  const valSuggestions = getSearchCompletions('.level == ', 10, fields);
+  assert.equal(valSuggestions.some((s) => s.insertText === '"error"'), true);
+  const fnSuggestions = getSearchCompletions('sel', 3, fields);
+  assert.equal(fnSuggestions.some((s) => s.insertText === 'select('), true);
+});
+
+test('v0.9 data quality, dataset diff, trace waterfall, concatenated JSON stream & Brotli .br', async () => {
+  // 1. Data Quality & Duplicate / Anomaly Detector
+  const qLines = [
+    '{"id":1,"ms":10,"host":"h1"}',
+    '{"id":1,"ms":10,"host":"h1"}', // exact duplicate + dup id
+    '{"id":2,"ms":20,"host":"h1"}',
+    '{"id":3,"ms":25,"host":"h2"}',
+    '{"id":4,"ms":30,"host":"h2"}',
+    '{"id":5,"ms":"slow"}', // minority type drift on `ms` + missing `host`
+    '{broken',
+  ].join('\n');
+  const qm = new DocModel(qLines, true);
+  qm.parseSome(1000);
+  const qrep = analyzeDataQuality(qm);
+  assert.equal(qrep.issues.some((i) => i.kind === 'syntax' && i.recordIds.includes(6)), true);
+  assert.equal(qrep.issues.some((i) => i.kind === 'dup-line' && i.deletableIds?.includes(1)), true);
+  assert.equal(qrep.issues.some((i) => i.kind === 'dup-key' && i.title.includes('id')), true);
+  assert.equal(qrep.issues.some((i) => i.kind === 'type-drift' && i.title.includes('ms')), true);
+  assert.equal(qrep.issues.some((i) => i.kind === 'missing-field' && i.title.includes('host')), true);
+
+  // 2. Cross-File Dataset Diff (aligned by primary key `id`)
+  const leftRecs = parseDatasetRecords('{"id":"r1","ms":10,"status":200}\n{"id":"r2","ms":20,"status":200}\n');
+  const rightRecs = parseDatasetRecords('{"id":"r1","ms":15,"status":500}\n{"id":"r3","ms":30,"status":200}\n');
+  const ddiff = diffDatasets(leftRecs, rightRecs);
+  assert.equal(ddiff.keyField, 'id');
+  assert.deepEqual([ddiff.modified, ddiff.added, ddiff.removed], [1, 1, 1]);
+  assert.equal(ddiff.metrics.some((m) => m.field === 'ms'), true);
+
+  // 3. Trace / Request Waterfall View
+  const wfModel = new DocModel(
+    [
+      '{"ts":"2026-10-27T09:00:00.000Z","trace_id":"tr-99","service":"gateway","ms":120}',
+      '{"ts":"2026-10-27T09:00:00.020Z","trace_id":"tr-99","service":"db","ms":60,"level":"error"}',
+      '{"ts":"2026-10-27T09:00:01.000Z","trace_id":"tr-other","service":"gateway","ms":10}',
+    ].join('\n'),
+    true,
+  );
+  wfModel.parseSome(1000);
+  assert.equal(isTraceCandidate(['trace_id'], 'tr-99'), true);
+  const wf = buildTraceWaterfall(wfModel, ['trace_id'], 'tr-99');
+  assert.equal(wf.spans.length, 2);
+  assert.equal(wf.spans[0].offsetMs, 0);
+  assert.equal(wf.spans[1].offsetMs, 20);
+  assert.equal(wf.spans[1].isError, true);
+  assert.equal(wf.totalDurationMs, 120);
+
+  // 4. Concatenated multi-line JSON stream auto-detection & line mapping
+  const concatSrc = '{\n  "id": 1,\n  "name": "Ada"\n}\n{\n  "id": 2,\n  "name": "Alan"\n}\n';
+  const cm = new DocModel(concatSrc, false);
+  cm.parseSome(1000);
+  assert.equal(cm.isJsonl, true);
+  assert.equal(cm.concatenated, true);
+  assert.equal(cm.count, 2);
+  assert.deepEqual([cm.fileLine(0), cm.fileLine(1)], [0, 4]);
+  assert.deepEqual([cm.recordForFileLine(2), cm.recordForFileLine(5)], [0, 1]);
+
+  // 5. Brotli (.jsonl.br) replaceLine & mutateFileLines round-trip
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bj-br-'));
+  try {
+    const brFile = path.join(dir, 'events.jsonl.br');
+    fs.writeFileSync(brFile, zlib.brotliCompressSync(Buffer.from('{"id":1,"v":"a"}\n{"id":2,"v":"b"}\n', 'utf8')));
+    await replaceLine(brFile, 0, '{"id":1,"v":"a"}', '{"id":1,"v":"updated"}', { compression: 'brotli', encoding: 'utf-8' });
+    await mutateFileLines(brFile, { op: 'insert', after: 1, text: '{"id":3,"v":"c"}' }, { compression: 'brotli', encoding: 'utf-8' });
+    assert.equal(
+      zlib.brotliDecompressSync(fs.readFileSync(brFile)).toString('utf8'),
+      '{"id":1,"v":"updated"}\n{"id":2,"v":"b"}\n{"id":3,"v":"c"}\n',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('explicit state machines: OverlayController, QuerySyntaxMode, DocLifecycle, ExportStream & AX snapshot', () => {
+  // 1. QuerySyntaxMode prevents impossible {regex: true, literal: true} state
+  assert.equal(normalizeQuerySyntax(true, true), 'regex');
+  assert.equal(normalizeQuerySyntax(false, true), 'literal');
+  assert.equal(normalizeQuerySyntax(false, false), 'auto');
+  assert.equal(toggleQuerySyntax('regex', 'literal'), 'literal');
+  assert.equal(toggleQuerySyntax('literal', 'literal'), 'auto');
+  assert.deepEqual(syntaxToFlags('literal'), { regex: false, literal: true });
+
+  // 2. OverlayController enforces single-modal & single-popover exclusivity
+  const ov = new OverlayController();
+  assert.deepEqual(ov.openPopover('export-menu'), { closePopover: undefined });
+  assert.deepEqual(ov.openPopover('hist-menu'), { closePopover: 'export-menu' });
+  assert.equal(ov.popover, 'hist-menu');
+  const m1 = ov.openModal('schema', null);
+  assert.equal(m1.closePopover, 'hist-menu');
+  assert.equal(ov.popover, null);
+  assert.equal(ov.modal, 'schema');
+  const m2 = ov.openModal('pivot', null);
+  assert.equal(m2.closeModal, 'schema');
+  assert.equal(ov.modal, 'pivot');
+  assert.equal(ov.closeModal('schema').closeModal, undefined); // non-matching close is a safe no-op
+  assert.equal(ov.closeModal('pivot').closeModal, 'pivot');
+  assert.equal(ov.hasModal, false);
+
+  // 3. ExportStreamState cancels any superseded in-flight export
+  const e0 = startExportStream({ kind: 'idle' }, 1, 'csv', () => null);
+  assert.equal(e0.cancelPreviousId, undefined);
+  const e1 = startExportStream(e0.nextState, 2, 'sql', () => null);
+  assert.equal(e1.cancelPreviousId, 1);
+  assert.equal(e1.nextState.kind === 'streaming' && e1.nextState.id, 2);
+
+  // 4. DocLifecyclePhase & AX machine snapshot
+  assert.equal(
+    deriveDocLifecycle({ hasViews: false, hasLoadStore: true, parsingJson: false, bootError: false, modelLoading: false, modelComplete: false }),
+    'streaming',
+  );
+  assert.equal(
+    deriveDocLifecycle({ hasViews: true, hasLoadStore: false, parsingJson: false, bootError: false, modelLoading: false, modelComplete: false }),
+    'scanning',
+  );
+  assert.equal(
+    deriveDocLifecycle({ hasViews: true, hasLoadStore: false, parsingJson: false, bootError: false, modelLoading: false, modelComplete: true }),
+    'ready',
+  );
+  const snap = buildMachineSnapshot({
+    lifecycle: 'ready',
+    querySyntax: 'auto',
+    projection: 'projected',
+    searching: false,
+    awaitingModules: false,
+    modal: null,
+    popover: null,
+    mutation: 'idle',
+    exporting: false,
+  });
+  assert.deepEqual(snap, {
+    lifecycle: 'ready',
+    querySyntax: 'auto',
+    projection: 'projected',
+    search: 'idle',
+    modal: null,
+    popover: null,
+    mutation: 'idle',
+    export: 'idle',
+  });
 });

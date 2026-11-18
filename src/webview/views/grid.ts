@@ -8,11 +8,13 @@ import {
   decodeKey,
   entriesHead,
   esc,
+  getAt,
   isArr,
   isContainer,
   isObj,
   kindOf,
   parseNumLiteral,
+  parsePath,
   pathToString,
   plainText,
   primClass,
@@ -24,6 +26,7 @@ import {
 } from '../json';
 import { icon } from '../icons';
 import { lowerBound, type Parsed } from '../model';
+import { formatPathLabel } from '../pivot';
 import { compactJson } from '../query';
 
 /** Browsers cap element height near 33.5M px. Above this the scroll space is scaled. */
@@ -45,8 +48,24 @@ const VALUE_COL = ESC + 'v';
 /** The two columns of a root object. */
 const OKEY = ESC + 'k';
 const OVAL = ESC + 'o';
+/** A nested JSON path promoted to a top-level column (`\u0001p` + `pathKey`). */
+const PROM = ESC + 'p';
 const colId = (key: string): string => (key.startsWith(ESC) ? ESC + key : key);
 const keyOf = (id: string): string => (id.startsWith(ESC) ? id.slice(1) : id);
+export const promotedColId = (path: readonly (string | number)[]): string =>
+  PROM + path.reduce<string>((acc, seg) => childKey(acc, seg), '');
+export const isPromotedCol = (col: string): boolean => col.startsWith(PROM);
+const promotedPathKey = (col: string): string => col.slice(PROM.length);
+const promotedSegCache = new Map<string, (string | number)[]>();
+function promotedSegs(col: string): (string | number)[] {
+  let segs = promotedSegCache.get(col);
+  if (!segs) {
+    if (promotedSegCache.size > 1000) promotedSegCache.clear();
+    segs = decodeKey(promotedPathKey(col));
+    promotedSegCache.set(col, segs);
+  }
+  return segs;
+}
 /**
  * JSON Lines whose records are not all kept in memory (large files): above this many rows,
  * sorting and column filters first read the values of the columns they need, in the background.
@@ -182,6 +201,7 @@ export class GridView implements View {
     this.rowsEl.addEventListener('mouseover', (e) => this.onHover(e));
     window.addEventListener('pointermove', (e) => this.onDrag(e), { signal });
     window.addEventListener('pointerup', () => (this.dragging = null), { signal });
+    window.addEventListener('pointercancel', () => (this.dragging = null), { signal });
     this.scroll.addEventListener(
       'scroll',
       () => {
@@ -324,7 +344,7 @@ export class GridView implements View {
     this.colJob?.stop();
     const n = m.count;
     const arrays = cols.map(() => new Array<Cell>(n));
-    const keys = cols.map((c) => (c === VALUE_COL ? null : keyOf(c)));
+    const keys = cols.map((c) => (c === VALUE_COL ? null : isPromotedCol(c) ? promotedSegs(c) : keyOf(c)));
     let i = 0;
     let stop = () => undefined as void;
     const job = { cols, stop: () => stop() };
@@ -337,7 +357,18 @@ export class GridView implements View {
         const v = m.scanValue(i);
         for (let k = 0; k < cols.length; k++) {
           const key = keys[k];
-          const cell = v === undefined ? undefined : key === null ? (isObj(v) ? undefined : v) : isObj(v) && Object.prototype.hasOwnProperty.call(v, key) ? v[key] : undefined;
+          const cell =
+            v === undefined
+              ? undefined
+              : key === null
+                ? isObj(v)
+                  ? undefined
+                  : v
+                : Array.isArray(key)
+                  ? getAt(v, key)
+                  : isObj(v) && Object.prototype.hasOwnProperty.call(v, key)
+                    ? v[key]
+                    : undefined;
           arrays[k][i] = shapeOf(cell);
         }
         if ((i & 255) === 255 && performance.now() > end) {
@@ -370,6 +401,7 @@ export class GridView implements View {
     if (col === VALUE_COL) return t('(value)');
     if (col === OKEY) return t('key');
     if (col === OVAL) return t('value');
+    if (isPromotedCol(col)) return formatPathLabel(promotedSegs(col));
     return keyOf(col);
   }
 
@@ -431,7 +463,7 @@ export class GridView implements View {
   }
 
   fillReport(r: RenderReport): void {
-    const name = (c: string) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : keyOf(c));
+    const name = (c: string) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : isPromotedCol(c) ? this.label(c) : keyOf(c));
     const filters: Record<string, { text: string; exclude: number }> = {};
     for (const [c, f] of this.activeFilters()) filters[name(c)] = { text: f.text, exclude: f.exclude.size };
     r.grid = { rows: this.rowIds.length, columns: this.cols.map(name), openCells: this.app.state.grid.open.size, unfiltered: this.baseIds.length, filters };
@@ -467,6 +499,10 @@ export class GridView implements View {
     const p = this.record(id);
     if (p.kind !== 'value') return undefined;
     if (col === VALUE_COL) return isObj(p.value) ? undefined : p.value;
+    if (isPromotedCol(col)) {
+      const unp = this.app.unpackedOf(id);
+      return unp.size > 0 ? resolveAtPathKey(p.value, promotedPathKey(col), unp) : getAt(p.value, promotedSegs(col));
+    }
     if (!isObj(p.value)) return undefined;
     const key = keyOf(col);
     return Object.prototype.hasOwnProperty.call(p.value, key) ? p.value[key] : undefined;
@@ -474,17 +510,19 @@ export class GridView implements View {
 
   private buildVisibleCols(raw: string[]): void {
     const g = this.app.state.grid;
-    this.rawCols = raw;
+    const promoted = g.promotedCols;
+    const combined = promoted.length ? [...raw, ...promoted.filter((c) => !raw.includes(c))] : raw;
+    this.rawCols = combined;
     const hidden = g.hiddenCols;
     const pinned = g.pinnedCols;
     const order = g.colOrder;
-    const rawSet = new Set(raw);
+    const rawSet = new Set(combined);
     this.hiddenCount = 0;
     for (const h of hidden) if (rawSet.has(h)) this.hiddenCount++;
 
-    if (!order.length && !hidden.size && !pinned.size) {
-      this.cols = raw.slice(0, MAX_COLUMNS);
-      this.colsCut = raw.length > MAX_COLUMNS;
+    if (!order.length && !hidden.size && !pinned.size && !promoted.length) {
+      this.cols = combined.slice(0, MAX_COLUMNS);
+      this.colsCut = combined.length > MAX_COLUMNS;
       return;
     }
 
@@ -496,10 +534,10 @@ export class GridView implements View {
         ordered.push(c);
       }
     }
-    for (let i = 0; i < raw.length; i++) {
-      const c = raw[i];
+    for (let i = 0; i < combined.length; i++) {
+      const c = combined[i];
       if (seen.has(c)) continue;
-      if (i < MAX_COLUMNS || pinned.has(c)) {
+      if (i < MAX_COLUMNS || pinned.has(c) || isPromotedCol(c)) {
         seen.add(c);
         ordered.push(c);
       }
@@ -508,7 +546,7 @@ export class GridView implements View {
     const pinList = shown.filter((c) => pinned.has(c));
     const unpinList = shown.filter((c) => !pinned.has(c));
     this.cols = [...pinList, ...unpinList];
-    this.colsCut = raw.length > seen.size;
+    this.colsCut = combined.length > seen.size;
   }
 
   private layout(): void {
@@ -878,6 +916,7 @@ export class GridView implements View {
   private cellPath(id: number, col: string): string {
     if (this.mode === 'object') return childKey('', this.objKeys[id]);
     if (col === VALUE_COL) return '';
+    if (isPromotedCol(col)) return promotedPathKey(col);
     return childKey('', keyOf(col));
   }
 
@@ -1197,7 +1236,7 @@ export class GridView implements View {
     if (!app.canEditCells || col === NUM || col === OKEY || rec.kind !== 'value') return false;
     const v = this.cell(id, col);
     if (v === undefined) {
-      if (col === VALUE_COL || this.mode !== 'records' || !isObj(rec.value)) return false;
+      if (col === VALUE_COL || isPromotedCol(col) || this.mode !== 'records' || !isObj(rec.value)) return false;
       const key = keyOf(col);
       return this.openOverlayInput(cellEl, this.label(col), '', false, (text) => {
         app.insertMissingCell(id, this.recordPath(id, childKey('', key)), key, text);
@@ -1244,14 +1283,14 @@ export class GridView implements View {
   // ---------- export ----------
 
   /** The rows on screen (after search, filters and sort), for an export. */
-  exportSource(): { ids: number[]; header: string[]; line(id: number): string; cells(id: number): string[] } {
+  exportSource(): { ids: number[]; header: string[]; line(id: number): string; cells(id: number): string[]; values(id: number): (JVal | undefined)[] } {
     this.layout();
     const m = this.app.model;
     const g = this.app.state.grid;
-    const customCols = g.hiddenCols.size > 0 || g.colOrder.length > 0 || g.pinnedCols.size > 0;
+    const customCols = g.hiddenCols.size > 0 || g.colOrder.length > 0 || g.pinnedCols.size > 0 || g.promotedCols.length > 0;
     const cols = !customCols && this.mode === 'records' && this.rawCols.length > this.cols.length ? this.rawCols : this.cols;
     const root = this.rootValue();
-    const header = cols.map((c) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : keyOf(c)));
+    const header = cols.map((c) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : isPromotedCol(c) ? this.label(c) : keyOf(c)));
     return {
       ids: [...this.rowIds],
       header,
@@ -1262,6 +1301,7 @@ export class GridView implements View {
         return p.kind === 'value' ? compactJson(p.value) : '';
       },
       cells: (id) => cols.map((c) => cellText(this.cell(id, c))),
+      values: (id) => cols.map((c) => this.cell(id, c)),
     };
   }
 
@@ -1273,10 +1313,16 @@ export class GridView implements View {
       return;
     }
     this.closeFilter();
+    this.app.onPopoverOpened('col-picker');
     this.colSearch = '';
     this.cpel.innerHTML = `
       <div class="gf-title">${icon('columns', 13)}<span>${esc(t('Columns'))}</span></div>
       <label class="search gf-search">${icon('search')}<span class="sr">${esc(t('Filter columns'))}</span><input type="search" data-csearch placeholder="${esc(t('Filter columns'))}" spellcheck="false"></label>
+      <div class="cp-add">
+        <input type="text" class="mono" data-cpromote-in placeholder="${esc(t('Add nested path (e.g. user.name)'))}" aria-label="${esc(t('Add nested path (e.g. user.name)'))}" spellcheck="false">
+        <button class="btn" data-cpromote-btn>${esc(t('Add'))}</button>
+        <button class="btn" data-cflatten title="${esc(t('Flatten 1 level'))}">${esc(t('Flatten 1 level'))}</button>
+      </div>
       <div class="gf-list cp-list" role="group"></div>
       <div class="gf-foot">
         <button class="btn" data-cshowall>${esc(t('Show all'))}</button>
@@ -1285,6 +1331,13 @@ export class GridView implements View {
         <span class="dim cp-count"></span>
       </div>`;
     this.cpel.hidden = false;
+    const promIn = this.cpel.querySelector('[data-cpromote-in]') as HTMLInputElement;
+    promIn.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        this.promoteFromInput();
+      }
+    });
     this.paintColPickerList();
     this.placeColPicker();
     (this.cpel.querySelector('[data-csearch]') as HTMLInputElement).focus();
@@ -1294,6 +1347,7 @@ export class GridView implements View {
     if (this.cpel.hidden) return;
     this.cpel.hidden = true;
     this.cpel.innerHTML = '';
+    this.app.onPopoverClosed('col-picker');
     this.app.paintChrome();
     if (focusBtn) (document.querySelector('.cols-btn') as HTMLElement | null)?.focus();
   }
@@ -1323,8 +1377,12 @@ export class GridView implements View {
       const checked = visibleSet.has(c);
       const pinned = g.pinnedCols.has(c);
       const name = this.label(c);
+      const rmBtn = isPromotedCol(c)
+        ? `<button class="icon-btn cp-act" data-cremove="${esc(c)}" title="${esc(t('Remove promoted column'))}">${icon('close', 11)}</button>`
+        : '';
       return `<div class="cp-row" data-ccol="${esc(c)}">
         <label class="cp-lbl" title="${esc(name)}"><input type="checkbox" data-ctoggle="${esc(c)}"${checked ? ' checked' : ''}><span class="gf-v">${esc(name)}</span></label>
+        ${rmBtn}
         <button class="icon-btn cp-act${pinned ? ' on' : ''}" data-cpin="${esc(c)}" title="${esc(t(pinned ? 'Unpin column' : 'Pin column to left'))}" aria-pressed="${pinned}">${icon('pin', 12)}</button>
         <button class="icon-btn cp-act" data-cmove="-1" data-cc="${esc(c)}" title="${esc(t('Move column left'))}">${icon('chev-left', 12)}</button>
         <button class="icon-btn cp-act" data-cmove="1" data-cc="${esc(c)}" title="${esc(t('Move column right'))}">${icon('chev-right', 12)}</button>
@@ -1369,16 +1427,74 @@ export class GridView implements View {
     this.app.stateChanged();
   }
 
+  private promoteFromInput(): void {
+    const input = this.cpel.querySelector('[data-cpromote-in]') as HTMLInputElement | null;
+    if (!input) return;
+    const raw = input.value.trim();
+    if (!raw) return;
+    const path = parsePath(raw.startsWith('.') ? '$' + raw : raw);
+    if (!path || !path.length) return;
+    this.app.promoteNestedColumn(path, true);
+    input.value = '';
+    this.paintColPickerList();
+  }
+
+  private flattenOneLevel(): void {
+    const m = this.app.model;
+    const g = this.app.state.grid;
+    const added: string[] = [];
+    const sampleCount = m.isJsonl ? Math.min(m.count, 200) : 1;
+    for (let i = 0; i < sampleCount; i++) {
+      const rec = m.isJsonl ? m.scanValue(i) : this.rootValue();
+      const items = !m.isJsonl && rec && isArr(rec) ? rec.slice(0, 200) : rec ? [rec] : [];
+      for (const item of items) {
+        if (!isObj(item)) continue;
+        for (const topKey of Object.keys(item as JObj)) {
+          const childVal = (item as JObj)[topKey];
+          if (!isObj(childVal)) continue;
+          for (const subKey of Object.keys(childVal as JObj)) {
+            const cid = promotedColId([topKey, subKey]);
+            if (!g.promotedCols.includes(cid) && g.promotedCols.length + added.length < 200) {
+              g.promotedCols.push(cid);
+              added.push(cid);
+            }
+          }
+        }
+      }
+    }
+    if (added.length) {
+      const ord = this.ensureColOrder();
+      for (const cid of added) {
+        g.hiddenCols.delete(cid);
+        if (!ord.includes(cid)) ord.push(cid);
+      }
+    }
+  }
+
   private onColPickerClick(e: MouseEvent): void {
     const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
     if (!btn) return;
     const g = this.app.state.grid;
-    if (btn.hasAttribute('data-cshowall')) {
+    if (btn.hasAttribute('data-cpromote-btn')) {
+      this.promoteFromInput();
+      return;
+    }
+    if (btn.hasAttribute('data-cflatten')) {
+      this.flattenOneLevel();
+    } else if (btn.dataset.cremove !== undefined) {
+      const col = btn.dataset.cremove;
+      g.promotedCols = g.promotedCols.filter((c) => c !== col);
+      g.pinnedCols.delete(col);
+      g.hiddenCols.delete(col);
+      g.colOrder = g.colOrder.filter((c) => c !== col);
+      g.filters.delete(col);
+    } else if (btn.hasAttribute('data-cshowall')) {
       g.hiddenCols.clear();
       g.colOrder = this.rawCols.slice(0, Math.max(MAX_COLUMNS, this.rawCols.length));
     } else if (btn.hasAttribute('data-creset')) {
       g.hiddenCols.clear();
       g.pinnedCols.clear();
+      g.promotedCols = [];
       g.colOrder = [];
       g.widths = {};
     } else if (btn.dataset.cpin !== undefined) {
@@ -1496,6 +1612,7 @@ export class GridView implements View {
 
   private openFilter(col: string): void {
     this.closeColPicker();
+    this.app.onPopoverOpened('grid-filter');
     this.fcol = col;
     this.fvalues = this.valuesOf(col);
     const f = this.app.state.grid.filters.get(col);
@@ -1528,6 +1645,7 @@ export class GridView implements View {
 
   closeFilter(focusGrid = false): void {
     if (this.fcol === null) return;
+    this.app.onPopoverClosed('grid-filter');
     clearTimeout(this.ftimer);
     const col = this.fcol;
     this.fcol = null;

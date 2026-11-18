@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- **Promote & Flatten Nested Paths to Grid Columns**: right-click any nested field (`Add as Grid column`) or use the Grid **Columns** manager (`Add nested path`, `Flatten 1 level`) to promote nested paths like `user.name` or `usage.total_tokens` into first-class sortable, filterable, pinnable, and exportable Grid columns.
+- **Interactive Pivot & Group-By Summary**: group records by any top-level or nested path and compute `Count`, `Share %`, `Sum`, `Avg`, `Min`, `p50`, `p95`, and `Max`, with one-click row drill-down filtering and Copy as Markdown or TSV.
+- **Schema-Aware Search & `jq` Autocomplete**: live completion menu in the search bar suggesting discovered field paths (`.user.name`, `$.user.name`, `level=`), observed enum values, and `jq` built-in functions (`Tab` or `Enter` to accept).
+- **LLM Conversation & Agent Trace Reader**: auto-detects OpenAI / ChatML `messages`, Anthropic `thinking` + `tool_use` / `tool_result`, Gemini `contents` / `parts`, SFT / DPO `prompt` / `completion` / `chosen` / `rejected`, and agent trajectory steps, adding an inline `Chat (N)` pill and a formatted **Chat** tab in the Value Inspector.
+- **Data Quality, Anomaly & Duplicate Detector**: single-pass $O(N)$ scanner with 64-bit dual-hash fingerprinting that detects JSON syntax errors, exact duplicate lines, duplicate primary keys (`id`, `uuid`, or custom column), minority type-drift outliers, and missing core fields — with one-click **Filter N lines** and **Delete N duplicates**.
+- **Cross-File Dataset Comparison (`betterJsonl.compareFiles`)**: compare the open dataset against another `.jsonl`, `.json`, `.gz`, or `.br` file aligned by primary key or line number, showing `+Added`, `-Removed`, and `~Modified` field diffs, numeric metric deltas, and **Open in the diff editor**.
+- **Trace / Request Waterfall View**: right-click any `trace_id` / `request_id` / `session_id` / `correlation_id` field (`Trace call flow`) to correlate matching spans chronologically in a Gantt waterfall with offset, duration bars, error highlights, click-to-jump, and **Filter to trace**.
+- **Go to Line / `%` / Timestamp (`Cmd/Ctrl+G`) & Full Paging**: press `Cmd/Ctrl+G` (or click `Line N` in the status bar) to jump by line number (`42`), file percentage (`50%`), or timestamp (`09:15:00` / ISO-8601), plus `Home`, `End`, `PageUp`, and `PageDown` navigation in Formatted and Grid views.
+- **PII & Secret Redaction**: right-click **Copy redacted JSON** or enable **Redact secrets & PII** in the Export menu to mask sensitive keys, Bearer tokens, JWTs, API keys (`sk-…`, `ghp_…`, `AKIA…`), URL secret query parameters, and email addresses while preserving structure and token counts.
+- **TSV Copy, SQL Export, Brotli (`.br`) & Concatenated JSON Streams**: added one-click **Copy as TSV (Excel / Sheets)**, streaming **TSV (`.tsv`)** and **SQL (`CREATE TABLE` + `INSERT`, `.sql`)** exports, native `.jsonl.br` / `.ndjson.br` / `.jsonlines.br` / `.json.br` streaming & record-by-record editing, and `jq`-style concatenated multi-line JSON stream auto-detection with exact source-line mapping.
+- **Explicit State Machines & UX/DX/AX Hardening**: unified modal/popover exclusivity with WCAG `Tab` focus trapping and focus return (`OverlayController`), normalized `QuerySyntaxMode`, deterministic mutation & export stream machines, DOM `data-lifecycle` / `data-modal` attributes + `RenderReport.machines` + `api.inspect()`, toolbar visual grouping, memoized string-JSON unpacking, and zero-allocation lazy record iterators.
+
 ## 0.8.0
 
 - **Nested JSON-in-String Unpack**: string values containing serialized JSON (`"{...}"`, `"[...]"`, or multi-line JSONL) get an inline `JSON {N}` / `JSON [N]` unpack pill in Formatted and Grid views (plus right-click **Unpack JSON**) so double-encoded logs, tool calls, and webhook payloads expand in place without modifying the file.
