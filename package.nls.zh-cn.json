@@ -13,6 +13,7 @@
   "command.compactLines": "Better JSONL: 压缩行（每行一条记录）",
   "command.convertFormat": "Better JSONL: 转换 JSON 数组 ↔ JSON Lines",
   "command.compareFiles": "Better JSONL: 与另一个 JSON/JSONL 文件对比…",
+  "command.mergeFiles": "Better JSONL: 合并打开多个 JSON/JSONL 文件…",
   "config.defaultView": "打开时显示的视图。",
   "config.defaultView.formatted": "格式化卡片（JSONL 可选聚焦或全部展开）。",
   "config.defaultView.grid": "记录表格，嵌套值可展开为子表格。",

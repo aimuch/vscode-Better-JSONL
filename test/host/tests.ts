@@ -92,6 +92,7 @@ describe('Better JSONL · extension host', () => {
       'betterJsonl.compactLines',
       'betterJsonl.convertFormat',
       'betterJsonl.compareFiles',
+      'betterJsonl.mergeFiles',
     ]) {
       assert.ok(all.includes(id), id);
     }
@@ -945,6 +946,34 @@ describe('Better JSONL · extension host', () => {
       assert.strictEqual(cs.snapshot().concatenated, true);
       await cs.handle({ type: 'reveal', line: 4, path: ['name'] });
       assert.strictEqual(concatDoc.getText(editor.selection), '"name": "Grace"');
+    } finally {
+      removeDir(dir);
+    }
+  });
+
+  it('H36 v1.0 Multi-File Merge Viewer (betterJsonl.mergeFiles) & pickSchema handshake', async function () {
+    this.timeout(30000);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'better-jsonl-v10-'));
+    try {
+      const f1 = path.join(dir, 'shard-1.jsonl');
+      const f2 = path.join(dir, 'shard-2.jsonl');
+      fs.writeFileSync(f1, '{"id":1,"v":"a"}\n');
+      fs.writeFileSync(f2, '{"id":2,"v":"b"}\n');
+      const merged = (await vscode.commands.executeCommand('betterJsonl.mergeFiles', undefined, [
+        vscode.Uri.file(f1),
+        vscode.Uri.file(f2),
+      ])) as ViewerSession | undefined;
+      assert.ok(merged, 'mergeFiles returned a ViewerSession');
+      const mr = await merged!.waitForReport((x) => x.stats.valid === 2 && parsed(x), 15000);
+      assert.strictEqual(mr.stats.lines, 2);
+      assert.ok(mr.activeText?.includes('"_file":"shard-1.jsonl"'), `activeText=${mr.activeText}`);
+
+      // Test pickSchema -> schemaLoaded host handshake.
+      const schemaPath = path.join(dir, 'test.schema.json');
+      fs.writeFileSync(schemaPath, JSON.stringify({ type: 'object', required: ['id'] }));
+      merged!.testSchemaTarget = vscode.Uri.file(schemaPath);
+      await merged!.handle({ type: 'pickSchema' });
+      merged!.panel.dispose();
     } finally {
       removeDir(dir);
     }

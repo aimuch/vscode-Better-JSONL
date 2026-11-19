@@ -1740,6 +1740,92 @@ await scenario('W53', 'v0.9 features: promoted nested Grid columns, Pivot summar
   check.eq('Escape closes modal and returns focus to initial trigger button', await page.evaluate(() => document.activeElement?.classList.contains('schema-btn')), true);
 });
 
+await scenario('W54', 'v1.0 SQL mode, 2D Cross-Tab, Charts, Schema Validation, Grid Computed/MultiSort/Footer, Go/Rust/DuckDB, Image Preview & Palette', [], async ({ page, check, shot }) => {
+  const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  const v10Sample = [
+    JSON.stringify({ id: 1, service: 'auth', region: 'us', ms: 40, img: tinyPng, messages: [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello A' }] }),
+    JSON.stringify({ id: 2, service: 'auth', region: 'eu', ms: 80, messages: [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Bonjour A' }] }),
+    JSON.stringify({ id: 3, service: 'pay', region: 'us', ms: 120 }),
+    JSON.stringify({ id: 4, service: 'pay', region: 'us', ms: 200 }),
+  ].join('\n');
+  await open(page, 'v10.jsonl', { isJsonl: true, text: v10Sample });
+  let r = await complete(page);
+  check.eq('v10 sample loaded', r.stats.valid, 4);
+
+  // 1. Lightweight SQL Query Mode (F1)
+  await page.fill('.search input', 'SELECT service, COUNT(*) AS n, AVG(ms) AS avg_ms GROUP BY service ORDER BY avg_ms DESC');
+  r = await report(page, (x) => x.stats.lines === 2);
+  check.eq('SQL GROUP BY projects 2 aggregated rows', r.stats.lines, 2);
+  await page.click('[data-exit-xform]');
+  await page.fill('.search input', '');
+  r = await report(page, (x) => x.stats.lines === 4);
+
+  // 2. 2D Cross-Tab Pivot Matrix (F2)
+  await page.click('.pivot-btn');
+  await page.locator('.pivotpanel').waitFor({ state: 'visible' });
+  await page.selectOption('[data-piv-group]', 'service');
+  await page.selectOption('[data-piv-col]', 'region');
+  check.ok('2D Cross-Tab matrix renders piv-xtab table', (await page.locator('.pivotpanel .piv-xtab').count()) === 1);
+  await page.keyboard.press('Escape');
+
+  // 3. Interactive Charts Explorer (F3)
+  await page.click('.charts-btn');
+  await page.locator('.charts-panel').waitFor({ state: 'visible' });
+  await page.selectOption('[data-ch-kind]', 'scatter');
+  check.ok('Scatter plot renders SVG circles', (await page.locator('.charts-panel .ch-dot').count()) >= 1);
+  await shot('v1.0 Interactive Charts Explorer');
+  await page.keyboard.press('Escape');
+
+  // 4. JSON Schema Validation modal (F7)
+  await page.click('.validate-btn');
+  await page.locator('.validate-panel').waitFor({ state: 'visible' });
+  await page.fill('.val-input', JSON.stringify({ type: 'object', properties: { ms: { type: 'number', maximum: 150 } } }));
+  await page.click('[data-val-run]');
+  check.ok('Schema validation flags 1 invalid record', (await page.locator('.val-results').innerText()).includes('1 invalid'));
+  await page.keyboard.press('Escape');
+
+  // 5. Grid Computed Virtual Column (F4) + Multi-Column Sort (F2) + Pinned Summary Footer (O6)
+  await tabBtn(page, 'grid').click();
+  await report(page, (x) => x.view === 'grid');
+  await page.click('.cols-btn');
+  await page.fill('[data-ccomp-name]', 'double_ms');
+  await page.fill('[data-ccomp-expr]', '.ms * 2');
+  await page.click('[data-ccomp-btn]');
+  await page.click('[data-cfooter]');
+  r = await report(page, (x) => x.grid.columns.some((c) => c.includes('double_ms')));
+  check.ok('Computed virtual column added to Grid', r.grid.columns.some((c) => c.includes('double_ms')));
+  check.ok('Pinned summary footer is visible', await page.locator('.gfoot').isVisible());
+  await page.keyboard.press('Escape');
+  await page.click('.gh[data-col="service"]');
+  await page.click('.gh[data-col="ms"]', { modifiers: ['Shift'] });
+  check.ok('Multi-column sort shows priority badges', (await page.locator('.gh .sort-ord').count()) === 2);
+
+  // 6. Extended Schema Generators (Go / Rust / DuckDB / Polars) (F9)
+  await page.click('.schema-btn');
+  await page.click('.schemapanel [data-stab="go"]');
+  check.ok('Go struct generated', (await page.locator('.schemapanel .sp-code').innerText()).includes('type V10 struct'));
+  await page.click('.schemapanel [data-stab="rust"]');
+  check.ok('Rust serde generated', (await page.locator('.schemapanel .sp-code').innerText()).includes('pub struct V10'));
+  await page.click('.schemapanel [data-stab="duckdb"]');
+  check.ok('DuckDB snippet generated', (await page.locator('.schemapanel .sp-code').innerText()).includes('read_json_auto'));
+  await page.keyboard.press('Escape');
+
+  // 7. Command Palette (?) (O5) + Responsive Narrow Toolbar (O5)
+  await page.click('.palette-btn');
+  await page.locator('.palette-panel').waitFor({ state: 'visible' });
+  check.ok('Command palette lists commands', (await page.locator('.pal-item').count()) >= 10);
+  await page.keyboard.press('Escape');
+
+  // 8. LLM Eval Side-by-Side in Dataset Diff (F8)
+  const otherEval = JSON.stringify({ id: 1, service: 'auth', region: 'us', ms: 42, messages: [{ role: 'user', content: 'Hi' }, { role: 'assistant', content: 'Hello Model B' }] });
+  await send(page, { type: 'fileDiff', otherName: 'model-b.jsonl', otherText: otherEval });
+  await page.locator('.filediffpanel').waitFor({ state: 'visible' });
+  await page.selectOption('[data-fd-align]', 'k:id');
+  await page.locator('[data-fd-eval]').first().click();
+  check.ok('LLM Eval Side-by-Side renders Model A vs Model B', (await page.locator('.eval-sbs').innerText()).includes('Hello Model B'));
+  await page.keyboard.press('Escape');
+});
+
 await browser.close();
 server.close();
 

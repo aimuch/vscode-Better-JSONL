@@ -351,3 +351,23 @@ export function formatDecodedSummary(d: DecodedInfo): string {
   if (d.kind === 'base64') return d.text.slice(0, 200);
   return d.decoded.slice(0, 200);
 }
+
+const DATA_IMAGE_RE = /^data:image\/(png|jpeg|jpg|gif|webp|bmp|avif);base64,[A-Za-z0-9+/=\s]{16,}$/i;
+
+/** Detects a safe inline base64 image data URI (excludes SVG to prevent script injection). */
+export function detectImageDataUrl(s: string): { mime: string; approxBytes: number; src: string } | null {
+  if (s.length < 32 || s.length > 8_000_000) return null;
+  const trimmed = s.trim();
+  const m = DATA_IMAGE_RE.exec(trimmed);
+  if (!m) return null;
+  const comma = trimmed.indexOf(',');
+  const b64Len = trimmed.length - comma - 1;
+  return { mime: `image/${m[1].toLowerCase()}`, approxBytes: Math.floor((b64Len * 3) / 4), src: trimmed };
+}
+
+export function renderImagePreviewHtml(s: string): string | null {
+  const info = detectImageDataUrl(s);
+  if (!info) return null;
+  const kb = (info.approxBytes / 1024).toFixed(1);
+  return `<div class="img-preview"><div class="img-meta"><span class="badge">${esc(info.mime)}</span><span class="dim">~${kb} KB</span></div><img class="img-thumb" src="${esc(info.src)}" alt="${esc(info.mime)} preview"></div>`;
+}

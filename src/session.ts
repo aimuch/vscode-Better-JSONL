@@ -17,6 +17,7 @@ import {
   readAllUtf8,
   readUtf8,
   replaceLine,
+  streamDiffFiles,
   TAIL,
   type Compression,
   type FileState,
@@ -163,6 +164,10 @@ export class ViewerSession implements vscode.Disposable {
   testExportTarget: vscode.Uri | undefined;
   /** The E2E tests set this: compareWithFile reads this URI without opening a file picker. */
   testCompareTarget: vscode.Uri | undefined;
+  /** The E2E tests set this: pickSchemaFile reads this URI without opening a file picker. */
+  testSchemaTarget: vscode.Uri | undefined;
+  /** Virtual in-memory read-only dataset (used by Multi-File Merge Viewer). */
+  private virtualDoc: { title: string; text: string } | undefined;
   /** What the webview shows the document as. The webview decides (a .json file can hold JSON Lines). */
   private jsonl = false;
   private concatenated = false;
@@ -424,6 +429,18 @@ export class ViewerSession implements vscode.Disposable {
   }
 
   private sendInit(): void {
+    if (this.virtualDoc) {
+      const { title, text } = this.virtualDoc;
+      this.post({
+        type: 'init',
+        doc: { uri: `better-jsonl-merged://${encodeURIComponent(title)}`, fileName: title, languageId: 'jsonl', isJsonl: true, host: this.host, readOnly: true },
+        text,
+        bytes: Buffer.byteLength(text, 'utf8'),
+        version: ++this.generation,
+        config: readConfig(),
+      });
+      return;
+    }
     const uri = this.uri;
     if (!uri) return;
     clearTimeout(this.updateTimer);
@@ -786,6 +803,9 @@ export class ViewerSession implements vscode.Disposable {
           break;
         case 'compareWithFile':
           await this.compareWithFile();
+          break;
+        case 'pickSchema':
+          await this.pickSchemaFile();
           break;
         case 'readModules':
           this.post({ type: 'modules', files: await this.readModules(m.keys) });
@@ -1189,6 +1209,41 @@ export class ViewerSession implements vscode.Disposable {
     }
   }
 
+  /** Binds a virtual merged read-only JSONL dataset to this session. */
+  bindVirtual(title: string, text: string): void {
+    this.watcher?.dispose();
+    this.watcher = undefined;
+    this.doc = undefined;
+    this.large = undefined;
+    this.uri = undefined;
+    this.virtualDoc = { title, text };
+    this.jsonl = true;
+    this.concatenated = false;
+    this.panel.title = title;
+    if (this.ready) this.sendInit();
+  }
+
+  async pickSchemaFile(): Promise<void> {
+    let chosen = this.testSchemaTarget;
+    if (!chosen) {
+      const defaultUri = this.uri && this.uri.scheme === 'file' ? vscode.Uri.joinPath(this.uri, '..') : undefined;
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        defaultUri,
+        openLabel: t('Select JSON Schema file'),
+        filters: { 'JSON Schema': ['json'] },
+      });
+      chosen = picked?.[0];
+    }
+    if (!chosen) return;
+    try {
+      const text = await readAllUtf8(chosen, 10 * 1024 * 1024);
+      this.post({ type: 'schemaLoaded', name: path.posix.basename(chosen.path), text });
+    } catch (e) {
+      void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', errorMessage(e)));
+    }
+  }
+
   async compareWithFile(otherUri?: vscode.Uri): Promise<void> {
     let chosen = otherUri ?? this.testCompareTarget;
     if (!chosen) {
@@ -1198,13 +1253,25 @@ export class ViewerSession implements vscode.Disposable {
         defaultUri,
         openLabel: t('Select JSON / JSONL file to compare'),
         filters: {
-          'JSON / JSON Lines': ['jsonl', 'ndjson', 'jsonlines', 'json', 'jsonc', 'gz', 'br'],
+          'JSON / JSON Lines': ['jsonl', 'ndjson', 'jsonlines', 'json', 'jsonc', 'gz', 'br', 'zst'],
         },
       });
       chosen = picked?.[0];
     }
     if (!chosen) return;
     try {
+      let otherSize = 0;
+      try {
+        otherSize = (await vscode.workspace.fs.stat(chosen)).size;
+      } catch {
+        // ignore
+      }
+      // For large files (>20 MB) or large-file sessions on disk, use streaming hash-indexed diff to break the 50 MB RAM barrier.
+      if (this.uri && (otherSize > 20 * 1024 * 1024 || (this.large && this.large.bytes > 20 * 1024 * 1024))) {
+        const diff = await streamDiffFiles(this.uri, chosen);
+        this.post({ type: 'streamFileDiff', otherName: path.posix.basename(chosen.path), ...diff });
+        return;
+      }
       const openDoc = !isGzipPath(chosen.path)
         ? vscode.workspace.textDocuments.find((d) => d.uri.toString() === chosen!.toString() && !d.isClosed)
         : undefined;
@@ -1265,7 +1332,13 @@ export class ViewerSession implements vscode.Disposable {
             ? { [t('TypeScript definitions')]: ['ts'] }
             : format === 'py'
               ? { [t('Python file')]: ['py'] }
-              : { JSON: ['json'] };
+              : format === 'go'
+                ? { [t('Go file')]: ['go'] }
+                : format === 'rs'
+                  ? { [t('Rust file')]: ['rs'] }
+                  : format === 'sql'
+                    ? { [t('SQL file')]: ['sql'] }
+                    : { JSON: ['json'] };
     const target =
       this.testExportTarget ??
       (await vscode.window.showSaveDialog({
@@ -1290,6 +1363,7 @@ export class ViewerSession implements vscode.Disposable {
       `style-src ${webview.cspSource} 'unsafe-inline'`,
       `font-src ${webview.cspSource}`,
       `script-src 'nonce-${nonce}'`,
+      "worker-src blob:",
     ].join('; ');
     return `<!DOCTYPE html>
 <html lang="en">

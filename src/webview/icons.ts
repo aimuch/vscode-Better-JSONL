@@ -43,6 +43,10 @@ const P: Record<string, string> = {
   chat: '<path d="M2.2 3.5a1 1 0 0 1 1-1h9.6a1 1 0 0 1 1 1v6.4a1 1 0 0 1-1 1H6.5L3.2 13.6v-2.7a1 1 0 0 1-1-1z"/><path class="ic-2" d="M5.2 5.8h5.6M5.2 8.2h3.6"/>',
   waterfall: '<path d="M2 4h4.5M5 8h6M9 12h5"/><circle class="ic-2" cx="2" cy="4" r=".9"/><circle class="ic-2" cx="5" cy="8" r=".9"/><circle class="ic-2" cx="9" cy="12" r=".9"/>',
   'diff-files': '<rect x="2" y="2.5" width="6.5" height="9.5" rx="1"/><rect class="ic-2" x="7.5" y="4" width="6.5" height="9.5" rx="1"/><path class="ic-2" d="M9.5 7.5h2.5M9.5 10h2.5"/>',
+  charts: '<path d="M2 13.5h12M2 2.5v11"/><path class="ic-2" d="M4 10.5 7 6.5l3 2.5 3.5-5"/>',
+  'check-doc': '<path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z"/><path d="M9.5 1.5V5H13"/><path class="ic-2" d="M5.5 9.5 7.2 11.2 10.6 7.6"/>',
+  more: '<circle cx="3.5" cy="8" r="1.1"/><circle cx="8" cy="8" r="1.1"/><circle cx="12.5" cy="8" r="1.1"/>',
+  command: '<rect x="2.2" y="2.5" width="11.6" height="11" rx="1.6"/><path class="ic-2" d="M5.2 6.5 7.5 8.5 5.2 10.5M8.5 10.5h2.5"/>',
 };
 
 export function icon(name: string, size = 14): string {

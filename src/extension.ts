@@ -4,9 +4,9 @@ import { setLang, t } from './shared/i18n';
 import { randomBytes } from 'crypto';
 import { COMPRESSED_VIEW_TYPE, CompressedEditorProvider, ViewerEditorProvider, VIEWER_VIEW_TYPE } from './customEditor';
 import { compactLines, convertFormat, expandLines, formatJsonl } from './lineCommands';
-import { isGzipPath } from './largeFile';
+import { isGzipPath, readMergedJsonl } from './largeFile';
 import { PREVIEW_VIEW_TYPE, PreviewManager, resolveTarget } from './preview';
-import type { SessionEnv, SessionStateSnapshot, Target, ViewerSession } from './session';
+import { ViewerSession, type SessionEnv, type SessionStateSnapshot, type Target } from './session';
 import type { HostMessage } from './shared/protocol';
 
 export interface BetterJsonlApi {
@@ -95,9 +95,9 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
   const target = async (uri?: vscode.Uri): Promise<Target | undefined> => {
     try {
       if (uri instanceof vscode.Uri) {
-        if (/\.(gz|br)$/i.test(uri.path) && !isGzipPath(uri.path)) {
+        if (/\.(gz|br|zst)$/i.test(uri.path) && !isGzipPath(uri.path)) {
           void vscode.window.showWarningMessage(
-            t('Better JSONL opens compressed files named .json.gz, .jsonl.gz, .ndjson.gz, .jsonlines.gz, .json.br, .jsonl.br, .ndjson.br or .jsonlines.br.'),
+            t('Better JSONL opens compressed files named .json.gz, .jsonl.gz, .ndjson.gz, .jsonlines.gz, .json.br, .jsonl.br, .ndjson.br, .jsonlines.br, .json.zst, .jsonl.zst, .ndjson.zst or .jsonlines.zst.'),
           );
           return undefined;
         }
@@ -186,6 +186,39 @@ export function activate(context: vscode.ExtensionContext): BetterJsonlApi {
     }
     const other = uri instanceof vscode.Uri && s.resource?.toString() !== uri.toString() ? uri : undefined;
     await s.compareWithFile(other);
+  });
+  reg('betterJsonl.mergeFiles', async (uri?: vscode.Uri, selectedUris?: vscode.Uri[]) => {
+    let uris: vscode.Uri[] = [];
+    if (Array.isArray(selectedUris) && selectedUris.length >= 2) {
+      uris = selectedUris.filter((u) => u instanceof vscode.Uri);
+    } else if (Array.isArray(uri)) {
+      uris = (uri as unknown as vscode.Uri[]).filter((u) => u instanceof vscode.Uri);
+    } else {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: true,
+        openLabel: t('Merge Open in Better JSONL'),
+        filters: { 'JSON / JSON Lines': ['jsonl', 'ndjson', 'jsonlines', 'json', 'gz', 'br', 'zst'] },
+      });
+      if (picked && picked.length >= 1) uris = picked;
+    }
+    if (!uris.length) return undefined;
+    try {
+      const text = await readMergedJsonl(uris);
+      const title = `Merged (${uris.length} files).jsonl`;
+      const panel = vscode.window.createWebviewPanel(
+        PREVIEW_VIEW_TYPE,
+        title,
+        vscode.ViewColumn.Active,
+        { enableScripts: true, retainContextWhenHidden: true },
+      );
+      const session = new ViewerSession(panel, env, 'preview');
+      session.bindVirtual(title, text);
+      track(session);
+      return session;
+    } catch (e) {
+      void vscode.window.showErrorMessage(t('Better JSONL could not read the file: {0}', e instanceof Error ? e.message : String(e)));
+      return undefined;
+    }
   });
 
   return {

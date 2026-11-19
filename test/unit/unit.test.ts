@@ -22,6 +22,14 @@ import { computePivot, discoverFieldPaths } from '../../src/webview/pivot';
 import { analyzeDataQuality } from '../../src/webview/quality';
 import { redactJsonLine, redactValue } from '../../src/webview/redact';
 import { buildTraceWaterfall, isTraceCandidate } from '../../src/webview/waterfall';
+import { DistinctCounter, QuantileSketch } from '../../src/webview/sketch';
+import { runSliced } from '../../src/webview/compute';
+import { executeSql, isSqlQueryText, parseSql } from '../../src/webview/sql';
+import { validateRecordsAgainstSchema } from '../../src/webview/schemaValidate';
+import { buildChartSvg } from '../../src/webview/charts';
+import { computeCrossTab } from '../../src/webview/pivot';
+import { emitDuckDbSnippet, emitGoStruct, emitPolarsSnippet, emitRustSerde } from '../../src/webview/schema';
+import { detectImageDataUrl } from '../../src/webview/inspect';
 import {
   buildMachineSnapshot,
   deriveDocLifecycle,
@@ -1188,7 +1196,7 @@ test('explicit state machines: OverlayController, QuerySyntaxMode, DocLifecycle,
   assert.equal(normalizeQuerySyntax(false, false), 'auto');
   assert.equal(toggleQuerySyntax('regex', 'literal'), 'literal');
   assert.equal(toggleQuerySyntax('literal', 'literal'), 'auto');
-  assert.deepEqual(syntaxToFlags('literal'), { regex: false, literal: true });
+  assert.deepEqual(syntaxToFlags('literal'), { regex: false, literal: true, sql: false });
 
   // 2. OverlayController enforces single-modal & single-popover exclusivity
   const ov = new OverlayController();
@@ -1247,4 +1255,81 @@ test('explicit state machines: OverlayController, QuerySyntaxMode, DocLifecycle,
     mutation: 'idle',
     export: 'idle',
   });
+});
+
+test('v1.0 engines: QuantileSketch, DistinctCounter, SQL, CrossTab, SchemaValidate, Charts, Go/Rust/DuckDB/Polars, ImageDataUrl & runSliced', async () => {
+  // 1. Streaming QuantileSketch & DistinctCounter (O4)
+  const sk = new QuantileSketch(0.01);
+  for (let i = 1; i <= 1000; i++) sk.add(i);
+  assert.equal(sk.count, 1000);
+  assert.ok(Math.abs(sk.quantile(0.5) - 500) <= 10, `p50=${sk.quantile(0.5)}`);
+  assert.ok(Math.abs(sk.quantile(0.95) - 950) <= 20, `p95=${sk.quantile(0.95)}`);
+  const dc = new DistinctCounter();
+  for (let i = 0; i < 600; i++) dc.add(`k${i % 350}`);
+  assert.ok(Math.abs(dc.estimate() - 350) < 40, `hll=${dc.estimate()}`);
+
+  // 2. Lightweight SQL query mode (F1)
+  assert.equal(isSqlQueryText('SELECT service, COUNT(*) AS n FROM logs GROUP BY service'), true);
+  const recs = [
+    { id: 1, service: 'auth', region: 'us', ms: 40, ok: true },
+    { id: 2, service: 'auth', region: 'eu', ms: 80, ok: false },
+    { id: 3, service: 'pay', region: 'us', ms: 120, ok: true },
+    { id: 4, service: 'pay', region: 'us', ms: 200, ok: true },
+  ];
+  const q1 = parseSql('SELECT service, COUNT(*) AS n, AVG(ms) AS avg_ms WHERE ms >= 40 GROUP BY service ORDER BY avg_ms DESC LIMIT 2');
+  const r1 = executeSql(q1, recs);
+  assert.equal(r1.rows.length, 2);
+  assert.equal(r1.rows[0].service, 'pay');
+  assert.equal(r1.rows[0].n, 2);
+  assert.equal(r1.rows[0].avg_ms, 160);
+
+  // 3. 2D Cross-Tab Pivot (F2)
+  const xtab = computeCrossTab(recs, ['service'], ['region'], ['ms']);
+  assert.deepEqual(xtab.rowLabels.sort(), ['auth', 'pay']);
+  assert.deepEqual(xtab.colLabels.sort(), ['eu', 'us']);
+  assert.equal(xtab.totalRecords, 4);
+
+  // 4. JSON Schema Validation (F7)
+  const schema = {
+    type: 'object',
+    required: ['id', 'service'],
+    properties: {
+      id: { type: 'integer', minimum: 1 },
+      service: { enum: ['auth', 'pay'] },
+      ms: { type: 'number', maximum: 150 },
+    },
+  };
+  const valRep = validateRecordsAgainstSchema(
+    recs.map((value, line) => ({ line, value })),
+    schema,
+  );
+  assert.equal(valRep.validLines, 3);
+  assert.deepEqual(valRep.invalidLines, [3]);
+  assert.equal(valRep.violations[0].rule, 'maximum');
+
+  // 5. Charts SVG builder (F3)
+  const scatter = buildChartSvg(
+    recs.map((value, line) => ({ line, value })),
+    { kind: 'scatter', xPath: ['id'], yPath: ['ms'] },
+  );
+  assert.equal(scatter.pointCount, 4);
+  assert.ok(scatter.svg.includes('data-chart-line="3"'));
+
+  // 6. Extended Schema & Code Emitters (F9)
+  const { schema: inferred } = inferSchema(recs);
+  assert.ok(emitGoStruct(inferred, 'Event').includes('type Event struct'));
+  assert.ok(emitRustSerde(inferred, 'Event').includes('pub struct Event'));
+  assert.ok(emitDuckDbSnippet(inferred, 'events.jsonl').includes('read_json_auto("events.jsonl")'));
+  assert.ok(emitPolarsSnippet(inferred, 'events.jsonl').includes('pl.scan_ndjson("events.jsonl")'));
+
+  // 7. Multimodal Image Data-URL detector (F8) & runSliced (O1)
+  const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  assert.equal(detectImageDataUrl(tinyPng)?.mime, 'image/png');
+  assert.equal(detectImageDataUrl('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4='), null);
+  let sum = 0;
+  const done = await runSliced(100, (i) => {
+    sum += i;
+  });
+  assert.equal(done, true);
+  assert.equal(sum, 4950);
 });

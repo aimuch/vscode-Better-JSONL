@@ -96,7 +96,17 @@ async function write(stream: NodeJS.WritableStream, data: Uint8Array, seen?: (d:
   if (!stream.write(data)) await new Promise<void>((resolve) => stream.once('drain', resolve));
 }
 
-export type Compression = 'gzip' | 'brotli' | null;
+export type Compression = 'gzip' | 'brotli' | 'zstd' | null;
+
+type ZlibZstd = {
+  createZstdDecompress?: (opts?: { chunkSize?: number }) => NodeJS.ReadWriteStream & { destroy: (err?: Error) => void; unpipe: (dest: NodeJS.WritableStream) => void };
+  createZstdCompress?: (opts?: { chunkSize?: number }) => NodeJS.ReadWriteStream & { destroy: (err?: Error) => void; unpipe: (dest: NodeJS.WritableStream) => void };
+};
+
+export function supportsZstd(): boolean {
+  const z = zlib as unknown as ZlibZstd;
+  return typeof z.createZstdDecompress === 'function' && typeof z.createZstdCompress === 'function';
+}
 
 function resolveCompression(opts: { gzip?: boolean; compression?: Compression }): Compression {
   if (opts.compression !== undefined) return opts.compression;
@@ -106,6 +116,13 @@ function resolveCompression(opts: { gzip?: boolean; compression?: Compression })
 function wrapReadStream(raw: Readable, comp: Compression): Readable {
   if (comp === 'gzip') return raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024 }));
   if (comp === 'brotli') return raw.pipe(zlib.createBrotliDecompress({ chunkSize: 1024 * 1024 }));
+  if (comp === 'zstd') {
+    const z = zlib as unknown as ZlibZstd;
+    if (typeof z.createZstdDecompress !== 'function') {
+      throw new Error('Zstandard (.zst) requires Node.js 22.15+ (VS Code with Node 22.15+ runtime).');
+    }
+    return raw.pipe(z.createZstdDecompress({ chunkSize: 1024 * 1024 })) as unknown as Readable;
+  }
   return raw;
 }
 
@@ -132,6 +149,21 @@ function wrapWriteStream(file: fs.WriteStream, comp: Compression): { sink: NodeJ
       destroy: () => {
         br.unpipe(file);
         br.destroy();
+      },
+    };
+  }
+  if (comp === 'zstd') {
+    const z = zlib as unknown as ZlibZstd;
+    if (typeof z.createZstdCompress !== 'function') {
+      throw new Error('Zstandard (.zst) writing requires Node.js 22.15+.');
+    }
+    const zs = z.createZstdCompress({ chunkSize: 1024 * 1024 });
+    zs.pipe(file);
+    return {
+      sink: zs,
+      destroy: () => {
+        zs.unpipe(file);
+        zs.destroy();
       },
     };
   }

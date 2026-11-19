@@ -27,7 +27,7 @@ import {
 import { icon } from '../icons';
 import { lowerBound, type Parsed } from '../model';
 import { formatPathLabel } from '../pivot';
-import { compactJson } from '../query';
+import { compactJson, compileQuery, type Program } from '../query';
 
 /** Browsers cap element height near 33.5M px. Above this the scroll space is scaled. */
 const MAX_SCROLL_PX = 30_000_000;
@@ -50,11 +50,16 @@ const OKEY = ESC + 'k';
 const OVAL = ESC + 'o';
 /** A nested JSON path promoted to a top-level column (`\u0001p` + `pathKey`). */
 const PROM = ESC + 'p';
+/** A computed virtual column backed by a jq expression (`\u0001c` + name). */
+const COMP = ESC + 'c';
 const colId = (key: string): string => (key.startsWith(ESC) ? ESC + key : key);
 const keyOf = (id: string): string => (id.startsWith(ESC) ? id.slice(1) : id);
 export const promotedColId = (path: readonly (string | number)[]): string =>
   PROM + path.reduce<string>((acc, seg) => childKey(acc, seg), '');
 export const isPromotedCol = (col: string): boolean => col.startsWith(PROM);
+export const computedColId = (name: string): string => COMP + name;
+export const isComputedCol = (col: string): boolean => col.startsWith(COMP);
+const computedColName = (col: string): string => col.slice(COMP.length);
 const promotedPathKey = (col: string): string => col.slice(PROM.length);
 const promotedSegCache = new Map<string, (string | number)[]>();
 function promotedSegs(col: string): (string | number)[] {
@@ -116,6 +121,9 @@ export class GridView implements View {
   private readonly head: HTMLElement;
   private readonly bodyEl: HTMLElement;
   private readonly rowsEl: HTMLElement;
+  private readonly footEl: HTMLElement;
+  private readonly compProgCache = new Map<string, Program | null>();
+  private cellRange: { r0: number; c0: number; r1: number; c1: number } | null = null;
   private mode: Mode = 'records';
   private cols: string[] = [];
   private rowIds: number[] = [];
@@ -170,11 +178,12 @@ export class GridView implements View {
     this.rowH = app.rh + 6;
     this.el = document.createElement('div');
     this.el.className = 'view grid';
-    this.el.innerHTML = `<div class="gscroll" role="table" tabindex="0" aria-label="${t('Grid')}"><div class="ghead" role="row"></div><div class="gbody"><div class="grows" role="rowgroup"></div></div></div>`;
+    this.el.innerHTML = `<div class="gscroll" role="table" tabindex="0" aria-label="${t('Grid')}"><div class="ghead" role="row"></div><div class="gbody"><div class="grows" role="rowgroup"></div></div><div class="gfoot" role="row" hidden></div></div>`;
     this.scroll = this.el.querySelector('.gscroll') as HTMLElement;
     this.head = this.el.querySelector('.ghead') as HTMLElement;
     this.bodyEl = this.el.querySelector('.gbody') as HTMLElement;
     this.rowsEl = this.el.querySelector('.grows') as HTMLElement;
+    this.footEl = this.el.querySelector('.gfoot') as HTMLElement;
     this.scroll.addEventListener('scroll', () => this.paint(), { passive: true });
     this.resizes = new ResizeObserver(() => {
       if (this.ratio < 1) this.applyScrollHeight();
@@ -402,6 +411,7 @@ export class GridView implements View {
     if (col === OKEY) return t('key');
     if (col === OVAL) return t('value');
     if (isPromotedCol(col)) return formatPathLabel(promotedSegs(col));
+    if (isComputedCol(col)) return `ƒ ${computedColName(col)}`;
     return keyOf(col);
   }
 
@@ -463,18 +473,78 @@ export class GridView implements View {
   }
 
   fillReport(r: RenderReport): void {
-    const name = (c: string) => (c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : isPromotedCol(c) ? this.label(c) : keyOf(c));
+    const name = (c: string) =>
+      c === VALUE_COL ? '(value)' : c === OKEY ? 'key' : c === OVAL ? 'value' : isPromotedCol(c) || isComputedCol(c) ? this.label(c) : keyOf(c);
     const filters: Record<string, { text: string; exclude: number }> = {};
     for (const [c, f] of this.activeFilters()) filters[name(c)] = { text: f.text, exclude: f.exclude.size };
     r.grid = { rows: this.rowIds.length, columns: this.cols.map(name), openCells: this.app.state.grid.open.size, unfiltered: this.baseIds.length, filters };
   }
 
-  /** Status bar text while column filters are on, e.g. "Filtered: level, ms · 5 of 20 rows". */
+  /** Status bar text while column filters or a rectangular cell range are active. */
   filterStatus(): string {
+    const parts: string[] = [];
     const f = this.activeFilters();
-    if (!f.length) return '';
-    const names = f.map(([c]) => this.label(c)).join(', ');
-    return `${t('Filtered: {0}', names)} · ${t('{0} of {1} rows', this.rowIds.length.toLocaleString(), this.baseIds.length.toLocaleString())}`;
+    if (f.length) {
+      const names = f.map(([c]) => this.label(c)).join(', ');
+      parts.push(`${t('Filtered: {0}', names)} · ${t('{0} of {1} rows', this.rowIds.length.toLocaleString(), this.baseIds.length.toLocaleString())}`);
+    }
+    const rs = this.rangeSummary();
+    if (rs) parts.push(rs);
+    return parts.join(' · ');
+  }
+
+  private rangeSummary(): string {
+    if (!this.cellRange) return '';
+    const rMin = Math.min(this.cellRange.r0, this.cellRange.r1);
+    const rMax = Math.max(this.cellRange.r0, this.cellRange.r1);
+    const cMin = Math.min(this.cellRange.c0, this.cellRange.c1);
+    const cMax = Math.max(this.cellRange.c0, this.cellRange.c1);
+    const cols = this.allCols();
+    let cells = 0;
+    let nums = 0;
+    let sum = 0;
+    for (let r = rMin; r <= rMax && r < this.rowIds.length; r++) {
+      const id = this.rowIds[r];
+      for (let c = cMin; c <= cMax && c < cols.length; c++) {
+        if (cols[c] === NUM) continue;
+        cells++;
+        const v = this.cell(id, cols[c]);
+        const n = typeof v === 'number' ? v : v instanceof RawNum ? Number(v.src) : NaN;
+        if (Number.isFinite(n)) {
+          nums++;
+          sum += n;
+        }
+      }
+    }
+    if (!cells) return '';
+    const dims = `${rMax - rMin + 1}×${cMax - cMin + 1}`;
+    if (nums > 0) {
+      const avg = sum / nums;
+      return `${t('Range')} ${dims} · Σ ${Number(sum.toPrecision(6)).toLocaleString()} · μ ${Number(avg.toPrecision(5)).toLocaleString()}`;
+    }
+    return `${t('Range')} ${dims} (${cells})`;
+  }
+
+  /** Copies the active rectangular cell range as TSV. Returns null if no range is selected. */
+  copyRangeTsv(): string | null {
+    if (!this.cellRange) return null;
+    const rMin = Math.min(this.cellRange.r0, this.cellRange.r1);
+    const rMax = Math.max(this.cellRange.r0, this.cellRange.r1);
+    const cMin = Math.min(this.cellRange.c0, this.cellRange.c1);
+    const cMax = Math.max(this.cellRange.c0, this.cellRange.c1);
+    const cols = this.allCols();
+    const lines: string[] = [];
+    for (let r = rMin; r <= rMax && r < this.rowIds.length; r++) {
+      const id = this.rowIds[r];
+      const rowCells: string[] = [];
+      for (let c = cMin; c <= cMax && c < cols.length; c++) {
+        if (cols[c] === NUM) continue;
+        const v = this.cell(id, cols[c]);
+        rowCells.push(v === undefined ? '' : cellText(v).replace(/[\t\r\n]+/g, ' '));
+      }
+      lines.push(rowCells.join('\t'));
+    }
+    return lines.join('\n');
   }
 
   // ---------- data ----------
@@ -503,6 +573,23 @@ export class GridView implements View {
       const unp = this.app.unpackedOf(id);
       return unp.size > 0 ? resolveAtPathKey(p.value, promotedPathKey(col), unp) : getAt(p.value, promotedSegs(col));
     }
+    if (isComputedCol(col)) {
+      const def = this.app.state.grid.computedCols.find((x) => x.id === col);
+      if (!def) return undefined;
+      let prog = this.compProgCache.get(def.expr);
+      if (prog === undefined) {
+        const compiled = compileQuery(def.expr);
+        prog = compiled.program ?? null;
+        this.compProgCache.set(def.expr, prog);
+      }
+      if (!prog) return undefined;
+      try {
+        const res = prog.run(p.value);
+        return res.outs.length ? res.outs[0].v : undefined;
+      } catch {
+        return undefined;
+      }
+    }
     if (!isObj(p.value)) return undefined;
     const key = keyOf(col);
     return Object.prototype.hasOwnProperty.call(p.value, key) ? p.value[key] : undefined;
@@ -511,7 +598,9 @@ export class GridView implements View {
   private buildVisibleCols(raw: string[]): void {
     const g = this.app.state.grid;
     const promoted = g.promotedCols;
-    const combined = promoted.length ? [...raw, ...promoted.filter((c) => !raw.includes(c))] : raw;
+    const computed = g.computedCols.map((c) => c.id);
+    const extras = [...promoted, ...computed].filter((c) => !raw.includes(c));
+    const combined = extras.length ? [...raw, ...extras] : raw;
     this.rawCols = combined;
     const hidden = g.hiddenCols;
     const pinned = g.pinnedCols;
@@ -520,7 +609,7 @@ export class GridView implements View {
     this.hiddenCount = 0;
     for (const h of hidden) if (rawSet.has(h)) this.hiddenCount++;
 
-    if (!order.length && !hidden.size && !pinned.size && !promoted.length) {
+    if (!order.length && !hidden.size && !pinned.size && !extras.length) {
       this.cols = combined.slice(0, MAX_COLUMNS);
       this.colsCut = combined.length > MAX_COLUMNS;
       return;
@@ -537,7 +626,7 @@ export class GridView implements View {
     for (let i = 0; i < combined.length; i++) {
       const c = combined[i];
       if (seen.has(c)) continue;
-      if (i < MAX_COLUMNS || pinned.has(c) || isPromotedCol(c)) {
+      if (i < MAX_COLUMNS || pinned.has(c) || isPromotedCol(c) || isComputedCol(c)) {
         seen.add(c);
         ordered.push(c);
       }
@@ -641,44 +730,57 @@ export class GridView implements View {
     this.heavy = m.isJsonl && !m.keepsAll && this.baseIds.length > HEAVY_ROWS;
     let filters = this.activeFilters();
     const g = app.state.grid.sort;
-    let sort = g && (g.col === NUM || this.cols.includes(g.col)) ? g : null;
+    const allSorts = [
+      ...(g && (g.col === NUM || this.cols.includes(g.col)) ? [g] : []),
+      ...(app.state.grid.extraSorts ?? []).filter((s) => s.col === NUM || this.cols.includes(s.col)),
+    ];
+    let activeSorts = allSorts;
     if (this.heavy) {
       // The columns are read first; until then the rows show in file order.
       const need = new Set<string>(filters.map(([c]) => c));
-      if (sort && sort.col !== NUM) need.add(sort.col);
+      for (const s of activeSorts) if (s.col !== NUM) need.add(s.col);
       if (this.fcol !== null) need.add(this.fcol);
       const missing = [...need].filter((c) => !this.colCache.has(c));
       if (missing.length) {
         this.readColumns([...need]);
         filters = [];
-        sort = null;
+        activeSorts = [];
       }
     }
-    const rowSig = JSON.stringify([sort, filters.map(([c, f]) => [c, f.text, f.min ?? '', f.max ?? '', [...f.exclude]])]);
+    const rowSig = JSON.stringify([activeSorts, filters.map(([c, f]) => [c, f.text, f.min ?? '', f.max ?? '', [...f.exclude]])]);
     if (rowSig !== this.rowSig) {
       this.rowSig = rowSig;
       let ids = this.baseIds;
       if (filters.length) ids = ids.filter((id) => this.passes(id, filters));
-      if (sort) {
-        const s = sort;
-        const keys = s.col === NUM ? null : ids.map((id) => this.val(id, s.col));
+      if (activeSorts.length) {
+        const keyCols = activeSorts.map((s) => (s.col === NUM ? null : ids.map((id) => this.val(id, s.col))));
         const order = ids.map((_, k) => k);
         order.sort((a, b) => {
-          if (!keys) return s.dir * (ids[a] - ids[b]);
-          // Missing values stay at the bottom in both directions.
-          const ma = keys[a] === undefined;
-          const mb = keys[b] === undefined;
-          if (ma !== mb) return ma ? 1 : -1;
-          return s.dir * compare(keys[a], keys[b]) || ids[a] - ids[b];
+          for (let si = 0; si < activeSorts.length; si++) {
+            const s = activeSorts[si];
+            const keys = keyCols[si];
+            if (!keys) {
+              const d = s.dir * (ids[a] - ids[b]);
+              if (d !== 0) return d;
+              continue;
+            }
+            const ma = keys[a] === undefined;
+            const mb = keys[b] === undefined;
+            if (ma !== mb) return ma ? 1 : -1;
+            const c = s.dir * compare(keys[a], keys[b]);
+            if (c !== 0) return c;
+          }
+          return ids[a] - ids[b];
         });
         ids = order.map((k) => ids[k]);
       }
       this.rowIds = ids;
-      this.sorted = !!sort;
+      this.sorted = activeSorts.length > 0;
       this.idToRow = null;
     }
     this.computeOffsets();
     this.paintHead();
+    this.paintFooter();
   }
 
   private computeOffsets(): void {
@@ -739,7 +841,7 @@ export class GridView implements View {
 
   private paintHead(): void {
     const g = this.app.state.grid;
-    const sort = g.sort;
+    const allSorts = [...(g.sort ? [g.sort] : []), ...(g.extraSorts ?? [])];
     const pinned = g.pinnedCols;
     const cols = this.allCols();
     const filters = g.filters;
@@ -752,7 +854,10 @@ export class GridView implements View {
     this.head.innerHTML = cols
       .map((c, i) => {
         const isPin = c === NUM || pinned.has(c);
-        const sorted = sort && sort.col === c ? (sort.dir > 0 ? icon('chev-up', 11) : icon('chev-down', 11)) : '';
+        const sIdx = allSorts.findIndex((s) => s.col === c);
+        const sSpec = sIdx >= 0 ? allSorts[sIdx] : null;
+        const sBadge = allSorts.length > 1 && sIdx >= 0 ? `<span class="sort-ord">${sIdx + 1}</span>` : '';
+        const sorted = sSpec ? `${sSpec.dir > 0 ? icon('chev-up', 11) : icon('chev-down', 11)}${sBadge}` : '';
         const pinMark = pinned.has(c) ? `<span class="pin-mark" title="${esc(t('Unpin column'))}">${icon('pin', 10)}</span>` : '';
         const label = c === VALUE_COL ? `<span class="dim">${t('(value)')}</span>` : esc(this.label(c));
         const f = filters.get(c);
@@ -761,7 +866,7 @@ export class GridView implements View {
           filterable && c !== NUM
             ? `<button class="gh-f${on ? ' on' : ''}${this.fcol === c ? ' open' : ''}" data-f="${esc(c)}" aria-label="${esc(t('Filter {0}', this.label(c)))}" aria-pressed="${on}" title="${t('Filter this column')}">${icon('filter', 12)}</button>`
             : '';
-        const sortState = sort && sort.col === c ? (sort.dir > 0 ? 'ascending' : 'descending') : 'none';
+        const sortState = sSpec ? (sSpec.dir > 0 ? 'ascending' : 'descending') : 'none';
         const cls = ['gh'];
         if (c === NUM) cls.push('num');
         if (isPin) cls.push('sticky');
@@ -769,6 +874,46 @@ export class GridView implements View {
         if (on) cls.push('filtered');
         const style = isPin ? `width:var(--w${i});left:var(--x${i})` : `width:var(--w${i})`;
         return `<div class="${cls.join(' ')}" role="columnheader" tabindex="0" aria-sort="${sortState}" data-col="${esc(c)}" style="${style}" title="${esc(this.label(c))}">${pinMark}<span class="gh-l">${label}</span>${sorted}${fbtn}<span class="rz" data-rz="${esc(c)}"></span></div>`;
+      })
+      .join('');
+  }
+
+  private paintFooter(): void {
+    const show = this.app.state.grid.showFooter && this.mode === 'records' && this.rowIds.length > 0;
+    this.footEl.hidden = !show;
+    if (!show) return;
+    const cols = this.allCols();
+    const pinned = this.app.state.grid.pinnedCols;
+    let lastPin = -1;
+    cols.forEach((c, i) => {
+      if (c === NUM || pinned.has(c)) lastPin = i;
+    });
+    const sampleN = Math.min(this.rowIds.length, 10_000);
+    this.footEl.innerHTML = cols
+      .map((c, i) => {
+        const isPin = c === NUM || pinned.has(c);
+        const pinCls = isPin ? ` sticky${i === lastPin ? ' last-pin' : ''}` : '';
+        const style = isPin ? `style="width:var(--w${i});left:var(--x${i})"` : `style="width:var(--w${i})"`;
+        if (c === NUM) return `<div class="gf-cell num${pinCls}" ${style}>Σ</div>`;
+        let nonNull = 0;
+        let numCount = 0;
+        let sum = 0;
+        for (let r = 0; r < sampleN; r++) {
+          const v = this.val(this.rowIds[r], c);
+          if (v !== undefined && v !== null) {
+            nonNull++;
+            const n = typeof v === 'number' ? v : v instanceof RawNum ? Number(v.src) : NaN;
+            if (Number.isFinite(n)) {
+              numCount++;
+              sum += n;
+            }
+          }
+        }
+        const txt =
+          numCount > 0 && numCount >= nonNull * 0.5
+            ? `Σ ${Number(sum.toPrecision(5)).toLocaleString()} · μ ${Number((sum / numCount).toPrecision(4)).toLocaleString()}`
+            : `${Math.round((nonNull / sampleN) * 100)}%`;
+        return `<div class="gf-cell mono dim${pinCls}" ${style} title="${esc(txt)}">${esc(txt)}</div>`;
       })
       .join('');
   }
@@ -1044,9 +1189,24 @@ export class GridView implements View {
     if (!h) return;
     const col = h.dataset.col as string;
     const g = this.app.state.grid;
-    if (!g.sort || g.sort.col !== col) g.sort = { col, dir: 1 };
-    else if (g.sort.dir === 1) g.sort = { col, dir: -1 };
-    else g.sort = null;
+    if (e.shiftKey && g.sort) {
+      // Shift+Click appends/cycles multi-column secondary sort keys.
+      if (g.sort.col === col) {
+        g.sort = { col, dir: g.sort.dir === 1 ? -1 : 1 };
+      } else {
+        const list = [...(g.extraSorts ?? [])];
+        const idx = list.findIndex((s) => s.col === col);
+        if (idx < 0) list.push({ col, dir: 1 });
+        else if (list[idx].dir === 1) list[idx] = { col, dir: -1 };
+        else list.splice(idx, 1);
+        g.extraSorts = list;
+      }
+    } else {
+      g.extraSorts = [];
+      if (!g.sort || g.sort.col !== col) g.sort = { col, dir: 1 };
+      else if (g.sort.dir === 1) g.sort = { col, dir: -1 };
+      else g.sort = null;
+    }
     this.render();
     this.app.stateChanged();
   }
@@ -1089,6 +1249,22 @@ export class GridView implements View {
       return;
     }
     if (tEl.closest('.gdetail')) return;
+    const cellEl = tEl.closest('.gc') as HTMLElement | null;
+    const colIdx = cellEl ? Array.from(cellEl.parentElement!.children).indexOf(cellEl) : -1;
+    const rowIdx = this.rowIndexOf(id);
+    if (cellEl && colIdx >= 0 && rowIdx >= 0 && this.allCols()[colIdx] !== NUM) {
+      if (e.shiftKey && this.cellRange) {
+        this.cellRange = { r0: this.cellRange.r0, c0: this.cellRange.c0, r1: rowIdx, c1: colIdx };
+      } else {
+        this.cellRange = { r0: rowIdx, c0: colIdx, r1: rowIdx, c1: colIdx };
+      }
+      this.markRangeCells();
+      this.app.paintChrome();
+    } else if (this.cellRange) {
+      this.cellRange = null;
+      this.markRangeCells();
+      this.app.paintChrome();
+    }
     if (this.app.model.isJsonl) {
       const how = e.shiftKey ? 'range' : e.metaKey || e.ctrlKey ? 'toggle' : 'set';
       this.app.selectRecord(id, how);
@@ -1096,6 +1272,24 @@ export class GridView implements View {
       this.jsonActive = id;
       this.markRows();
     }
+  }
+
+  private markRangeCells(): void {
+    const r = this.cellRange;
+    const active = r && (r.r0 !== r.r1 || r.c0 !== r.c1);
+    const rMin = active ? Math.min(r.r0, r.r1) : -1;
+    const rMax = active ? Math.max(r.r0, r.r1) : -1;
+    const cMin = active ? Math.min(r.c0, r.c1) : -1;
+    const cMax = active ? Math.max(r.c0, r.c1) : -1;
+    this.rowsEl.querySelectorAll<HTMLElement>('.grow').forEach((rowEl) => {
+      const id = Number(rowEl.dataset.id);
+      const ri = this.rowIndexOf(id);
+      const cells = rowEl.querySelector('.gcells');
+      if (!cells) return;
+      Array.from(cells.children).forEach((el, ci) => {
+        el.classList.toggle('in-range', !!active && ri >= rMin && ri <= rMax && ci >= cMin && ci <= cMax);
+      });
+    });
   }
 
   private onDblClick(e: MouseEvent): void {
@@ -1323,10 +1517,16 @@ export class GridView implements View {
         <button class="btn" data-cpromote-btn>${esc(t('Add'))}</button>
         <button class="btn" data-cflatten title="${esc(t('Flatten 1 level'))}">${esc(t('Flatten 1 level'))}</button>
       </div>
+      <div class="cp-add cp-comp">
+        <input type="text" class="mono" data-ccomp-name placeholder="${esc(t('Computed name'))}" aria-label="${esc(t('Computed name'))}" spellcheck="false" style="max-width:96px">
+        <input type="text" class="mono" data-ccomp-expr placeholder="${esc(t('jq expr (e.g. .ms * 2)'))}" aria-label="${esc(t('jq expr (e.g. .ms * 2)'))}" spellcheck="false">
+        <button class="btn" data-ccomp-btn>${esc(t('+ Col'))}</button>
+      </div>
       <div class="gf-list cp-list" role="group"></div>
       <div class="gf-foot">
         <button class="btn" data-cshowall>${esc(t('Show all'))}</button>
         <button class="btn" data-creset>${esc(t('Reset columns'))}</button>
+        <button class="btn${this.app.state.grid.showFooter ? ' active' : ''}" data-cfooter title="${esc(t('Toggle summary footer'))}">Σ</button>
         <span class="spring"></span>
         <span class="dim cp-count"></span>
       </div>`;
@@ -1377,9 +1577,10 @@ export class GridView implements View {
       const checked = visibleSet.has(c);
       const pinned = g.pinnedCols.has(c);
       const name = this.label(c);
-      const rmBtn = isPromotedCol(c)
-        ? `<button class="icon-btn cp-act" data-cremove="${esc(c)}" title="${esc(t('Remove promoted column'))}">${icon('close', 11)}</button>`
-        : '';
+      const rmBtn =
+        isPromotedCol(c) || isComputedCol(c)
+          ? `<button class="icon-btn cp-act" data-cremove="${esc(c)}" title="${esc(t('Remove custom column'))}">${icon('close', 11)}</button>`
+          : '';
       return `<div class="cp-row" data-ccol="${esc(c)}">
         <label class="cp-lbl" title="${esc(name)}"><input type="checkbox" data-ctoggle="${esc(c)}"${checked ? ' checked' : ''}><span class="gf-v">${esc(name)}</span></label>
         ${rmBtn}
@@ -1479,11 +1680,36 @@ export class GridView implements View {
       this.promoteFromInput();
       return;
     }
-    if (btn.hasAttribute('data-cflatten')) {
+    if (btn.hasAttribute('data-ccomp-btn')) {
+      const nameEl = this.cpel.querySelector('[data-ccomp-name]') as HTMLInputElement | null;
+      const exprEl = this.cpel.querySelector('[data-ccomp-expr]') as HTMLInputElement | null;
+      const name = nameEl?.value.trim() ?? '';
+      const expr = exprEl?.value.trim() ?? '';
+      if (!name || !expr) return;
+      const compiled = compileQuery(expr);
+      if (!compiled.program) {
+        exprEl?.classList.add('bad');
+        return;
+      }
+      const cid = computedColId(name);
+      this.compProgCache.set(expr, compiled.program);
+      const existing = g.computedCols.find((x) => x.id === cid);
+      if (existing) existing.expr = expr;
+      else g.computedCols.push({ id: cid, name, expr });
+      g.hiddenCols.delete(cid);
+      const ord = this.ensureColOrder();
+      if (!ord.includes(cid)) ord.push(cid);
+      if (nameEl) nameEl.value = '';
+      if (exprEl) exprEl.value = '';
+    } else if (btn.hasAttribute('data-cfooter')) {
+      g.showFooter = !g.showFooter;
+      btn.classList.toggle('active', g.showFooter);
+    } else if (btn.hasAttribute('data-cflatten')) {
       this.flattenOneLevel();
     } else if (btn.dataset.cremove !== undefined) {
       const col = btn.dataset.cremove;
       g.promotedCols = g.promotedCols.filter((c) => c !== col);
+      g.computedCols = g.computedCols.filter((c) => c.id !== col);
       g.pinnedCols.delete(col);
       g.hiddenCols.delete(col);
       g.colOrder = g.colOrder.filter((c) => c !== col);
@@ -1495,6 +1721,7 @@ export class GridView implements View {
       g.hiddenCols.clear();
       g.pinnedCols.clear();
       g.promotedCols = [];
+      g.computedCols = [];
       g.colOrder = [];
       g.widths = {};
     } else if (btn.dataset.cpin !== undefined) {

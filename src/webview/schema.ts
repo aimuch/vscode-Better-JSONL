@@ -302,3 +302,138 @@ export function emitZod(root: SchemaNode, rootName = 'RecordItemSchema'): string
   const schemaVar = rootName.endsWith('Schema') ? rootName : `${rootName}Schema`;
   return `import { z } from 'zod';\n\nexport const ${schemaVar} = ${zodExpr(root, 0)};\n\nexport type ${baseName} = z.infer<typeof ${schemaVar}>;\n`;
 }
+
+// ---------- 5. Go struct ----------
+
+export function emitGoStruct(root: SchemaNode, rootName = 'RecordItem'): string {
+  const defs: string[] = [];
+  const used = new Set<string>([rootName]);
+  const uniq = (hint: string) => {
+    const base = pascalCase(hint);
+    if (!used.has(base)) {
+      used.add(base);
+      return base;
+    }
+    let n = 2;
+    while (used.has(`${base}${n}`)) n++;
+    used.add(`${base}${n}`);
+    return `${base}${n}`;
+  };
+
+  const goType = (node: SchemaNode, hint: string, isRoot = false): string => {
+    const prims = normalizePrims(node.prims);
+    const nonNull = prims.filter((p) => p !== 'null');
+    const nullable = prims.includes('null');
+    if (node.objectCount > 0 && node.objectFields?.size) {
+      const name = isRoot ? rootName : uniq(hint);
+      const rows: string[] = [];
+      for (const [k, f] of node.objectFields) {
+        const fieldName = pascalCase(k);
+        const optional = f.count < node.objectCount;
+        let t = goType(f.node, `${name}${fieldName}`);
+        if (optional && !t.startsWith('*') && !t.startsWith('[]') && t !== 'any') t = `*${t}`;
+        rows.push(`\t${fieldName} ${t} \`json:"${k}${optional ? ',omitempty' : ''}"\``);
+      }
+      defs.push(`type ${name} struct {\n${rows.join('\n')}\n}`);
+      return nullable ? `*${name}` : name;
+    }
+    if (node.arrayItem) return `[]${goType(node.arrayItem, `${hint}Item`)}`;
+    if (nonNull.length === 1) {
+      const p = nonNull[0];
+      const base = p === 'string' ? 'string' : p === 'boolean' ? 'bool' : p === 'integer' || p === 'bigint' ? 'int64' : 'float64';
+      return nullable ? `*${base}` : base;
+    }
+    return 'any';
+  };
+
+  const top = goType(root, rootName, true);
+  if (top !== rootName) defs.push(`type ${rootName} = ${top}`);
+  return `package main\n\n${defs.join('\n\n')}\n`;
+}
+
+// ---------- 6. Rust serde ----------
+
+function rustIdent(k: string): string {
+  const s = k.replace(/[^A-Za-z0-9_]+/g, '_').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/^_+|_+$/g, '') || 'field';
+  const reserved = new Set(['type', 'match', 'ref', 'mod', 'fn', 'let', 'mut', 'pub', 'use', 'struct', 'enum', 'impl', 'in', 'as', 'loop', 'move', 'self']);
+  return /^[0-9]/.test(s) ? `f_${s}` : reserved.has(s) ? `r#${s}` : s;
+}
+
+export function emitRustSerde(root: SchemaNode, rootName = 'RecordItem'): string {
+  const defs: string[] = [];
+  const used = new Set<string>([rootName]);
+  const uniq = (hint: string) => {
+    const base = pascalCase(hint);
+    if (!used.has(base)) {
+      used.add(base);
+      return base;
+    }
+    let n = 2;
+    while (used.has(`${base}${n}`)) n++;
+    used.add(`${base}${n}`);
+    return `${base}${n}`;
+  };
+
+  const rsType = (node: SchemaNode, hint: string, isRoot = false): string => {
+    const prims = normalizePrims(node.prims);
+    const nonNull = prims.filter((p) => p !== 'null');
+    const nullable = prims.includes('null');
+    const wrap = (t: string) => (nullable ? `Option<${t}>` : t);
+    if (node.objectCount > 0 && node.objectFields?.size) {
+      const name = isRoot ? rootName : uniq(hint);
+      const rows: string[] = [];
+      for (const [k, f] of node.objectFields) {
+        const attr = rustIdent(k);
+        const optional = f.count < node.objectCount;
+        let t = rsType(f.node, `${name}${pascalCase(k)}`);
+        if (optional && !t.startsWith('Option<')) t = `Option<${t}>`;
+        if (attr.replace(/^r#/, '') !== k) rows.push(`    #[serde(rename = ${JSON.stringify(k)})]`);
+        rows.push(`    pub ${attr}: ${t},`);
+      }
+      defs.push(`#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct ${name} {\n${rows.join('\n')}\n}`);
+      return wrap(name);
+    }
+    if (node.arrayItem) return wrap(`Vec<${rsType(node.arrayItem, `${hint}Item`)}>`);
+    if (nonNull.length === 1) {
+      const p = nonNull[0];
+      return wrap(p === 'string' ? 'String' : p === 'boolean' ? 'bool' : p === 'integer' || p === 'bigint' ? 'i64' : 'f64');
+    }
+    return 'serde_json::Value';
+  };
+
+  const top = rsType(root, rootName, true);
+  if (top !== rootName) defs.push(`pub type ${rootName} = ${top};`);
+  return `use serde::{Deserialize, Serialize};\n\n${defs.join('\n\n')}\n`;
+}
+
+// ---------- 7. DuckDB SQL & Python Polars snippets ----------
+
+export function emitDuckDbSnippet(root: SchemaNode, fileName = 'data.jsonl'): string {
+  const cols = root.objectFields ? [...root.objectFields.keys()].slice(0, 8) : [];
+  const selectCols = cols.length ? cols.map((c) => `  "${c.replace(/"/g, '""')}"`).join(',\n') : '  *';
+  const groupCol = cols.find((c) => {
+    const f = root.objectFields?.get(c);
+    return f && f.node.prims.has('string');
+  });
+  const numCol = cols.find((c) => {
+    const f = root.objectFields?.get(c);
+    return f && (f.node.prims.has('number') || f.node.prims.has('integer'));
+  });
+  const agg = groupCol
+    ? `\n-- Group-by summary\nSELECT\n  "${groupCol}",\n  COUNT(*) AS rows${numCol ? `,\n  ROUND(AVG("${numCol}"), 2) AS avg_${numCol.replace(/[^A-Za-z0-9_]/g, '_')},\n  QUANTILE_CONT("${numCol}", 0.95) AS p95_${numCol.replace(/[^A-Za-z0-9_]/g, '_')}` : ''}\nFROM read_json_auto(${JSON.stringify(fileName)})\nGROUP BY 1\nORDER BY 2 DESC\nLIMIT 25;\n`
+    : '';
+  return `-- DuckDB query for ${fileName}\nSELECT\n${selectCols}\nFROM read_json_auto(${JSON.stringify(fileName)})\nLIMIT 100;\n${agg}`;
+}
+
+export function emitPolarsSnippet(root: SchemaNode, fileName = 'data.jsonl'): string {
+  const cols = root.objectFields ? [...root.objectFields.keys()].slice(0, 8) : [];
+  const groupCol = cols.find((c) => root.objectFields?.get(c)?.node.prims.has('string'));
+  const numCol = cols.find((c) => {
+    const p = root.objectFields?.get(c)?.node.prims;
+    return p && (p.has('number') || p.has('integer'));
+  });
+  const summary = groupCol
+    ? `\nsummary = (\n    df.group_by(${JSON.stringify(groupCol)})\n    .agg([\n        pl.len().alias("count"),${numCol ? `\n        pl.col(${JSON.stringify(numCol)}).mean().alias("avg"),\n        pl.col(${JSON.stringify(numCol)}).quantile(0.95).alias("p95"),` : ''}\n    ])\n    .sort("count", descending=True)\n)\nprint(summary.collect())\n`
+    : `\nprint(df.head(20).collect())\n`;
+  return `import polars as pl\n\ndf = pl.scan_ndjson(${JSON.stringify(fileName)})\n${summary}`;
+}

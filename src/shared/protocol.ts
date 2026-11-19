@@ -8,7 +8,7 @@ export type JsonPath = (string | number)[];
 export type ThemeMode = 'vscode' | 'light' | 'dark' | 'system';
 export type WrapSetting = 'followEditor' | 'on' | 'off';
 export type ExportRowFormat = 'jsonl' | 'csv' | 'json' | 'md' | 'tsv' | 'sql';
-export type ExportAssetFormat = 'svg' | 'png' | 'ts' | 'json' | 'py';
+export type ExportAssetFormat = 'svg' | 'png' | 'ts' | 'json' | 'py' | 'go' | 'rs' | 'sql';
 
 export type LineMutation =
   | { op: 'insert'; after: number; text: string }
@@ -84,7 +84,7 @@ export interface DocInfo {
 /** Explicit finite-state-machine snapshot exposed for E2E harnesses, developers, and AI agents (AX). */
 export interface WebviewMachineSnapshot {
   lifecycle: 'booting' | 'streaming' | 'parsing-json' | 'scanning' | 'ready' | 'error';
-  querySyntax: 'auto' | 'regex' | 'literal';
+  querySyntax: 'auto' | 'regex' | 'literal' | 'sql';
   projection: 'off' | 'projecting' | 'projected';
   search: 'idle' | 'running' | 'awaiting-modules';
   modal: string | null;
@@ -152,6 +152,18 @@ export type HostMessage =
   | { type: 'exportReady'; id: number; ok: boolean }
   | { type: 'exportDone'; id: number; ok: boolean; message: string }
   | { type: 'fileDiff'; otherName: string; otherText: string }
+  | {
+      type: 'streamFileDiff';
+      otherName: string;
+      mode: 'key' | 'line';
+      keyField: string | null;
+      added: number;
+      removed: number;
+      modified: number;
+      unchanged: number;
+      entries: { kind: 'added' | 'removed' | 'modified'; keyLabel: string; leftLine?: number; rightLine?: number; leftText?: string; rightText?: string }[];
+    }
+  | { type: 'schemaLoaded'; name: string; text: string }
   | { type: 'notice'; message: string; action?: 'reload' | 'append' };
 
 export type WebviewMessage =
@@ -182,6 +194,8 @@ export type WebviewMessage =
   | { type: 'diff'; left: { title: string; text: string }; right: { title: string; text: string } }
   /** Ask the host to pick and read another JSON/JSONL file for cross-file diffing. */
   | { type: 'compareWithFile' }
+  /** Ask the host to pick a .schema.json file from disk for JSON Schema validation. */
+  | { type: 'pickSchema' }
   | { type: 'copy'; text: string }
   | { type: 'openAsText' }
   | { type: 'export'; format: ExportAssetFormat; data: string; name: string }

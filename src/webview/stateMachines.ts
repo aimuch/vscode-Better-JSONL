@@ -16,6 +16,9 @@ export type ModalId =
   | 'quality'
   | 'filediff'
   | 'trace'
+  | 'charts'
+  | 'validate'
+  | 'palette'
   | 'settings';
 
 export type PopoverId =
@@ -25,7 +28,8 @@ export type PopoverId =
   | 'ac-menu'
   | 'goto-box'
   | 'grid-filter'
-  | 'col-picker';
+  | 'col-picker'
+  | 'tools-menu';
 
 export interface OverlayTransition {
   closeModal?: ModalId;
@@ -122,20 +126,21 @@ export function trapModalTabKey(container: HTMLElement, e: KeyboardEvent): void 
 
 // ---------- SM-2: Query Syntax & Virtual Projection Machine ----------
 
-export type QuerySyntaxMode = 'auto' | 'regex' | 'literal';
+export type QuerySyntaxMode = 'auto' | 'regex' | 'literal' | 'sql';
 
-export function normalizeQuerySyntax(regex?: boolean, literal?: boolean): QuerySyntaxMode {
+export function normalizeQuerySyntax(regex?: boolean, literal?: boolean, sql?: boolean): QuerySyntaxMode {
+  if (sql) return 'sql';
   if (regex) return 'regex';
   if (literal) return 'literal';
   return 'auto';
 }
 
-export function toggleQuerySyntax(current: QuerySyntaxMode, toggle: 'regex' | 'literal'): QuerySyntaxMode {
+export function toggleQuerySyntax(current: QuerySyntaxMode, toggle: 'regex' | 'literal' | 'sql'): QuerySyntaxMode {
   return current === toggle ? 'auto' : toggle;
 }
 
-export function syntaxToFlags(mode: QuerySyntaxMode): { regex: boolean; literal: boolean } {
-  return { regex: mode === 'regex', literal: mode === 'literal' };
+export function syntaxToFlags(mode: QuerySyntaxMode): { regex: boolean; literal: boolean; sql: boolean } {
+  return { regex: mode === 'regex', literal: mode === 'literal', sql: mode === 'sql' };
 }
 
 export type ProjectionState<M> =

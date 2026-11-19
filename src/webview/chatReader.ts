@@ -2,7 +2,7 @@
 // Supports OpenAI/ChatML messages, Anthropic thinking/tool_use/tool_result, Gemini contents/parts,
 // SFT/DPO prompt/completion/chosen/rejected datasets, and agent step records.
 import { t } from '../shared/i18n';
-import { renderMarkdownSafe } from './inspect';
+import { renderImagePreviewHtml, renderMarkdownSafe } from './inspect';
 import { esc, isArr, isContainer, isObj, stringifyPretty, type JObj, type JVal } from './json';
 
 export interface ToolCallItem {
@@ -274,7 +274,8 @@ export function renderConversationHtml(conv: ConversationView): string {
     const thinkHtml = tr.thinking
       ? `<details class="chat-think"><summary>${esc(t('Thinking / Reasoning'))}</summary><div class="chat-think-body md-body">${renderMarkdownSafe(tr.thinking)}</div></details>`
       : '';
-    const bodyHtml = tr.text ? `<div class="chat-content md-body">${renderMarkdownSafe(tr.text)}</div>` : '';
+    const imgHtml = tr.text ? renderImagePreviewHtml(tr.text) : null;
+    const bodyHtml = imgHtml ? imgHtml : tr.text ? `<div class="chat-content md-body">${renderMarkdownSafe(tr.text)}</div>` : '';
     const callsHtml = (tr.toolCalls ?? [])
       .map(
         (c) =>
@@ -290,4 +291,28 @@ export function renderConversationHtml(conv: ConversationView): string {
     return `<div class="chat-turn role-${tr.role}"><div class="chat-role">${esc(tr.label)}</div>${thinkHtml}${bodyHtml}${callsHtml}${resHtml}</div>`;
   });
   return `<div class="chat-reader">${head}${cards.join('')}</div>`;
+}
+
+/** Side-by-side LLM Eval comparison view for two aligned conversations (Model A vs Model B). */
+export function renderSideBySideEvalHtml(
+  leftLabel: string,
+  left: ConversationView,
+  rightLabel: string,
+  right: ConversationView,
+  verdict?: 'A' | 'tie' | 'B',
+): string {
+  const mkBtn = (v: 'A' | 'tie' | 'B', label: string) =>
+    `<button class="btn${verdict === v ? ' active' : ''}" data-eval-verdict="${v}">${esc(label)}</button>`;
+  return `<div class="eval-sbs">
+    <div class="eval-bar">
+      <span class="dim">${esc(t('LLM Eval Verdict:'))}</span>
+      ${mkBtn('A', t('A wins'))}
+      ${mkBtn('tie', t('Tie'))}
+      ${mkBtn('B', t('B wins'))}
+    </div>
+    <div class="eval-cols">
+      <div class="eval-col"><div class="eval-col-head"><strong>A · ${esc(leftLabel)}</strong></div>${renderConversationHtml(left)}</div>
+      <div class="eval-col"><div class="eval-col-head"><strong>B · ${esc(rightLabel)}</strong></div>${renderConversationHtml(right)}</div>
+    </div>
+  </div>`;
 }

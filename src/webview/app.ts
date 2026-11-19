@@ -15,17 +15,19 @@ import type {
 import { valueSpan } from '../locate';
 import { ByteJsonError, parseJsonBytes } from './byteJson';
 import { collectFieldCandidates, getSearchCompletions, type CompletionItem, type FieldInfo } from './autocomplete';
-import { detectConversation, renderConversationHtml } from './chatReader';
+import { detectConversation, renderConversationHtml, renderSideBySideEvalHtml } from './chatReader';
 import { diffDatasets, parseDatasetRecords } from './datasetDiff';
 import { indexItems, ItemStore } from './items';
 import { diffValues, type Difference } from './diff';
 import { csvRow, inferSqlColumnTypes, mdDivider, mdRow, sqlCreateTable, sqlInsertBatch, tsvRow } from './exporter';
 import {
   decodeSmartValue,
+  detectImageDataUrl,
   extractRecordEpochMs,
   formatDecodedSummary,
   formatDelta,
   parseTimestampMs,
+  renderImagePreviewHtml,
   renderMarkdownSafe,
   tryUnpackJsonString,
   type DecodedInfo,
@@ -46,7 +48,10 @@ import {
   type JObj,
   type JVal,
 } from './json';
-import { computePivot, discoverFieldPaths, renderPivotTableHtml } from './pivot';
+import { ChartsModal } from './modals/chartsModal';
+import { CommandPaletteModal, type PaletteCommand } from './modals/paletteModal';
+import { SchemaValidateModal } from './modals/schemaValidateModal';
+import { computeCrossTab, computePivot, discoverFieldPaths, renderCrossTabHtml, renderPivotTableHtml, type CrossTabResult } from './pivot';
 import { analyzeDataQuality } from './quality';
 import { compactJson, compileQuery, pathOf, type Out, type Program } from './query';
 import { redactJsonLine, redactValue } from './redact';
@@ -66,7 +71,18 @@ import {
   type Query,
 } from './model';
 import { icon } from './icons';
-import { emitJsonSchema, emitPydantic, emitTypeScript, emitZod, inferSchema } from './schema';
+import {
+  emitDuckDbSnippet,
+  emitGoStruct,
+  emitJsonSchema,
+  emitPolarsSnippet,
+  emitPydantic,
+  emitRustSerde,
+  emitTypeScript,
+  emitZod,
+  inferSchema,
+} from './schema';
+import { executeSql, isSqlQueryText, parseSql } from './sql';
 import { SettingsPanel } from './settings';
 import { buildTimeline, detectTimeColumn, renderTimelineHtml, type TimelineData } from './timeline';
 import { FormattedView } from './views/formatted';
@@ -124,6 +140,7 @@ export interface UIState {
   caseSensitive: boolean;
   regex: boolean;
   literal: boolean;
+  sqlMode: boolean;
   filterOnly: boolean;
   bookmarkedOnly: boolean;
   bookmarks: Set<number>;
@@ -144,12 +161,15 @@ export interface UIState {
   foldDepth: number;
   grid: {
     sort: { col: string; dir: 1 | -1 } | null;
+    extraSorts?: { col: string; dir: 1 | -1 }[];
     widths: Record<string, number>;
     open: Set<string>;
     filters: Map<string, ColFilter>;
     hiddenCols: Set<string>;
     pinnedCols: Set<string>;
     promotedCols: string[];
+    computedCols: { id: string; name: string; expr: string }[];
+    showFooter: boolean;
     colOrder: string[];
   };
   graph: { collapsed: Set<string>; selectedNode: string | null };
@@ -176,6 +196,7 @@ interface DocSaved {
   caseSensitive?: boolean;
   regex?: boolean;
   literal?: boolean;
+  sqlMode?: boolean;
   filterOnly?: boolean;
   bookmarkedOnly?: boolean;
   bookmarks?: number[];
@@ -190,6 +211,8 @@ interface DocSaved {
     hiddenCols?: string[];
     pinnedCols?: string[];
     promotedCols?: string[];
+    computedCols?: { id: string; name: string; expr: string }[];
+    showFooter?: boolean;
     colOrder?: string[];
   };
   graph?: { collapsed: string[] };
@@ -330,6 +353,10 @@ export class App {
   private acIndex = -1;
 
   private timelineData: TimelineData | undefined;
+  private chartsModal: ChartsModal | undefined;
+  private validateModal: SchemaValidateModal | undefined;
+  private paletteModal: CommandPaletteModal | undefined;
+  private toolbarResize: ResizeObserver | undefined;
   private timelineModelRef: unknown;
   private timelineModelRev = -1;
   private timelineBrushStart = -1;
@@ -379,7 +406,10 @@ export class App {
   }
 
   private modalElement(id: ModalId): HTMLElement | null {
-    const sel: Record<ModalId, string> = {
+    if (id === 'charts') return this.chartsModal?.el ?? null;
+    if (id === 'validate') return this.validateModal?.el ?? null;
+    if (id === 'palette') return this.paletteModal?.el ?? null;
+    const sel: Record<Exclude<ModalId, 'charts' | 'validate' | 'palette'>, string> = {
       edit: '.editpanel',
       compare: '.comparepanel',
       inspector: '.valpanel',
@@ -397,6 +427,18 @@ export class App {
   private hideModalDom(id: ModalId): void {
     if (id === 'settings') {
       if (this.settings?.open) this.settings.close();
+      return;
+    }
+    if (id === 'charts') {
+      this.chartsModal?.close();
+      return;
+    }
+    if (id === 'validate') {
+      this.validateModal?.close();
+      return;
+    }
+    if (id === 'palette') {
+      this.paletteModal?.close();
       return;
     }
     const el = this.modalElement(id);
@@ -425,6 +467,7 @@ export class App {
       'hist-menu': '.hist-menu',
       'ac-menu': '.ac-menu',
       'goto-box': '.goto-box',
+      'tools-menu': '.tools-menu',
     };
     const el = this.root.querySelector(sel[id]) as HTMLElement | null;
     if (el) el.hidden = true;
@@ -432,6 +475,7 @@ export class App {
     if (restoreFocus) {
       if (id === 'export-menu') (this.toolbar?.querySelector('.export-btn') as HTMLElement | null)?.focus();
       else if (id === 'hist-menu') (this.toolbar?.querySelector('.hist-btn') as HTMLElement | null)?.focus();
+      else if (id === 'tools-menu') (this.toolbar?.querySelector('.tools-btn') as HTMLElement | null)?.focus();
     }
   }
 
@@ -473,7 +517,7 @@ export class App {
   }
 
   get querySyntax(): QuerySyntaxMode {
-    return normalizeQuerySyntax(this.state?.regex, this.state?.literal);
+    return normalizeQuerySyntax(this.state?.regex, this.state?.literal, this.state?.sqlMode);
   }
 
   private machineSnapshot() {
@@ -523,7 +567,7 @@ export class App {
   }
 
   get isProjected(): boolean {
-    return this.transformMode && this.baseModel !== undefined;
+    return this.baseModel !== undefined;
   }
 
   get canRevealSource(): boolean {
@@ -785,6 +829,12 @@ export class App {
       case 'fileDiff':
         if (this.views && this.model) this.openFileDiffPanel(m.otherName, m.otherText);
         break;
+      case 'streamFileDiff':
+        if (this.views && this.model) this.openStreamFileDiffPanel(m);
+        break;
+      case 'schemaLoaded':
+        this.validateModal?.setSchemaFromHost(m.name, m.text);
+        break;
       case 'notice':
         // While a large file loads there is no banner yet: the message takes the place of the progress text.
         if (this.views) this.showBanner(m.message, m.action);
@@ -829,7 +879,7 @@ export class App {
     // A new file over 50 MB asks again before it expands every line.
     this.bigExpandOK = false;
     if (expandMode === 'all' && !model.keepsAll) expandMode = 'focus';
-    const normSyntax = syntaxToFlags(normalizeQuerySyntax(old.regex, old.literal));
+    const normSyntax = syntaxToFlags(normalizeQuerySyntax(old.regex, old.literal, old.sqlMode));
     this.state = {
       view: old.view || prev?.view || config.defaultView,
       expandMode,
@@ -837,6 +887,7 @@ export class App {
       caseSensitive: !!old.caseSensitive,
       regex: normSyntax.regex,
       literal: normSyntax.literal,
+      sqlMode: normSyntax.sql,
       filterOnly: !!old.filterOnly,
       bookmarkedOnly: !!old.bookmarkedOnly && !!(old.bookmarks && old.bookmarks.length),
       bookmarks: new Set((old.bookmarks ?? []).filter(within)),
@@ -862,6 +913,8 @@ export class App {
         hiddenCols: new Set(old.grid?.hiddenCols ?? []),
         pinnedCols: new Set(old.grid?.pinnedCols ?? []),
         promotedCols: [...(old.grid?.promotedCols ?? [])],
+        computedCols: [...(old.grid?.computedCols ?? [])],
+        showFooter: !!old.grid?.showFooter,
         colOrder: [...(old.grid?.colOrder ?? [])],
       },
       graph: { collapsed: new Set(old.graph?.collapsed ?? []), selectedNode: null },
@@ -1663,8 +1716,10 @@ export class App {
     const unpackedJson = typeof val === 'string' ? tryUnpackJsonString(val) : undefined;
     const conv = detectConversation(unpackedJson ?? val) ?? (path.length === 0 ? detectConversation(rootVal) : undefined);
     const isStr = typeof val === 'string';
+    const imgInfo = isStr ? detectImageDataUrl(val) : null;
     const hasJsonTab = isContainer(val) || unpackedJson !== undefined;
     const tabs: { id: string; label: string }[] = [{ id: 'text', label: t('Text') }];
+    if (imgInfo) tabs.push({ id: 'img', label: t('Image') });
     if (conv) tabs.push({ id: 'chat', label: t('Chat') });
     if (isStr) tabs.push({ id: 'md', label: t('Markdown') });
     if (hasJsonTab) tabs.push({ id: 'json', label: t('JSON') });
@@ -1673,15 +1728,17 @@ export class App {
     let activeTab =
       forceTab && tabs.some((tb) => tb.id === forceTab)
         ? forceTab
-        : conv
-          ? 'chat'
-          : decoded.length
-            ? 'dec'
-            : unpackedJson !== undefined
-              ? 'json'
-              : isStr && (val.includes('\n#') || val.includes('```') || val.includes('**'))
-                ? 'md'
-                : 'text';
+        : imgInfo
+          ? 'img'
+          : conv
+            ? 'chat'
+            : decoded.length
+              ? 'dec'
+              : unpackedJson !== undefined
+                ? 'json'
+                : isStr && (val.includes('\n#') || val.includes('```') || val.includes('**'))
+                  ? 'md'
+                  : 'text';
     const pathStr = pathToString(path);
     const pathKey = path.reduce<string>((acc, seg) => childKey(acc, seg), '');
     const canToggleUnpack = isStr && unpackedJson !== undefined && isContainer(unpackedJson) && (this.state.view === 'formatted' || this.state.view === 'grid');
@@ -1737,7 +1794,9 @@ export class App {
         b.setAttribute('aria-selected', String(on));
       });
       const host = panel.querySelector('.vp-host') as HTMLElement;
-      if (activeTab === 'chat' && conv) {
+      if (activeTab === 'img' && isStr) {
+        host.innerHTML = `<div class="val-body img-host" tabindex="0">${renderImagePreviewHtml(val) ?? ''}</div>`;
+      } else if (activeTab === 'chat' && conv) {
         host.innerHTML = `<div class="val-body chat-host" tabindex="0">${renderConversationHtml(conv)}</div>`;
       } else if (activeTab === 'md' && isStr) {
         host.innerHTML = `<div class="val-body md-body" tabindex="0">${renderMarkdownSafe(val)}</div>`;
@@ -1842,11 +1901,11 @@ export class App {
     })(this);
 
     const { schema, sampled } = inferSchema(recordsIter);
-    const stem = this.doc.fileName.replace(/\.(gz|br)$/i, '').replace(/\.[^.]+$/, '');
+    const stem = this.doc.fileName.replace(/\.(gz|br|zst)$/i, '').replace(/\.[^.]+$/, '');
     const typeName = stem.replace(/[^A-Za-z0-9]+/g, ' ').trim().split(/\s+/).map((w) => (w ? w[0].toUpperCase() + w.slice(1) : '')).join('') || 'RecordItem';
     const safeRoot = /^[0-9]/.test(typeName) ? `T${typeName}` : typeName;
 
-    type TabKind = 'ts' | 'jsonschema' | 'pydantic' | 'zod';
+    type TabKind = 'ts' | 'jsonschema' | 'pydantic' | 'zod' | 'go' | 'rust' | 'duckdb' | 'polars';
     let curTab: TabKind = 'ts';
     const renderCode = (kind: TabKind): { code: string; format: ExportAssetFormat; suffix: string } => {
       switch (kind) {
@@ -1858,6 +1917,14 @@ export class App {
           return { code: emitPydantic(schema, safeRoot), format: 'py', suffix: '_models.py' };
         case 'zod':
           return { code: emitZod(schema, `${safeRoot}Schema`), format: 'ts', suffix: '.zod.ts' };
+        case 'go':
+          return { code: emitGoStruct(schema, safeRoot), format: 'go', suffix: '.go' };
+        case 'rust':
+          return { code: emitRustSerde(schema, safeRoot), format: 'rs', suffix: '.rs' };
+        case 'duckdb':
+          return { code: emitDuckDbSnippet(schema, this.doc.fileName), format: 'sql', suffix: '.duckdb.sql' };
+        case 'polars':
+          return { code: emitPolarsSnippet(schema, this.doc.fileName), format: 'py', suffix: '_polars.py' };
       }
     };
 
@@ -1873,6 +1940,10 @@ export class App {
           <button role="tab" class="seg-btn sub" data-stab="jsonschema">JSON Schema</button>
           <button role="tab" class="seg-btn sub" data-stab="pydantic">Pydantic</button>
           <button role="tab" class="seg-btn sub" data-stab="zod">Zod</button>
+          <button role="tab" class="seg-btn sub" data-stab="go">Go</button>
+          <button role="tab" class="seg-btn sub" data-stab="rust">Rust</button>
+          <button role="tab" class="seg-btn sub" data-stab="duckdb">DuckDB</button>
+          <button role="tab" class="seg-btn sub" data-stab="polars">Polars</button>
         </div>
       </div>
       <pre class="val-body mono sp-code" tabindex="0"></pre>
@@ -2081,6 +2152,106 @@ export class App {
 
   // ---------- pivot, quality, dataset diff, trace waterfall & go-to ----------
 
+  private visibleRecordPairsIter(): Iterable<{ line: number; value: JVal }> {
+    const m = this.model;
+    const app = this;
+    return {
+      *[Symbol.iterator]() {
+        if (!m.isJsonl) {
+          const root = m.value(0);
+          if (root === undefined) return;
+          if (isArr(root)) {
+            for (let i = 0; i < root.length; i++) yield { line: i, value: root[i] };
+          } else yield { line: 0, value: root };
+          return;
+        }
+        if (app.state.view === 'grid') {
+          for (const id of (app.views.grid as GridView).visibleRecordIds()) {
+            if (m.isBlank(id)) continue;
+            const v = m.scanValue(id);
+            if (v !== undefined) yield { line: id, value: v };
+          }
+          return;
+        }
+        const hasG = app.hasGlobalRowFilter();
+        if (app.query.text) {
+          for (const id of app.matches) {
+            if (m.isBlank(id) || (hasG && !app.passesGlobalRowFilter(id))) continue;
+            const v = m.scanValue(id);
+            if (v !== undefined) yield { line: id, value: v };
+          }
+          return;
+        }
+        for (let id = 0; id < m.count; id++) {
+          if (m.isBlank(id) || (hasG && !app.passesGlobalRowFilter(id))) continue;
+          const v = m.scanValue(id);
+          if (v !== undefined) yield { line: id, value: v };
+        }
+      },
+    };
+  }
+
+  private openChartsModal(): void {
+    this.activateModal('charts');
+    this.chartsModal?.open();
+    this.stateChanged();
+  }
+
+  private openValidateModal(): void {
+    this.activateModal('validate');
+    this.validateModal?.open();
+    this.stateChanged();
+  }
+
+  private openPaletteModal(): void {
+    const mac = navigator.platform.includes('Mac');
+    const mod = mac ? '⌘' : 'Ctrl+';
+    const cmds: PaletteCommand[] = [
+      { id: 'view-formatted', category: t('View'), label: t('Formatted'), run: () => this.setView('formatted') },
+      { id: 'view-grid', category: t('View'), label: t('Grid'), run: () => this.setView('grid') },
+      { id: 'view-graph', category: t('View'), label: t('Graph'), run: () => this.setView('graph') },
+      { id: 'pivot', category: t('Analyze'), label: t('Pivot & Group By'), run: () => this.openPivotPanel() },
+      { id: 'charts', category: t('Analyze'), label: t('Charts explorer'), run: () => this.openChartsModal() },
+      { id: 'quality', category: t('Analyze'), label: t('Data quality & duplicates'), run: () => this.openQualityPanel() },
+      { id: 'validate', category: t('Schema'), label: t('Validate JSON Schema'), run: () => this.openValidateModal() },
+      { id: 'schema', category: t('Schema'), label: t('Generate types / schema'), run: () => this.openSchemaGenerator() },
+      { id: 'batch', category: t('Edit'), label: t('Batch rewrite with jq…'), run: () => this.openBatchRewrite() },
+      { id: 'filediff', category: t('Compare'), label: t('Compare with file…'), run: () => this.post({ type: 'compareWithFile' }) },
+      { id: 'goto', category: t('Navigate'), label: t('Go to line, % or time…'), shortcut: `${mod}G`, run: () => this.openGotoBox() },
+      { id: 'wrap', category: t('View'), label: t('Toggle Word Wrap'), shortcut: mac ? '⌥Z' : 'Alt+Z', run: () => this.setWrap(!this.state.wrap) },
+      { id: 'bookmark', category: t('Navigate'), label: t('Toggle Bookmark'), shortcut: 'B', run: () => this.toggleBookmark(this.state.active) },
+      { id: 'search', category: t('Search'), label: t('Focus Search Box'), shortcut: `${mod}F`, run: () => (this.toolbar.querySelector('.search input') as HTMLInputElement | null)?.focus() },
+      { id: 'settings', category: t('Settings'), label: t('Settings'), run: () => this.settings?.toggle() },
+    ];
+    this.activateModal('palette');
+    this.paletteModal?.open(cmds);
+    this.stateChanged();
+  }
+
+  private toggleToolsMenu(): void {
+    const menu = this.root.querySelector('.tools-menu') as HTMLElement | null;
+    if (!menu) return;
+    if (!menu.hidden) {
+      menu.hidden = true;
+      this.onPopoverClosed('tools-menu');
+      return;
+    }
+    this.onPopoverOpened('tools-menu');
+    menu.innerHTML = `
+      <button class="menu-item" role="menuitem" data-tool="pivot">${icon('pivot', 13)}<span>${esc(t('Pivot & Group By'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="charts">${icon('charts', 13)}<span>${esc(t('Charts explorer'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="quality">${icon('shield', 13)}<span>${esc(t('Data quality & duplicates'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="validate">${icon('check-doc', 13)}<span>${esc(t('Validate JSON Schema'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="schema">${icon('schema', 13)}<span>${esc(t('Generate types / schema'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="wand">${icon('wand', 13)}<span>${esc(t('Batch rewrite with jq…'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="filediff">${icon('diff-files', 13)}<span>${esc(t('Compare with file…'))}</span></button>
+      <button class="menu-item" role="menuitem" data-tool="palette">${icon('command', 13)}<span>${esc(t('Command palette & shortcuts'))}</span></button>`;
+    menu.hidden = false;
+    const btn = this.toolbar.querySelector('.tools-btn') as HTMLElement | null;
+    if (btn) this.placeMenuBelow(btn, menu);
+    (menu.querySelector('button') as HTMLElement | null)?.focus();
+  }
+
   private visibleValuesIter(): Iterable<JVal> {
     const m = this.model;
     const app = this;
@@ -2126,11 +2297,14 @@ export class App {
     if (!paths.length) return;
     this.activateModal('pivot');
     let groupStr = paths[0].label;
+    let colStr = '';
     let metricStr = paths.find((p) => p.isNumeric && p.label !== groupStr)?.label ?? '';
     let sortBy: 'count' | 'sum' | 'avg' | 'group' = 'count';
     let lastRes = computePivot(this.visibleValuesIter(), paths[0].path, metricStr ? (parsePath(metricStr) ?? null) : null, sortBy);
+    let lastXtab: CrossTabResult | null = null;
 
     const groupOpts = paths.map((p) => `<option value="${esc(p.label)}">${esc(p.label)}</option>`).join('');
+    const colOpts = `<option value="">${esc(t('(None — 1D)'))}</option>` + groupOpts;
     const numOpts = `<option value="">${esc(t('(Count only)'))}</option>` + paths.filter((p) => p.isNumeric).map((p) => `<option value="${esc(p.label)}"${p.label === metricStr ? ' selected' : ''}>${esc(p.label)}</option>`).join('');
 
     panel.innerHTML = `
@@ -2140,6 +2314,7 @@ export class App {
       </div>
       <div class="batch-bar piv-controls">
         <label class="piv-ctl"><span>${esc(t('Group by'))}</span><select data-piv-group>${groupOpts}</select></label>
+        <label class="piv-ctl"><span>${esc(t('Columns (2D)'))}</span><select data-piv-col>${colOpts}</select></label>
         <label class="piv-ctl"><span>${esc(t('Metric field'))}</span><select data-piv-metric>${numOpts}</select></label>
         <div class="seg" role="group">
           <button class="seg-btn sub on" data-psort="count">${esc(t('Count'))} ↓</button>
@@ -2159,11 +2334,20 @@ export class App {
     const host = panel.querySelector('.piv-host') as HTMLElement;
     const meta = panel.querySelector('.piv-meta') as HTMLElement;
     const gSel = panel.querySelector('[data-piv-group]') as HTMLSelectElement;
+    const cSel = panel.querySelector('[data-piv-col]') as HTMLSelectElement;
     const mSel = panel.querySelector('[data-piv-metric]') as HTMLSelectElement;
 
     const recompute = () => {
       const gp = parsePath(groupStr) ?? [groupStr];
       const mp = metricStr ? (parsePath(metricStr) ?? [metricStr]) : null;
+      if (colStr && colStr !== groupStr) {
+        const cp = parsePath(colStr) ?? [colStr];
+        lastXtab = computeCrossTab(this.visibleValuesIter(), gp, cp, mp);
+        meta.textContent = `${lastXtab.rowLabels.length} × ${lastXtab.colLabels.length} · ${t('{0} records', lastXtab.totalRecords.toLocaleString())}`;
+        host.innerHTML = renderCrossTabHtml(lastXtab);
+        return;
+      }
+      lastXtab = null;
       lastRes = computePivot(this.visibleValuesIter(), gp, mp, sortBy);
       meta.textContent = t('{0} groups · {1} records', lastRes.groups.length.toLocaleString(), lastRes.totalRecords.toLocaleString());
       panel.querySelectorAll<HTMLButtonElement>('[data-psort]').forEach((b) => b.classList.toggle('on', b.dataset.psort === sortBy));
@@ -2175,12 +2359,28 @@ export class App {
       groupStr = gSel.value;
       recompute();
     };
+    cSel.onchange = () => {
+      colStr = cSel.value;
+      recompute();
+    };
     mSel.onchange = () => {
       metricStr = mSel.value;
       recompute();
     };
     panel.onclick = (e) => {
       const target = e.target as HTMLElement;
+      const xcell = target.closest('.piv-cell') as HTMLElement | null;
+      if (xcell && lastXtab) {
+        const ri = Number(xcell.dataset.xrow);
+        const ci = Number(xcell.dataset.xcol);
+        const rf = lastXtab.rowFilters[ri];
+        const cf = lastXtab.colFilters[ci];
+        if (rf && cf) {
+          this.closePivotPanel(false);
+          this.applyQueryFromUI(`(${rf}) and (${cf})`, true);
+        }
+        return;
+      }
       const row = target.closest('.piv-row') as HTMLElement | null;
       if (row) {
         const g = lastRes.groups[Number(row.dataset.pidx)];
@@ -2349,7 +2549,11 @@ export class App {
                   : en.right !== undefined
                     ? compactJson(en.right).slice(0, 200)
                     : '–';
-              return `<tr class="${cls}"><td><span class="badge">${esc(badgeLbl)}</span></td><td class="mono">${esc(en.keyLabel)}</td><td class="mono">${esc(leftCell)}</td><td class="mono">${esc(rightCell)}</td></tr>`;
+              const evalBtn =
+                en.left !== undefined && en.right !== undefined && detectConversation(en.left) && detectConversation(en.right)
+                  ? ` <button class="btn fd-eval-btn" data-fd-eval="${en.keyLabel}">${esc(t('Chat Eval'))}</button>`
+                  : '';
+              return `<tr class="${cls}"><td><span class="badge">${esc(badgeLbl)}</span>${evalBtn}</td><td class="mono">${esc(en.keyLabel)}</td><td class="mono">${esc(leftCell)}</td><td class="mono">${esc(rightCell)}</td></tr>`;
             })
             .join('')}</tbody></table>`
         : `<div class="empty-note">${esc(t('No differences between the two files.'))}</div>`;
@@ -2389,10 +2593,32 @@ export class App {
     panel.hidden = false;
     paintDiff();
 
+    const evalVerdicts = new Map<string, 'A' | 'tie' | 'B'>();
+    let activeEvalKey: string | null = null;
     panel.onclick = (e) => {
       const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
       if (!btn) return;
-      if (btn.dataset.fdtab) {
+      if (btn.dataset.fdEval) {
+        const key = btn.dataset.fdEval;
+        const res = diffDatasets(leftRecords, rightRecords, keyMode);
+        const en = res.entries.find((x) => x.keyLabel === key);
+        const lc = en?.left !== undefined ? detectConversation(en.left) : undefined;
+        const rc = en?.right !== undefined ? detectConversation(en.right) : undefined;
+        if (lc && rc) {
+          activeEvalKey = key;
+          const host = panel.querySelector('.cmp-scroll') as HTMLElement;
+          host.innerHTML =
+            `<div class="eval-back-bar"><button class="btn" data-fd-back>← ${esc(t('Back to table'))}</button><span class="mono">${esc(key)}</span></div>` +
+            renderSideBySideEvalHtml(this.doc.fileName, lc, otherName, rc, evalVerdicts.get(key));
+        }
+      } else if (btn.hasAttribute('data-fd-back')) {
+        activeEvalKey = null;
+        paintDiff();
+      } else if (btn.dataset.evalVerdict && activeEvalKey) {
+        evalVerdicts.set(activeEvalKey, btn.dataset.evalVerdict as 'A' | 'tie' | 'B');
+        panel.querySelectorAll<HTMLButtonElement>('[data-eval-verdict]').forEach((b) => b.classList.toggle('active', b === btn));
+      } else if (btn.dataset.fdtab) {
+        activeEvalKey = null;
         tabFilter = btn.dataset.fdtab as typeof tabFilter;
         paintDiff();
       } else if (btn.classList.contains('fd-open-diff')) {
@@ -2404,6 +2630,44 @@ export class App {
       } else if (btn.classList.contains('fd-close')) {
         this.closeFileDiffPanel();
       }
+    };
+    (panel.querySelector('.fd-close') as HTMLElement | null)?.focus();
+    this.stateChanged();
+  }
+
+  private openStreamFileDiffPanel(msg: Extract<HostMessage, { type: 'streamFileDiff' }>): void {
+    this.activateModal('filediff');
+    const panel = this.root.querySelector('.filediffpanel') as HTMLElement;
+    const rowsHtml = msg.entries.length
+      ? `<table class="cmp fd-tbl"><thead><tr><th>${esc(t('Status'))}</th><th>${esc(msg.keyField ?? '#')}</th><th>${esc(this.doc.fileName)}</th><th>${esc(msg.otherName)}</th></tr></thead><tbody>${msg.entries
+          .map(
+            (en) =>
+              `<tr class="cmp-${en.kind === 'added' ? 'add' : en.kind === 'removed' ? 'del' : 'chg'}"><td><span class="badge">${esc(en.kind)}</span></td><td class="mono">${esc(en.keyLabel)}</td><td class="mono">${esc((en.leftText ?? '–').slice(0, 200))}</td><td class="mono">${esc((en.rightText ?? '–').slice(0, 200))}</td></tr>`,
+          )
+          .join('')}</tbody></table>`
+      : `<div class="empty-note">${esc(t('No differences between the two files.'))}</div>`;
+    panel.innerHTML = `
+      <div class="ep-head">
+        <span class="ep-title">${icon('diff-files', 14)} ${esc(t('Dataset comparison'))} <span class="badge">${esc(t('Streaming'))}</span></span>
+        <span class="dim mono">${esc(this.doc.fileName)} ↔ ${esc(msg.otherName)}</span>
+      </div>
+      <div class="batch-bar fd-bar">
+        <span>+${esc(t('Added'))}: <strong>${msg.added.toLocaleString()}</strong></span>
+        <span>-${esc(t('Removed'))}: <strong>${msg.removed.toLocaleString()}</strong></span>
+        <span>~${esc(t('Modified'))}: <strong>${msg.modified.toLocaleString()}</strong></span>
+        <span class="dim">${esc(t('Unchanged'))}: ${msg.unchanged.toLocaleString()}</span>
+      </div>
+      <div class="cmp-scroll">${rowsHtml}</div>
+      <div class="ep-actions">
+        <button class="btn fd-pick-other">${esc(t('Compare with file…'))}</button>
+        <button class="btn fd-close">${esc(t('Close'))} <kbd>Esc</kbd></button>
+      </div>`;
+    panel.hidden = false;
+    panel.onclick = (e) => {
+      const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
+      if (!btn) return;
+      if (btn.classList.contains('fd-pick-other')) this.post({ type: 'compareWithFile' });
+      else if (btn.classList.contains('fd-close')) this.closeFileDiffPanel();
     };
     (panel.querySelector('.fd-close') as HTMLElement | null)?.focus();
     this.stateChanged();
@@ -3120,6 +3384,7 @@ export class App {
       <div class="ac-menu menu" hidden role="listbox"></div>
       <div class="export-menu menu" hidden role="menu" aria-label="${t('Export')}"></div>
       <div class="hist-menu menu" hidden role="menu" aria-label="${t('Query history and saved queries')}"></div>
+      <div class="tools-menu menu" hidden role="menu" aria-label="${t('Tools')}"></div>
       <div class="ctx-menu menu" hidden role="menu"></div>`;
     this.toolbar = this.root.querySelector('.toolbar') as HTMLElement;
     this.timelineEl = this.root.querySelector('.timeline-bar') as HTMLElement;
@@ -3287,6 +3552,36 @@ export class App {
 
     this.settings = new SettingsPanel(this);
     this.root.appendChild(this.settings.el);
+    this.chartsModal = new ChartsModal({
+      records: () => this.visibleRecordPairsIter(),
+      fileName: this.doc.fileName,
+      jumpToLine: (line) => {
+        this.selectRecord(line);
+        this.activeView.onActiveChanged(true);
+      },
+      exportSvg: (svg, name) => this.post({ type: 'export', format: 'svg', data: svg, name }),
+      onClose: () => this.deactivateModal('charts'),
+    });
+    this.root.appendChild(this.chartsModal.el);
+    this.validateModal = new SchemaValidateModal({
+      records: () => this.visibleRecordPairsIter(),
+      pickSchemaFile: () => this.post({ type: 'pickSchema' }),
+      filterLines: (label, lines) => {
+        this.state.subsetFilter = { label, ids: new Set(lines) };
+        this.subsetRev++;
+        this.activeView.render();
+        this.paintChrome();
+        this.stateChanged();
+      },
+      jumpToLine: (line) => {
+        this.selectRecord(line);
+        this.activeView.onActiveChanged(true);
+      },
+      onClose: () => this.deactivateModal('validate'),
+    });
+    this.root.appendChild(this.validateModal.el);
+    this.paletteModal = new CommandPaletteModal(() => this.deactivateModal('palette'));
+    this.root.appendChild(this.paletteModal.el);
     this.views = {
       formatted: new FormattedView(this),
       grid: new GridView(this),
@@ -3412,6 +3707,7 @@ export class App {
         <button class="sopt-btn case-btn" aria-label="${t('Match case')}" aria-pressed="false" title="${t('Match case')}">Aa</button>
         <button class="sopt-btn regex-btn" aria-label="${t('Regular expression')}" aria-pressed="false" title="${t('Regular expression')}">.*</button>
         <button class="sopt-btn lit-btn" aria-label="${t('Literal text search (do not parse as jq or JSONPath)')}" aria-pressed="false" title="${t('Literal text search (do not parse as jq or JSONPath)')}">""</button>
+        <button class="sopt-btn sql-btn" aria-label="${t('SQL query mode (SELECT ... WHERE ... GROUP BY ...)')}" aria-pressed="false" title="${t('SQL query mode (SELECT ... WHERE ... GROUP BY ...)')}">SQL</button>
         <button class="icon-btn star-btn" hidden aria-label="${t('Save current query')}" aria-pressed="false" title="${t('Save current query')}">${icon('star', 13)}</button>
         <button class="icon-btn hist-btn" aria-haspopup="menu" aria-label="${t('Query history and saved queries')}" title="${t('Query history and saved queries')}">${icon('history', 13)}</button>
         <button class="icon-btn" data-step="-1" aria-label="${t('Previous match')}">${icon('chev-up')}</button>
@@ -3422,22 +3718,52 @@ export class App {
       <div class="tb-right">
         <div class="stats"></div>
         <button class="icon-btn timeline-btn" hidden aria-pressed="false" aria-label="${t('Timeline')}" title="${t('Toggle timeline distribution bar')}">${icon('timeline')}</button>
-        <button class="icon-btn pivot-btn" hidden aria-label="${t('Pivot & Group By')}" title="${t('Group by field and aggregate metrics')}">${icon('pivot')}</button>
-        <button class="icon-btn quality-btn" hidden aria-label="${t('Data quality & duplicates')}" title="${t('Check duplicates, type drift and missing fields')}">${icon('shield')}</button>
+        <button class="icon-btn tb-tool pivot-btn" hidden aria-label="${t('Pivot & Group By')}" title="${t('Group by field and aggregate metrics')}">${icon('pivot')}</button>
+        <button class="icon-btn tb-tool charts-btn" aria-label="${t('Charts explorer')}" title="${t('Time-series, bar and scatter charts')}">${icon('charts')}</button>
+        <button class="icon-btn tb-tool quality-btn" hidden aria-label="${t('Data quality & duplicates')}" title="${t('Check duplicates, type drift and missing fields')}">${icon('shield')}</button>
         <button class="icon-btn bm-btn" hidden aria-pressed="false" aria-label="${t('Bookmark')}" title="${t('Show only bookmarked lines')}">${icon('bookmark')}</button>
         <button class="icon-btn cols-btn" hidden aria-pressed="false" aria-label="${t('Columns')}" title="${t('Show, hide, pin or reorder columns')}">${icon('columns')}</button>
-        <span class="tb-sep" role="separator" aria-orientation="vertical"></span>
-        <button class="icon-btn schema-btn" aria-label="${t('Generate types / schema')}" title="${t('Infer TypeScript, JSON Schema, Pydantic or Zod from records')}">${icon('schema')}</button>
-        <button class="icon-btn wand-btn" hidden aria-label="${t('Batch rewrite with jq…')}" title="${t('Batch rewrite with jq…')}">${icon('wand')}</button>
-        <button class="icon-btn filediff-btn" aria-label="${t('Compare with file…')}" title="${t('Compare current dataset with another JSON/JSONL file')}">${icon('diff-files')}</button>
+        <span class="tb-sep tb-tool" role="separator" aria-orientation="vertical"></span>
+        <button class="icon-btn tb-tool validate-btn" aria-label="${t('Validate JSON Schema')}" title="${t('Validate records against a JSON Schema')}">${icon('check-doc')}</button>
+        <button class="icon-btn tb-tool schema-btn" aria-label="${t('Generate types / schema')}" title="${t('Infer TypeScript, JSON Schema, Pydantic, Zod, Go, Rust, DuckDB or Polars')}">${icon('schema')}</button>
+        <button class="icon-btn tb-tool wand-btn" hidden aria-label="${t('Batch rewrite with jq…')}" title="${t('Batch rewrite with jq…')}">${icon('wand')}</button>
+        <button class="icon-btn tb-tool filediff-btn" aria-label="${t('Compare with file…')}" title="${t('Compare current dataset with another JSON/JSONL file')}">${icon('diff-files')}</button>
         <button class="icon-btn compare-btn" aria-label="${t('Compare the two selected lines')}" title="${t('Compare the two selected lines')}">${icon('compare')}</button>
+        <button class="icon-btn tools-btn" hidden aria-haspopup="menu" aria-label="${t('Tools')}" title="${t('More analysis tools')}">${icon('more')}</button>
         <span class="tb-sep" role="separator" aria-orientation="vertical"></span>
         <button class="icon-btn follow-btn" aria-pressed="false" aria-label="${t('Follow the end of the file')}" title="${t('Follow the end of the file: new lines show at once')}">${icon('follow')}</button>
         <button class="icon-btn export-btn" aria-haspopup="menu" aria-label="${t('Export rows')}" title="${t('Export rows as JSON Lines, CSV, TSV, JSON, Markdown or SQL')}">${icon('download')}</button>
         <button class="icon-btn wrap-btn" aria-label="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" title="${t('Word wrap ({0})', mac ? '⌥Z' : 'Alt+Z')}" aria-pressed="false">${icon('wrap')}</button>
         <button class="icon-btn open-text" aria-label="${t('Open as text')}" title="${t('Open as text')}">${icon('file-code')}</button>
+        <button class="icon-btn palette-btn" aria-label="${t('Command palette & shortcuts')}" title="${t('Command palette & shortcuts (?)')}">${icon('command')}</button>
         <button class="icon-btn gear-btn" aria-label="${t('Settings')}" title="${t('Settings')}">${icon('gear')}</button>
       </div>`;
+
+    this.toolbarResize?.disconnect();
+    this.toolbarResize = new ResizeObserver(() => {
+      const compact = tb.clientWidth > 0 && tb.clientWidth < 680;
+      tb.classList.toggle('tb-compact', compact);
+      const tbtn = tb.querySelector('.tools-btn') as HTMLElement | null;
+      if (tbtn) tbtn.hidden = !compact;
+    });
+    this.toolbarResize.observe(tb);
+
+    const toolsMenu = this.root.querySelector('.tools-menu') as HTMLElement | null;
+    toolsMenu?.addEventListener('click', (e) => {
+      const item = (e.target as HTMLElement).closest('[data-tool]') as HTMLElement | null;
+      if (!item) return;
+      toolsMenu.hidden = true;
+      this.onPopoverClosed('tools-menu');
+      const id = item.dataset.tool;
+      if (id === 'pivot') this.openPivotPanel();
+      else if (id === 'charts') this.openChartsModal();
+      else if (id === 'quality') this.openQualityPanel();
+      else if (id === 'validate') this.openValidateModal();
+      else if (id === 'schema') this.openSchemaGenerator();
+      else if (id === 'wand') this.openBatchRewrite();
+      else if (id === 'filediff') this.post({ type: 'compareWithFile' });
+      else if (id === 'palette') this.openPaletteModal();
+    });
 
     tb.addEventListener('click', (e) => {
       const btn = (e.target as HTMLElement).closest('button') as HTMLButtonElement | null;
@@ -3450,11 +3776,13 @@ export class App {
       else if (btn.classList.contains('case-btn')) {
         this.state.caseSensitive = !this.state.caseSensitive;
         this.rerunSearch();
-      } else if (btn.classList.contains('regex-btn') || btn.classList.contains('lit-btn')) {
-        const nextMode = toggleQuerySyntax(this.querySyntax, btn.classList.contains('regex-btn') ? 'regex' : 'literal');
+      } else if (btn.classList.contains('regex-btn') || btn.classList.contains('lit-btn') || btn.classList.contains('sql-btn')) {
+        const kind = btn.classList.contains('regex-btn') ? 'regex' : btn.classList.contains('lit-btn') ? 'literal' : 'sql';
+        const nextMode = toggleQuerySyntax(this.querySyntax, kind);
         const flags = syntaxToFlags(nextMode);
         this.state.regex = flags.regex;
         this.state.literal = flags.literal;
+        this.state.sqlMode = flags.sql;
         if (nextMode !== 'auto') this.transformMode = false;
         this.rerunSearch();
       } else if (btn.classList.contains('star-btn')) this.toggleSaveQuery();
@@ -3488,6 +3816,10 @@ export class App {
         (this.views.grid as GridView).toggleColPicker();
         this.paintChrome();
       } else if (btn.classList.contains('pivot-btn')) this.openPivotPanel();
+      else if (btn.classList.contains('charts-btn')) this.openChartsModal();
+      else if (btn.classList.contains('validate-btn')) this.openValidateModal();
+      else if (btn.classList.contains('palette-btn')) this.openPaletteModal();
+      else if (btn.classList.contains('tools-btn')) this.toggleToolsMenu();
       else if (btn.classList.contains('quality-btn')) this.openQualityPanel();
       else if (btn.classList.contains('filediff-btn')) this.post({ type: 'compareWithFile' });
       else if (btn.classList.contains('schema-btn')) this.openSchemaGenerator();
@@ -3675,6 +4007,45 @@ export class App {
       if (ask.length) this.post({ type: 'readModules', keys: ask });
       finish([]);
       return;
+    }
+
+    // Lightweight SQL query mode (auto-detected on `SELECT ...` or toggled via SQL button).
+    const rawSql = this.state.query.trim();
+    if (rawSql && (this.state.sqlMode || (!this.state.regex && !this.state.literal && isSqlQueryText(rawSql)))) {
+      try {
+        const parsed = parseSql(rawSql);
+        const recIter = (function* (): Generator<JVal> {
+          if (!srcModel.isJsonl) {
+            const root = srcModel.value(0);
+            if (root !== undefined) {
+              if (isArr(root)) for (const it of root) yield it;
+              else yield root;
+            }
+            return;
+          }
+          for (let i = 0; i < srcModel.count; i++) {
+            const v = srcModel.scanValue(i);
+            if (v !== undefined) yield v;
+          }
+        })();
+        const res = executeSql(parsed, recIter);
+        this.baseModel = srcModel;
+        this.model = DocModel.fromValues(res.rows);
+        this.timelineData = undefined;
+        this.state.active = 0;
+        this.state.anchor = 0;
+        this.state.selected = res.rows.length ? new Set([0]) : new Set();
+        finish(res.rows.map((_, idx) => idx));
+        this.queryNotes = [`SQL · ${res.rows.length.toLocaleString()} rows`];
+        return;
+      } catch (e) {
+        if (this.state.sqlMode) {
+          restoreBaseModel();
+          finish([]);
+          this.queryNotes = [`SQL: ${errorMessage(e)}`];
+          return;
+        }
+      }
     }
 
     // F4: jq / JSONPath Transform projection mode!
@@ -3959,6 +4330,7 @@ export class App {
     syncPressed('.case-btn', s.caseSensitive);
     syncPressed('.regex-btn', s.regex);
     syncPressed('.lit-btn', s.literal);
+    syncPressed('.sql-btn', s.sqlMode);
 
     const starBtn = tb.querySelector('.star-btn') as HTMLButtonElement;
     const qTrim = s.query.trim();
@@ -4204,6 +4576,15 @@ export class App {
       case 'compare':
         this.closeCompare();
         break;
+      case 'charts':
+        this.deactivateModal('charts');
+        break;
+      case 'validate':
+        this.deactivateModal('validate');
+        break;
+      case 'palette':
+        this.deactivateModal('palette');
+        break;
       case 'settings':
         this.settings?.close();
         break;
@@ -4233,6 +4614,11 @@ export class App {
       input?.select();
       return;
     }
+    if (mod && e.shiftKey && e.key.toLowerCase() === 'p' && !this.hasOpenModal()) {
+      e.preventDefault();
+      this.openPaletteModal();
+      return;
+    }
     if (mod && e.key.toLowerCase() === 'g' && this.model?.isJsonl && !this.hasOpenModal()) {
       e.preventDefault();
       this.openGotoBox();
@@ -4242,6 +4628,11 @@ export class App {
     const tag = target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !this.model || !this.views || this.hasOpenModal()) return;
     if (target.closest('.toolbar, .menu, .gfilter, .col-picker')) return;
+    if (!mod && !e.altKey && e.key === '?') {
+      e.preventDefault();
+      this.openPaletteModal();
+      return;
+    }
     // Enter and Space on a button press that button; they are not "edit the record".
     if ((e.key === 'Enter' || e.key === ' ') && target.closest('button, [role="button"], [role="columnheader"]')) return;
     if (!this.model.isJsonl) return;
@@ -4312,6 +4703,14 @@ export class App {
       e.preventDefault();
       this.openEditor(this.state.active);
     } else if (mod && e.key.toLowerCase() === 'c') {
+      if (this.state.view === 'grid' && !window.getSelection()?.toString()) {
+        const rangeTsv = (this.views.grid as GridView).copyRangeTsv();
+        if (rangeTsv) {
+          e.preventDefault();
+          this.post({ type: 'copy', text: rangeTsv });
+          return;
+        }
+      }
       const text = [...this.state.selected].sort((a, b) => a - b).map((r) => this.model.line(r)).join('\n');
       if (text && !window.getSelection()?.toString()) {
         e.preventDefault();
@@ -4344,6 +4743,7 @@ export class App {
       caseSensitive: s.caseSensitive,
       regex: s.regex,
       literal: s.literal,
+      sqlMode: s.sqlMode,
       filterOnly: s.filterOnly,
       bookmarkedOnly: s.bookmarkedOnly,
       bookmarks: head(s.bookmarks, MAX_RANGE),
@@ -4360,6 +4760,8 @@ export class App {
         hiddenCols: head(s.grid.hiddenCols, 500),
         pinnedCols: head(s.grid.pinnedCols, 50),
         promotedCols: s.grid.promotedCols.slice(0, 200),
+        computedCols: s.grid.computedCols.slice(0, 50),
+        showFooter: s.grid.showFooter,
         colOrder: s.grid.colOrder.slice(0, 500),
       },
       graph: { collapsed: head(s.graph.collapsed, 500) },

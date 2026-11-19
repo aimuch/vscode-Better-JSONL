@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.0
+
+- **Lightweight SQL Query Mode (`SELECT ... WHERE ... GROUP BY ... ORDER BY ... LIMIT`)**: run zero-dependency SQL queries directly in the search bar (auto-detected on `SELECT ` or via the `SQL` toggle) with `COUNT(*)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `LIKE`, `IN`, `IS NULL`, nested paths, and aliases — projecting results into Formatted, Grid, Graph, and Export views.
+- **Interactive Charts Explorer**: pure SVG **Time-Series Multi-Line**, **Grouped Bar**, and **2D Scatter** plots with click-to-jump record navigation and one-click SVG export.
+- **2D Cross-Tab Pivot Matrix & Streaming Sketches**: Pivot now supports **Row × Column** 2D heatmap cross-tabs with click-to-filter cells, backed by $O(1)$-memory **QuantileSketch** (DDSketch) and **HyperLogLog** distinct cardinality estimation for multi-million-row datasets.
+- **Grid Multi-Column Sort, Computed Virtual Columns, Range Selection & Summary Footer**: `Shift+Click` column headers for multi-column priority sorting (`1, 2, …`), add `jq`-powered **Computed Virtual Columns** in the Columns manager, `Shift+Click` cells for rectangular range selection (live `Range R×C · Σ · μ` + `Cmd/Ctrl+C` TSV copy), and toggle the sticky **Summary Footer (`Σ`)**.
+- **JSON Schema Validation (`Validate JSON Schema`)**: load a `.schema.json` file from disk or paste a schema inline to validate every record (`type`, `required`, `properties`, `enum`, `const`, `minimum`/`maximum`, `pattern`, `items`, `anyOf`/`oneOf`/`allOf`), inspect violations, and filter invalid lines in one click.
+- **Zstandard (`.zst`) & Multi-File Merge Viewer (`betterJsonl.mergeFiles`)**: native `.jsonl.zst` / `.ndjson.zst` / `.jsonlines.zst` / `.json.zst` streaming support (on Node 22.15+ runtimes), plus **Merge Open JSON/JSONL Files…** to view multiple shard files together with `_file` source metadata.
+- **Streaming Hash-Indexed Large-File Comparison (>50 MB)**: comparing files over 20 MB automatically switches to host-side streaming FNV-1a hash indexing, breaking the previous 50 MB RAM barrier.
+- **Multimodal Image Preview & LLM Eval Side-by-Side**: safe inline rendering of `data:image/*` thumbnails in Value Inspector and Chat Reader, plus side-by-side **Chat Eval** comparison (`A wins / Tie / B wins`) in Cross-File Dataset Diff.
+- **Extended Schema & Analysis Code Generators**: added **Go `struct`**, **Rust `serde`**, **DuckDB SQL**, and **Python Polars** emitters alongside TypeScript, JSON Schema, Pydantic, and Zod.
+- **Graph Viewport Culling, Responsive Overflow Toolbar & Command Palette (`?` / `Cmd/Ctrl+Shift+P`)**: Graph view now culls off-screen SVG nodes on pan/zoom; narrow sidebars collapse analysis tools into a `⋯ Tools` menu; inline Web Worker (`worker-src blob:`) + cancelable time-sliced runner (`compute.ts`) and modular `src/webview/modals/*.ts` architecture.
+
 ## 0.9.0
 
 - **Promote & Flatten Nested Paths to Grid Columns**: right-click any nested field (`Add as Grid column`) or use the Grid **Columns** manager (`Add nested path`, `Flatten 1 level`) to promote nested paths like `user.name` or `usage.total_tokens` into first-class sortable, filterable, pinnable, and exportable Grid columns.

@@ -76,6 +76,8 @@ export class GraphView implements View {
   private readonly mini: HTMLCanvasElement;
   private miniDrag = false;
   private miniMap = { x: 0, y: 0, scale: 1, ox: 0, oy: 0 };
+  private cullRaf = 0;
+  private lastCullBox: { x0: number; y0: number; x1: number; y1: number } | null = null;
   /** Ends the window listeners when the view is replaced. */
   private readonly gone = new AbortController();
 
@@ -484,13 +486,26 @@ export class GraphView implements View {
 
   // ---------- paint ----------
 
-  private paint(): void {
+  private paint(cull = true): void {
     const sel = this.app.state.graph.selectedNode;
     const isText = isTextQuery(this.app.query);
+    const vw = this.canvasEl.clientWidth;
+    const vh = this.canvasEl.clientHeight;
+    const useCull = cull && this.nodes.length > 200 && vw > 0 && vh > 0;
+    const margin = 280;
+    const vx0 = useCull ? (-this.tx - margin) / this.k : -Infinity;
+    const vy0 = useCull ? (-this.ty - margin) / this.k : -Infinity;
+    const vx1 = useCull ? (vw - this.tx + margin) / this.k : Infinity;
+    const vy1 = useCull ? (vh - this.ty + margin) / this.k : Infinity;
+    this.lastCullBox = useCull ? { x0: vx0, y0: vy0, x1: vx1, y1: vy1 } : null;
+    const inView = (n: GNode) => !useCull || n.key === sel || (n.x + n.w >= vx0 && n.x <= vx1 && n.y + n.h >= vy0 && n.y <= vy1);
+
     const edges: string[] = [];
     const nodes: string[] = [];
     for (const n of this.nodes) {
+      const nVis = inView(n);
       n.children.forEach((c, i) => {
+        if (!nVis && !inView(c)) return;
         const y1 = n.y + HEADER_H + n.childRows[i] * ROW_H + ROW_H / 2;
         const x1 = n.x + n.w;
         const x2 = c.x;
@@ -499,6 +514,7 @@ export class GraphView implements View {
         const on = sel === c.key || sel === n.key;
         edges.push(`<path class="ge${on ? ' on' : ''}" d="M${x1} ${y1} C${x1 + dx} ${y1} ${x2 - dx} ${y2} ${x2} ${y2}"/><circle class="gdot${on ? ' on' : ''}" cx="${x1}" cy="${y1}" r="3"/>`);
       });
+      if (!nVis) continue;
       const rows = n.rows
         .map((r, i) => {
           const y = HEADER_H + i * ROW_H;
@@ -535,6 +551,23 @@ export class GraphView implements View {
     this.vp.setAttribute('transform', `translate(${this.tx},${this.ty}) scale(${this.k})`);
     (this.el.querySelector('.zlabel') as HTMLElement).textContent = `${Math.round(this.k * 100)}%`;
     this.paintMini();
+    if (this.nodes.length > 200 && this.lastCullBox) {
+      const vw = this.canvasEl.clientWidth;
+      const vh = this.canvasEl.clientHeight;
+      const curX0 = -this.tx / this.k;
+      const curY0 = -this.ty / this.k;
+      const curX1 = (vw - this.tx) / this.k;
+      const curY1 = (vh - this.ty) / this.k;
+      const b = this.lastCullBox;
+      if (curX0 < b.x0 + 60 || curY0 < b.y0 + 60 || curX1 > b.x1 - 60 || curY1 > b.y1 - 60) {
+        if (!this.cullRaf) {
+          this.cullRaf = requestAnimationFrame(() => {
+            this.cullRaf = 0;
+            this.paint(true);
+          });
+        }
+      }
+    }
   }
 
   /** Draws the overview. It shows only when part of the graph is outside the view. */
@@ -829,6 +862,8 @@ export class GraphView implements View {
   }
 
   exportImage(format: 'svg' | 'png'): void {
+    const wasCulled = this.lastCullBox !== null;
+    if (wasCulled) this.paint(false);
     const b = this.bounds();
     const pad = 24;
     const css = getComputedStyle(document.body);
@@ -852,6 +887,7 @@ export class GraphView implements View {
 `;
     const xmlStyle = style.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const body = this.exportMarkup();
+    if (wasCulled) this.paint(true);
     const w = Math.ceil(b.w + pad * 2);
     const h = Math.ceil(b.h + pad * 2);
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="${b.x - pad} ${b.y - pad} ${w} ${h}"><style>${xmlStyle}</style><rect x="${b.x - pad}" y="${b.y - pad}" width="${w}" height="${h}" fill="${esc(bg)}"/>${body}</svg>`;

@@ -13,6 +13,7 @@
   "command.compactLines": "Better JSONL: Compact Lines",
   "command.convertFormat": "Better JSONL: Convert JSON Array ↔ JSON Lines",
   "command.compareFiles": "Better JSONL: Compare With JSON/JSONL File…",
+  "command.mergeFiles": "Better JSONL: Merge Open JSON/JSONL Files…",
   "config.defaultView": "The view that opens first.",
   "config.defaultView.formatted": "Formatted cards (Focus or Expand all for JSONL).",
   "config.defaultView.grid": "Grid of records with nested sub-grids.",

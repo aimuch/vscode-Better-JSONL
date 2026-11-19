@@ -3,6 +3,7 @@ import { t } from '../shared/i18n';
 import type { JsonPath } from '../shared/protocol';
 import { esc, getAt, isContainer, isObj, pathToJq, pathToString, plainText, RawNum, type JObj, type JVal } from './json';
 import { compactJson } from './query';
+import { DistinctCounter, QuantileSketch } from './sketch';
 
 export interface DiscoveredPath {
   path: JsonPath;
@@ -84,6 +85,21 @@ export interface PivotResult {
   totalRecords: number;
   groups: PivotGroup[];
   hasMetric: boolean;
+  distinctGroups?: number;
+}
+
+export interface CrossTabResult {
+  totalRecords: number;
+  rowLabels: string[];
+  colLabels: string[];
+  rowFilters: string[];
+  colFilters: string[];
+  /** Matrix[r][c] = { count, sum, avg, numCount } */
+  cells: { count: number; sum: number; avg: number; numCount: number }[][];
+  rowTotals: number[];
+  colTotals: number[];
+  maxCell: number;
+  hasMetric: boolean;
 }
 
 function numOf(v: JVal | undefined): number | undefined {
@@ -95,81 +111,105 @@ function numOf(v: JVal | undefined): number | undefined {
   return undefined;
 }
 
+function keyAndLabel(gv: JVal | undefined): { keyId: string; label: string } {
+  if (gv === undefined) return { keyId: 'u:', label: t('(missing)') };
+  if (gv === null) return { keyId: 'z:', label: 'null' };
+  if (isContainer(gv)) {
+    const cj = compactJson(gv);
+    return { keyId: 'j:' + cj, label: cj.length > 100 ? cj.slice(0, 100) + '…' : cj };
+  }
+  if (typeof gv === 'string') return { keyId: 's:' + gv, label: gv === '' ? '""' : gv };
+  if (typeof gv === 'boolean') return { keyId: 'b:' + String(gv), label: String(gv) };
+  const s = plainText(gv);
+  return { keyId: 'n:' + s, label: s };
+}
+
+function jqFilterFor(path: JsonPath, rawVal: JVal | undefined): string {
+  const jqPath = pathToJq(path);
+  if (rawVal === undefined) {
+    const parent = path.slice(0, -1);
+    const last = path[path.length - 1];
+    return typeof last === 'string'
+      ? `${parent.length ? pathToJq(parent) + ' | ' : ''}(has(${JSON.stringify(last)}) | not)`
+      : `${jqPath} == null`;
+  }
+  if (!isContainer(rawVal)) {
+    const rhs = rawVal instanceof RawNum ? rawVal.src : JSON.stringify(rawVal);
+    return `${jqPath} == ${rhs}`;
+  }
+  return `${jqPath} == ${compactJson(rawVal)}`;
+}
+
+const EXACT_QUANTILE_CAP = 8_192;
+
 export function computePivot(
   records: Iterable<JVal>,
   groupBy: JsonPath,
   metricPath: JsonPath | null,
   sortBy: 'count' | 'sum' | 'avg' | 'group' = 'count',
-  maxRecords = 200_000,
+  maxRecords = 2_000_000,
 ): PivotResult {
-  const buckets = new Map<string, { label: string; rawVal: JVal | undefined; count: number; nums: number[] }>();
+  const buckets = new Map<
+    string,
+    { label: string; rawVal: JVal | undefined; count: number; nums: number[] | null; sketch: QuantileSketch | null }
+  >();
+  const distinct = new DistinctCounter();
   let totalRecords = 0;
   for (const rec of records) {
     if (totalRecords >= maxRecords) break;
     totalRecords++;
     const gv = groupBy.length ? getAt(rec, groupBy) : rec;
-    let keyId: string;
-    let label: string;
-    if (gv === undefined) {
-      keyId = 'u:';
-      label = t('(missing)');
-    } else if (gv === null) {
-      keyId = 'z:';
-      label = 'null';
-    } else if (isContainer(gv)) {
-      const cj = compactJson(gv);
-      keyId = 'j:' + cj;
-      label = cj.length > 100 ? cj.slice(0, 100) + '…' : cj;
-    } else if (typeof gv === 'string') {
-      keyId = 's:' + gv;
-      label = gv === '' ? '""' : gv;
-    } else if (typeof gv === 'boolean') {
-      keyId = 'b:' + String(gv);
-      label = String(gv);
-    } else {
-      const s = plainText(gv);
-      keyId = 'n:' + s;
-      label = s;
-    }
+    const { keyId, label } = keyAndLabel(gv);
+    distinct.add(keyId);
     let b = buckets.get(keyId);
     if (!b) {
-      b = { label, rawVal: gv, count: 0, nums: [] };
+      b = { label, rawVal: gv, count: 0, nums: [], sketch: null };
       buckets.set(keyId, b);
     }
     b.count++;
     if (metricPath) {
       const mv = numOf(getAt(rec, metricPath));
-      if (mv !== undefined) b.nums.push(mv);
+      if (mv !== undefined) {
+        if (b.sketch) {
+          b.sketch.add(mv);
+        } else {
+          b.nums!.push(mv);
+          if (b.nums!.length > EXACT_QUANTILE_CAP) {
+            const sk = new QuantileSketch(0.01);
+            for (const x of b.nums!) sk.add(x);
+            b.sketch = sk;
+            b.nums = null;
+          }
+        }
+      }
     }
   }
 
-  const jqPath = pathToJq(groupBy);
   const groups: PivotGroup[] = [...buckets.entries()].map(([keyId, b]) => {
-    let filterQuery = '';
-    if (b.rawVal === undefined) {
-      const parent = groupBy.slice(0, -1);
-      const last = groupBy[groupBy.length - 1];
-      filterQuery =
-        typeof last === 'string'
-          ? `${parent.length ? pathToJq(parent) + ' | ' : ''}(has(${JSON.stringify(last)}) | not)`
-          : `${jqPath} == null`;
-    } else if (!isContainer(b.rawVal)) {
-      const rhs = b.rawVal instanceof RawNum ? b.rawVal.src : JSON.stringify(b.rawVal);
-      filterQuery = `${jqPath} == ${rhs}`;
-    } else {
-      filterQuery = `${jqPath} == ${compactJson(b.rawVal)}`;
-    }
+    const filterQuery = jqFilterFor(groupBy, b.rawVal);
+    let numCount = 0;
     let sum = 0;
-    let min = Infinity;
-    let max = -Infinity;
+    let min = 0;
+    let max = 0;
+    let avg = 0;
     let p50 = 0;
     let p95 = 0;
-    if (b.nums.length > 0) {
+    if (b.sketch) {
+      numCount = b.sketch.count;
+      sum = b.sketch.sum;
+      min = b.sketch.min;
+      max = b.sketch.max;
+      avg = b.sketch.avg;
+      p50 = b.sketch.quantile(0.5);
+      p95 = b.sketch.quantile(0.95);
+    } else if (b.nums && b.nums.length > 0) {
+      numCount = b.nums.length;
       b.nums.sort((x, y) => x - y);
       for (const x of b.nums) sum += x;
       min = b.nums[0];
       max = b.nums[b.nums.length - 1];
-      const q = (p: number) => b.nums[Math.min(b.nums.length - 1, Math.floor((b.nums.length - 1) * p))];
+      avg = sum / numCount;
+      const q = (p: number) => b.nums![Math.min(numCount - 1, Math.floor((numCount - 1) * p))];
       p50 = q(0.5);
       p95 = q(0.95);
     }
@@ -180,11 +220,11 @@ export function computePivot(
       count: b.count,
       share: totalRecords > 0 ? b.count / totalRecords : 0,
       filterQuery,
-      numCount: b.nums.length,
+      numCount,
       sum,
-      avg: b.nums.length > 0 ? sum / b.nums.length : 0,
-      min: b.nums.length > 0 ? min : 0,
-      max: b.nums.length > 0 ? max : 0,
+      avg,
+      min,
+      max,
       p50,
       p95,
     };
@@ -197,7 +237,100 @@ export function computePivot(
     return b.count - a.count || a.label.localeCompare(b.label);
   });
 
-  return { totalRecords, groups, hasMetric: metricPath !== null };
+  return { totalRecords, groups, hasMetric: metricPath !== null, distinctGroups: distinct.estimate() };
+}
+
+/** Computes a 2D Cross-Tab Pivot matrix (Row dimension x Column dimension). */
+export function computeCrossTab(
+  records: Iterable<JVal>,
+  rowBy: JsonPath,
+  colBy: JsonPath,
+  metricPath: JsonPath | null,
+  maxRows = 30,
+  maxCols = 12,
+  maxRecords = 500_000,
+): CrossTabResult {
+  const rowTotalsMap = new Map<string, { label: string; rawVal: JVal | undefined; count: number }>();
+  const colTotalsMap = new Map<string, { label: string; rawVal: JVal | undefined; count: number }>();
+  const cellMap = new Map<string, { count: number; sum: number; numCount: number }>();
+  let totalRecords = 0;
+
+  for (const rec of records) {
+    if (totalRecords >= maxRecords) break;
+    totalRecords++;
+    const rv = rowBy.length ? getAt(rec, rowBy) : rec;
+    const cv = colBy.length ? getAt(rec, colBy) : rec;
+    const rk = keyAndLabel(rv);
+    const ck = keyAndLabel(cv);
+    let rEnt = rowTotalsMap.get(rk.keyId);
+    if (!rEnt) {
+      rEnt = { label: rk.label, rawVal: rv, count: 0 };
+      rowTotalsMap.set(rk.keyId, rEnt);
+    }
+    rEnt.count++;
+    let cEnt = colTotalsMap.get(ck.keyId);
+    if (!cEnt) {
+      cEnt = { label: ck.label, rawVal: cv, count: 0 };
+      colTotalsMap.set(ck.keyId, cEnt);
+    }
+    cEnt.count++;
+    const pairKey = `${rk.keyId}\x00${ck.keyId}`;
+    let cell = cellMap.get(pairKey);
+    if (!cell) {
+      cell = { count: 0, sum: 0, numCount: 0 };
+      cellMap.set(pairKey, cell);
+    }
+    cell.count++;
+    if (metricPath) {
+      const mv = numOf(getAt(rec, metricPath));
+      if (mv !== undefined) {
+        cell.sum += mv;
+        cell.numCount++;
+      }
+    }
+  }
+
+  const topRows = [...rowTotalsMap.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, maxRows);
+  const topCols = [...colTotalsMap.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, maxCols);
+  let maxCell = 1;
+  const cells = topRows.map(([rk]) =>
+    topCols.map(([ck]) => {
+      const c = cellMap.get(`${rk}\x00${ck}`) ?? { count: 0, sum: 0, numCount: 0 };
+      const avg = c.numCount ? c.sum / c.numCount : 0;
+      const val = metricPath ? (c.numCount ? avg : 0) : c.count;
+      if (val > maxCell) maxCell = val;
+      return { count: c.count, sum: c.sum, avg, numCount: c.numCount };
+    }),
+  );
+
+  return {
+    totalRecords,
+    rowLabels: topRows.map(([, r]) => r.label),
+    colLabels: topCols.map(([, c]) => c.label),
+    rowFilters: topRows.map(([, r]) => jqFilterFor(rowBy, r.rawVal)),
+    colFilters: topCols.map(([, c]) => jqFilterFor(colBy, c.rawVal)),
+    cells,
+    rowTotals: topRows.map(([, r]) => r.count),
+    colTotals: topCols.map(([, c]) => c.count),
+    maxCell,
+    hasMetric: metricPath !== null,
+  };
+}
+
+export function renderCrossTabHtml(res: CrossTabResult): string {
+  if (!res.rowLabels.length || !res.colLabels.length) return `<div class="empty-note">${esc(t('No rows.'))}</div>`;
+  const head = `<tr><th>${esc(t('Row \\ Col'))}</th>${res.colLabels.map((c) => `<th class="num mono">${esc(c.length > 18 ? c.slice(0, 17) + '…' : c)}</th>`).join('')}<th class="num">${esc(t('Total'))}</th></tr>`;
+  const body = res.rowLabels.map((rl, ri) => {
+    const tds = res.colLabels.map((_, ci) => {
+      const c = res.cells[ri][ci];
+      if (!c.count) return '<td class="num dim">·</td>';
+      const display = res.hasMetric ? (c.numCount ? fmtNum(c.avg) : '–') : c.count.toLocaleString();
+      const intensity = Math.min(0.65, Math.max(0.08, ((res.hasMetric ? c.avg : c.count) / res.maxCell) * 0.65));
+      return `<td class="num mono piv-cell" data-xrow="${ri}" data-xcol="${ci}" style="background:color-mix(in srgb, var(--accent) ${Math.round(intensity * 100)}%, transparent)" title="${esc(t('Click to filter by row & column'))}">${esc(display)}</td>`;
+    });
+    return `<tr><td class="mono piv-key">${esc(rl)}</td>${tds.join('')}<td class="num mono dim">${res.rowTotals[ri].toLocaleString()}</td></tr>`;
+  });
+  return `<table class="cmp piv-tbl piv-xtab"><thead>${head}</thead><tbody>${body.join('')}</tbody></table>`;
 }
 
 function fmtNum(n: number): string {

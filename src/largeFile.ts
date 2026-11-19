@@ -10,13 +10,15 @@ import type { Compression } from './fileEdit';
 /** A large file goes to the webview in pieces of about this size. */
 export const CHUNK = 4 * 1024 * 1024;
 
-/** Compressed files Better JSONL opens (.gz or .br): the inner name says JSON or JSON Lines. */
+/** Compressed files Better JSONL opens (.gz, .br, .zst): the inner name says JSON or JSON Lines. */
 const GZIP = /\.(jsonl|ndjson|jsonlines|json)\.gz$/i;
 const BROTLI = /\.(jsonl|ndjson|jsonlines|json)\.br$/i;
+const ZSTD = /\.(jsonl|ndjson|jsonlines|json)\.zst$/i;
 
 export function compressionOfPath(p: string): Compression {
   if (GZIP.test(p)) return 'gzip';
   if (BROTLI.test(p)) return 'brotli';
+  if (ZSTD.test(p)) return 'zstd';
   return null;
 }
 
@@ -24,9 +26,9 @@ export function isGzipPath(p: string): boolean {
   return compressionOfPath(p) !== null;
 }
 
-/** The name without ".gz" or ".br". */
+/** The name without ".gz", ".br", or ".zst". */
 export function innerName(p: string): string {
-  return p.replace(/\.(gz|br)$/i, '');
+  return p.replace(/\.(gz|br|zst)$/i, '');
 }
 
 /**
@@ -107,12 +109,20 @@ export async function* readUtf8(uri: vscode.Uri, options: SourceOptions): AsyncG
   raw.on('data', (b: Buffer) => (read += b.length));
   const comp: Compression = options.compression !== undefined ? options.compression : options.gzip ? 'gzip' : null;
   // A file that is still being written (a compressed log) ends in the middle: the output so far is used.
+  const zstdDecompress = (zlib as unknown as { createZstdDecompress?: (opts?: { chunkSize?: number }) => NodeJS.ReadWriteStream }).createZstdDecompress;
   const source: Readable =
-    comp === 'brotli'
-      ? raw.pipe(zlib.createBrotliDecompress({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH }))
-      : comp === 'gzip'
-        ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH }))
-        : raw;
+    comp === 'zstd'
+      ? (() => {
+          if (typeof zstdDecompress !== 'function') {
+            throw new Error('Zstandard (.zst) requires Node.js 22.15+.');
+          }
+          return raw.pipe(zstdDecompress({ chunkSize: 1024 * 1024 })) as unknown as Readable;
+        })()
+      : comp === 'brotli'
+        ? raw.pipe(zlib.createBrotliDecompress({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH }))
+        : comp === 'gzip'
+          ? raw.pipe(zlib.createGunzip({ chunkSize: 1024 * 1024, finishFlush: zlib.constants.Z_SYNC_FLUSH }))
+          : raw;
   raw.on('error', (e) => source.destroy(e));
   let decoder: TextDecoder | null | undefined;
   let resolved = options.encoding;
@@ -182,7 +192,7 @@ function concat(parts: Buffer[], size: number): Uint8Array {
   return out;
 }
 
-/** Reads a plain or compressed (.gz / .br) file into a UTF-8 string up to `maxDecodedBytes`. */
+/** Reads a plain or compressed (.gz / .br / .zst) file into a UTF-8 string up to `maxDecodedBytes`. */
 export async function readAllUtf8(uri: vscode.Uri, maxDecodedBytes = 50 * 1024 * 1024): Promise<string> {
   const comp = compressionOfPath(uri.path);
   const parts: Buffer[] = [];
@@ -195,4 +205,179 @@ export async function readAllUtf8(uri: vscode.Uri, maxDecodedBytes = 50 * 1024 *
   return Buffer.concat(parts).toString('utf8');
 }
 
-export { compare, fileState, LineConflict, mutateFileLines, replaceLine, TAIL, type Compression, type FileState } from './fileEdit';
+function fnv64Pair(s: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b);
+  }
+  return `${(h1 >>> 0).toString(36)}:${(h2 >>> 0).toString(36)}:${s.length}`;
+}
+
+async function* readLinesStream(uri: vscode.Uri): AsyncGenerator<{ line: number; text: string }> {
+  const comp = compressionOfPath(uri.path);
+  const decoder = new TextDecoder('utf-8');
+  let carry = '';
+  let line = 0;
+  for await (const piece of readUtf8(uri, { gzip: comp !== null, compression: comp, encoding: encodingFor(uri) })) {
+    const chunk = carry + decoder.decode(piece.data, { stream: true });
+    let start = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk.charCodeAt(i) === 10) {
+        const end = i > start && chunk.charCodeAt(i - 1) === 13 ? i - 1 : i;
+        yield { line: line++, text: chunk.slice(start, end) };
+        start = i + 1;
+      }
+    }
+    carry = chunk.slice(start);
+  }
+  carry += decoder.decode();
+  if (carry.length) yield { line: line++, text: carry.endsWith('\r') ? carry.slice(0, -1) : carry };
+}
+
+const STREAM_KEY_CANDIDATES = ['id', '_id', 'uuid', 'sample_id', 'event_id', 'key'];
+
+function extractStreamKey(text: string, keyField: string): string | null {
+  try {
+    const obj = JSON.parse(text) as Record<string, unknown>;
+    if (obj && typeof obj === 'object' && !Array.isArray(obj) && keyField in obj) {
+      const v = obj[keyField];
+      if (v !== null && v !== undefined && typeof v !== 'object') return String(v);
+    }
+  } catch {
+    // ignore malformed line
+  }
+  return null;
+}
+
+export interface StreamDiffSummary {
+  mode: 'key' | 'line';
+  keyField: string | null;
+  added: number;
+  removed: number;
+  modified: number;
+  unchanged: number;
+  entries: { kind: 'added' | 'removed' | 'modified'; keyLabel: string; leftLine?: number; rightLine?: number; leftText?: string; rightText?: string }[];
+}
+
+/**
+ * Streaming hash-indexed cross-file comparison for large JSONL datasets (>50 MB).
+ * Stores only compact key -> (hash, line) maps in memory, keeping full text only for bounded diff samples.
+ */
+export async function streamDiffFiles(leftUri: vscode.Uri, rightUri: vscode.Uri, maxEntries = 500): Promise<StreamDiffSummary> {
+  // Detect a common primary key from the first 50 lines of leftUri.
+  let keyField: string | null = null;
+  const counts = new Map<string, number>();
+  let sampled = 0;
+  for await (const { text } of readLinesStream(leftUri)) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        for (const k of STREAM_KEY_CANDIDATES) {
+          if (k in obj && obj[k] !== null && obj[k] !== undefined && typeof obj[k] !== 'object') {
+            counts.set(k, (counts.get(k) ?? 0) + 1);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (++sampled >= 50) break;
+  }
+  for (const k of STREAM_KEY_CANDIDATES) {
+    if ((counts.get(k) ?? 0) >= Math.max(1, sampled * 0.8)) {
+      keyField = k;
+      break;
+    }
+  }
+
+  const leftIndex = new Map<string, { line: number; hash: string; sample?: string }>();
+  for await (const { line, text } of readLinesStream(leftUri)) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    const key = keyField ? extractStreamKey(trimmed, keyField) ?? `#${line + 1}` : `#${line + 1}`;
+    const sample = leftIndex.size < 20_000 && trimmed.length <= 8192 ? trimmed : undefined;
+    leftIndex.set(key, { line, hash: fnv64Pair(trimmed), sample });
+  }
+
+  let added = 0;
+  let removed = 0;
+  let modified = 0;
+  let unchanged = 0;
+  const entries: StreamDiffSummary['entries'] = [];
+  const seenLeft = new Set<string>();
+
+  for await (const { line, text } of readLinesStream(rightUri)) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    const key = keyField ? extractStreamKey(trimmed, keyField) ?? `#${line + 1}` : `#${line + 1}`;
+    const prev = leftIndex.get(key);
+    if (!prev) {
+      added++;
+      if (entries.length < maxEntries) {
+        entries.push({ kind: 'added', keyLabel: key, rightLine: line, rightText: trimmed.slice(0, 16_384) });
+      }
+    } else {
+      seenLeft.add(key);
+      if (prev.hash === fnv64Pair(trimmed)) {
+        unchanged++;
+      } else {
+        modified++;
+        if (entries.length < maxEntries) {
+          entries.push({
+            kind: 'modified',
+            keyLabel: key,
+            leftLine: prev.line,
+            rightLine: line,
+            leftText: prev.sample,
+            rightText: trimmed.slice(0, 16_384),
+          });
+        }
+      }
+    }
+  }
+
+  for (const [key, prev] of leftIndex) {
+    if (!seenLeft.has(key)) {
+      removed++;
+      if (entries.length < maxEntries) {
+        entries.push({ kind: 'removed', keyLabel: key, leftLine: prev.line, leftText: prev.sample });
+      }
+    }
+  }
+
+  return { mode: keyField ? 'key' : 'line', keyField, added, removed, modified, unchanged, entries };
+}
+
+/**
+ * Merges multiple JSON/JSONL/compressed files into a single JSONL stream with `_file` source metadata injected.
+ */
+export async function readMergedJsonl(uris: vscode.Uri[], maxBytes = 80 * 1024 * 1024): Promise<string> {
+  const out: string[] = [];
+  let bytes = 0;
+  for (const uri of uris) {
+    const base = uri.path.split('/').pop() ?? uri.fsPath;
+    const prefix = `{"_file":${JSON.stringify(base)},`;
+    for await (const { text } of readLinesStream(uri)) {
+      const trimmed = text.trim();
+      if (!trimmed) continue;
+      let lineOut: string;
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        lineOut = trimmed === '{}' ? `{"_file":${JSON.stringify(base)}}` : prefix + trimmed.slice(1);
+      } else {
+        lineOut = `{"_file":${JSON.stringify(base)},"value":${trimmed}}`;
+      }
+      bytes += lineOut.length + 1;
+      if (bytes > maxBytes) break;
+      out.push(lineOut);
+    }
+    if (bytes > maxBytes) break;
+  }
+  return out.join('\n') + (out.length ? '\n' : '');
+}
+
+export { compare, fileState, LineConflict, mutateFileLines, replaceLine, supportsZstd, TAIL, type Compression, type FileState } from './fileEdit';
