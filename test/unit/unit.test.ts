@@ -1282,6 +1282,14 @@ test('v1.0 engines: QuantileSketch, DistinctCounter, SQL, CrossTab, SchemaValida
   assert.equal(r1.rows[0].service, 'pay');
   assert.equal(r1.rows[0].n, 2);
   assert.equal(r1.rows[0].avg_ms, 160);
+  // SQL zero-row aggregate (FN-3) + normalized JsonPath GROUP BY
+  const rEmpty = executeSql(parseSql('SELECT COUNT(*) AS n, AVG(ms) AS a WHERE ms > 9999'), recs);
+  assert.equal(rEmpty.rows.length, 1);
+  assert.equal(rEmpty.rows[0].n, 0);
+  assert.equal(rEmpty.rows[0].a, null);
+  const rNorm = executeSql(parseSql('SELECT .service AS svc, COUNT(*) AS n GROUP BY service'), recs);
+  assert.equal(rNorm.rows.length, 2);
+  assert.ok(rNorm.rows.every((row) => row.svc === 'auth' || row.svc === 'pay'));
 
   // 3. 2D Cross-Tab Pivot (F2)
   const xtab = computeCrossTab(recs, ['service'], ['region'], ['ms']);
@@ -1306,6 +1314,12 @@ test('v1.0 engines: QuantileSketch, DistinctCounter, SQL, CrossTab, SchemaValida
   assert.equal(valRep.validLines, 3);
   assert.deepEqual(valRep.invalidLines, [3]);
   assert.equal(valRep.violations[0].rule, 'maximum');
+  const fmtRep = validateRecordsAgainstSchema(
+    [{ line: 0, value: { email: 'not-an-email', id: '550e8400-e29b-41d4-a716-446655440000' } }],
+    { type: 'object', properties: { email: { type: 'string', format: 'email' }, id: { type: 'string', format: 'uuid' } } },
+  );
+  assert.equal(fmtRep.invalidLines.length, 1);
+  assert.equal(fmtRep.violations[0].rule, 'format');
 
   // 5. Charts SVG builder (F3)
   const scatter = buildChartSvg(

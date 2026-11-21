@@ -107,6 +107,7 @@ export class CommandPaletteModal {
         }
       });
     });
+    (list.querySelector('.pal-item.active') as HTMLElement | null)?.scrollIntoView({ block: 'nearest' });
   }
 
   close(): void {

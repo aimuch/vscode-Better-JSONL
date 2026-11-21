@@ -3239,4 +3239,35 @@ body.vscode-high-contrast-light .ac-item.on {
   font-size: 12px;
 }
 
+.charts-btn .ic {
+  color: var(--ic-cyan);
+  --ic-2: var(--ic-amber);
+}
+
+.validate-btn .ic {
+  color: var(--ic-slate);
+  --ic-2: var(--ic-mint);
+}
+
+.palette-btn .ic {
+  color: var(--ic-slate);
+  --ic-2: var(--ic-violet);
+}
+
+.schemapanel .seg {
+  flex-wrap: wrap;
+}
+
+body.vscode-high-contrast .gc.in-range,
+body.vscode-high-contrast-light .gc.in-range,
+body.vscode-high-contrast .piv-cell,
+body.vscode-high-contrast-light .piv-cell {
+  outline: 1px solid var(--vscode-contrastActiveBorder, var(--accent)) !important;
+}
+
+body.vscode-high-contrast .gfoot,
+body.vscode-high-contrast-light .gfoot {
+  border-top: 1px solid var(--vscode-contrastBorder, var(--border));
+}
+
 

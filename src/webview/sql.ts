@@ -113,7 +113,7 @@ function tokenize(src: string): Tok[] {
       i++;
       continue;
     }
-    if (/[A-Za-z_$]/.test(ch)) {
+    if (/[A-Za-z_$.]/.test(ch)) {
       const start = i++;
       while (i < n && /[A-Za-z0-9_$.[\]-]/.test(src[i])) i++;
       const text = src.slice(start, i);
@@ -507,12 +507,29 @@ export function executeSql(query: SqlQuery, records: Iterable<JVal>, maxRows = 2
       }
     }
 
+    if (buckets.size === 0 && query.groupBy.length === 0 && query.hasAggregate) {
+      // SQL standard: aggregate over 0 rows with no GROUP BY returns 1 summary row.
+      buckets.set('', {
+        groupVals: [],
+        countAll: 0,
+        aggs: aggItems.map((it) => ({
+          count: 0,
+          sum: 0,
+          min: Infinity,
+          max: -Infinity,
+          distinct: it.distinct ? new DistinctCounter() : undefined,
+        })),
+      });
+    }
+
+    const groupPathKeys = query.groupBy.map((g) => JSON.stringify(g.path));
     for (const b of buckets.values()) {
       const out: JObj = {};
       let ai = 0;
       for (const item of query.select) {
         if (item.kind === 'field') {
-          const gi = query.groupBy.findIndex((g) => g.raw === item.rawPath);
+          const pk = item.path ? JSON.stringify(item.path) : '';
+          const gi = groupPathKeys.indexOf(pk);
           out[item.alias] = gi >= 0 ? b.groupVals[gi] : null;
         } else if (item.kind === 'agg') {
           const st = b.aggs[ai++];

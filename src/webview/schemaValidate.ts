@@ -19,6 +19,29 @@ export interface SchemaValidationReport {
 
 type JsonSchemaObj = Record<string, unknown>;
 
+const patternCache = new Map<string, RegExp | null>();
+function cachedRegex(pat: string): RegExp | null {
+  if (pat.length > 512) return null;
+  let re = patternCache.get(pat);
+  if (re === undefined) {
+    if (patternCache.size > 256) patternCache.clear();
+    try {
+      re = new RegExp(pat);
+    } catch {
+      re = null;
+    }
+    patternCache.set(pat, re);
+  }
+  return re;
+}
+
+const FORMAT_CHECKS: Record<string, RegExp> = {
+  email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  'date-time': /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/i,
+  uri: /^[a-z][a-z0-9+.-]*:\/\/\S+$/i,
+};
+
 function numOf(v: JVal): number | null {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
   if (v instanceof RawNum) {
@@ -123,12 +146,14 @@ function validateNode(
       out.push({ line, path, rule: 'maxLength', message: `Length ${val.length} > maxLength ${s.maxLength}` });
     }
     if (typeof s.pattern === 'string') {
-      try {
-        if (!new RegExp(s.pattern).test(val)) {
-          out.push({ line, path, rule: 'pattern', message: `Does not match /${s.pattern}/` });
-        }
-      } catch {
-        // Ignore malformed schema regex
+      const re = cachedRegex(s.pattern);
+      if (re && !re.test(val)) {
+        out.push({ line, path, rule: 'pattern', message: `Does not match /${s.pattern}/` });
+      }
+    }
+    if (typeof s.format === 'string' && s.format in FORMAT_CHECKS) {
+      if (!FORMAT_CHECKS[s.format].test(val)) {
+        out.push({ line, path, rule: 'format', message: `Invalid ${s.format} format` });
       }
     }
   }
@@ -199,6 +224,12 @@ function validateNode(
     }
     if (matches !== 1) out.push({ line, path, rule: 'oneOf', message: `Matched ${matches} branches of oneOf (expected 1)` });
   }
+}
+
+export function validateSingleRecord(line: number, value: JVal, schema: unknown, maxPerLine = 8): SchemaViolation[] {
+  const out: SchemaViolation[] = [];
+  validateNode(value, schema, '$', line, out, maxPerLine);
+  return out;
 }
 
 export function validateRecordsAgainstSchema(

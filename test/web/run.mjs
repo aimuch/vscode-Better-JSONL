@@ -1752,13 +1752,13 @@ await scenario('W54', 'v1.0 SQL mode, 2D Cross-Tab, Charts, Schema Validation, G
   let r = await complete(page);
   check.eq('v10 sample loaded', r.stats.valid, 4);
 
-  // 1. Lightweight SQL Query Mode (F1)
+  // 1. Lightweight SQL Query Mode (F1) & one-click exit (IX-2)
   await page.fill('.search input', 'SELECT service, COUNT(*) AS n, AVG(ms) AS avg_ms GROUP BY service ORDER BY avg_ms DESC');
   r = await report(page, (x) => x.stats.lines === 2);
   check.eq('SQL GROUP BY projects 2 aggregated rows', r.stats.lines, 2);
   await page.click('[data-exit-xform]');
-  await page.fill('.search input', '');
   r = await report(page, (x) => x.stats.lines === 4);
+  check.eq('Clicking Projected × exits SQL projection cleanly', r.stats.lines, 4);
 
   // 2. 2D Cross-Tab Pivot Matrix (F2)
   await page.click('.pivot-btn');

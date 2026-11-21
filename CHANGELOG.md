@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- **Security & Robustness**: escaped `data-fd-eval` attribute values in Dataset Diff; disconnected toolbar `ResizeObserver` via `shellGone` abort signal; bounded Grid computed-column program cache (`200` entries) and cleared on column reset.
+- **Interaction & UI Polish**: wired `⋯ Tools` overflow menu to keyboard navigation and outside-click dismissal; fixed exiting auto-detected `SELECT ...` SQL projection via the `Projected ×` chip; aligned `ChartsModal` and `SchemaValidateModal` headers/actions to the `.ep-head` / `.ep-actions` design system; raised responsive toolbar compact threshold (`940px`), added dual-tone icon accents, wrapped `Schema` language tabs, added High Contrast borders for cell ranges / cross-tab cells / summary footer, added `scrollIntoView` in Command Palette, and auto-switched X/Metric controls by chart type.
+- **Data & Large-File Fixes**: enabled `isComputedCol` evaluation inside >200k-row Grid `readColumns()`; upgraded `readMergedJsonl` to parse pretty-printed `.json` arrays and concatenated JSON streams cleanly; added SQL standard zero-row aggregate output & normalized `JsonPath` `GROUP BY` matching; backfilled >20k-line `leftText` snippets in `streamDiffFiles`; switched `SchemaValidateModal` to non-blocking `runSliced` validation with cached regex patterns and `format` (`email`, `uri`, `uuid`, `date-time`) checks; added **Copy Eval JSONL** export to LLM Side-by-Side Eval.
+
 ## 1.0.0
 
 - **Lightweight SQL Query Mode (`SELECT ... WHERE ... GROUP BY ... ORDER BY ... LIMIT`)**: run zero-dependency SQL queries directly in the search bar (auto-detected on `SELECT ` or via the `SQL` toggle) with `COUNT(*)`, `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `LIKE`, `IN`, `IS NULL`, nested paths, and aliases — projecting results into Formatted, Grid, Graph, and Export views.

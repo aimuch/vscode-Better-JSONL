@@ -610,6 +610,7 @@ const ZH: Record<string, string> = {
   Tie: '平局',
   'B wins': 'B 更好',
   'Back to table': '返回差异表格',
+  'Copy Eval JSONL': '复制评测结果 JSONL',
   Streaming: '流式大文件模式',
   'Merge Open in Better JSONL': '在 Better JSONL 中合并打开',
   'Go file': 'Go 文件',

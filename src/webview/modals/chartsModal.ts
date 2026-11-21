@@ -2,6 +2,7 @@
 import { t } from '../../shared/i18n';
 import type { JsonPath } from '../../shared/protocol';
 import { buildChartSvg, type ChartKind } from '../charts';
+import { icon } from '../icons';
 import { esc, type JVal } from '../json';
 import { discoverFieldPaths, type DiscoveredPath } from '../pivot';
 import { trapModalTabKey } from '../stateMachines';
@@ -66,28 +67,25 @@ export class ChartsModal {
 
     const opts = this.paths.map((p, i) => `<option value="${i}">${esc(p.label)}${p.isNumeric ? ' (#)' : ''}</option>`).join('');
     this.el.innerHTML = `
-      <div class="edit-head">
-        <strong>${esc(t('Charts explorer'))}</strong>
+      <div class="ep-head">
+        <span class="ep-title">${icon('charts', 14)} ${esc(t('Charts explorer'))}</span>
         <span class="dim charts-meta"></span>
-        <span class="spring"></span>
-        <button class="btn" data-ch-svg>${esc(t('Export SVG'))}</button>
-        <button class="btn" data-ch-close>${esc(t('Close'))}</button>
       </div>
-      <div class="piv-controls">
-        <label class="piv-lbl">${esc(t('Chart'))}
+      <div class="batch-bar piv-controls">
+        <label class="piv-ctl"><span>${esc(t('Chart'))}</span>
           <select data-ch-kind>
             <option value="timeseries"${this.kind === 'timeseries' ? ' selected' : ''}>${esc(t('Time series'))}</option>
             <option value="bar"${this.kind === 'bar' ? ' selected' : ''}>${esc(t('Bar chart'))}</option>
             <option value="scatter"${this.kind === 'scatter' ? ' selected' : ''}>${esc(t('Scatter plot'))}</option>
           </select>
         </label>
-        <label class="piv-lbl">X
+        <label class="piv-ctl"><span>X</span>
           <select data-ch-x>${opts}</select>
         </label>
-        <label class="piv-lbl">Y
+        <label class="piv-ctl"><span>Y</span>
           <select data-ch-y><option value="-1">${esc(t('Count (rows)'))}</option>${opts}</select>
         </label>
-        <label class="piv-lbl">${esc(t('Metric'))}
+        <label class="piv-ctl" data-ch-metric-wrap><span>${esc(t('Metric'))}</span>
           <select data-ch-metric>
             <option value="avg">${esc(t('Avg'))}</option>
             <option value="p50">p50</option>
@@ -97,14 +95,24 @@ export class ChartsModal {
           </select>
         </label>
       </div>
-      <div class="charts-body"></div>`;
+      <div class="charts-body"></div>
+      <div class="ep-actions">
+        <button class="btn primary" data-ch-svg>${icon('download', 12)}${esc(t('Export SVG'))}</button>
+        <button class="btn" data-ch-close>${esc(t('Close'))} <kbd>Esc</kbd></button>
+      </div>`;
 
     const kindSel = this.el.querySelector('[data-ch-kind]') as HTMLSelectElement;
     const xSel = this.el.querySelector('[data-ch-x]') as HTMLSelectElement;
     const ySel = this.el.querySelector('[data-ch-y]') as HTMLSelectElement;
     const mSel = this.el.querySelector('[data-ch-metric]') as HTMLSelectElement;
+    const mWrap = this.el.querySelector('[data-ch-metric-wrap]') as HTMLElement;
     if (this.paths.length) xSel.value = String(Math.max(0, this.xIdx));
     ySel.value = String(this.yIdx);
+
+    const syncMetricVis = () => {
+      mWrap.hidden = this.kind === 'scatter';
+    };
+    syncMetricVis();
 
     const rerun = (kindChanged = false) => {
       this.kind = kindSel.value as ChartKind;
@@ -119,7 +127,10 @@ export class ChartsModal {
           const n2 = this.paths.findIndex((p, i) => p.isNumeric && String(i) !== xSel.value);
           if (n2 >= 0) ySel.value = String(n2);
         }
+      } else if (kindChanged && this.kind === 'timeseries' && tsIdx >= 0) {
+        xSel.value = String(tsIdx);
       }
+      syncMetricVis();
       this.xIdx = Number(xSel.value);
       this.yIdx = Number(ySel.value);
       this.metric = mSel.value as ChartsModal['metric'];

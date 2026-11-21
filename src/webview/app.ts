@@ -2551,7 +2551,7 @@ export class App {
                     : '–';
               const evalBtn =
                 en.left !== undefined && en.right !== undefined && detectConversation(en.left) && detectConversation(en.right)
-                  ? ` <button class="btn fd-eval-btn" data-fd-eval="${en.keyLabel}">${esc(t('Chat Eval'))}</button>`
+                  ? ` <button class="btn fd-eval-btn" data-fd-eval="${esc(en.keyLabel)}">${esc(t('Chat Eval'))}</button>`
                   : '';
               return `<tr class="${cls}"><td><span class="badge">${esc(badgeLbl)}</span>${evalBtn}</td><td class="mono">${esc(en.keyLabel)}</td><td class="mono">${esc(leftCell)}</td><td class="mono">${esc(rightCell)}</td></tr>`;
             })
@@ -2608,9 +2608,12 @@ export class App {
           activeEvalKey = key;
           const host = panel.querySelector('.cmp-scroll') as HTMLElement;
           host.innerHTML =
-            `<div class="eval-back-bar"><button class="btn" data-fd-back>← ${esc(t('Back to table'))}</button><span class="mono">${esc(key)}</span></div>` +
+            `<div class="eval-back-bar"><button class="btn" data-fd-back>← ${esc(t('Back to table'))}</button><span class="mono">${esc(key)}</span><span class="spring"></span><button class="btn" data-eval-export>${icon('copy', 12)}${esc(t('Copy Eval JSONL'))}</button></div>` +
             renderSideBySideEvalHtml(this.doc.fileName, lc, otherName, rc, evalVerdicts.get(key));
         }
+      } else if (btn.hasAttribute('data-eval-export')) {
+        const lines = [...evalVerdicts.entries()].map(([k, v]) => JSON.stringify({ key: k, modelA: this.doc.fileName, modelB: otherName, verdict: v }));
+        if (lines.length) this.post({ type: 'copy', text: lines.join('\n') + '\n' });
       } else if (btn.hasAttribute('data-fd-back')) {
         activeEvalKey = null;
         paintDiff();
@@ -3520,6 +3523,8 @@ export class App {
     wireMenuKeys(exportMenu, 'export-menu', '.export-btn');
     wireMenuKeys(histMenu, 'hist-menu', '.hist-btn');
     wireMenuKeys(ctxMenu, 'ctx-menu');
+    const toolsMenuEl = this.root.querySelector('.tools-menu') as HTMLElement | null;
+    if (toolsMenuEl) wireMenuKeys(toolsMenuEl, 'tools-menu', '.tools-btn');
 
     document.addEventListener(
       'pointerdown',
@@ -3532,6 +3537,10 @@ export class App {
         if (!histMenu.hidden && !histMenu.contains(target) && !target.closest('.hist-btn')) {
           histMenu.hidden = true;
           this.onPopoverClosed('hist-menu');
+        }
+        if (toolsMenuEl && !toolsMenuEl.hidden && !toolsMenuEl.contains(target) && !target.closest('.tools-btn')) {
+          toolsMenuEl.hidden = true;
+          this.onPopoverClosed('tools-menu');
         }
         if (!ctxMenu.hidden && !ctxMenu.contains(target)) {
           ctxMenu.hidden = true;
@@ -3741,12 +3750,13 @@ export class App {
 
     this.toolbarResize?.disconnect();
     this.toolbarResize = new ResizeObserver(() => {
-      const compact = tb.clientWidth > 0 && tb.clientWidth < 680;
+      const compact = tb.clientWidth > 0 && tb.clientWidth < 940;
       tb.classList.toggle('tb-compact', compact);
       const tbtn = tb.querySelector('.tools-btn') as HTMLElement | null;
       if (tbtn) tbtn.hidden = !compact;
     });
     this.toolbarResize.observe(tb);
+    this.shellGone.signal.addEventListener('abort', () => this.toolbarResize?.disconnect(), { once: true });
 
     const toolsMenu = this.root.querySelector('.tools-menu') as HTMLElement | null;
     toolsMenu?.addEventListener('click', (e) => {
@@ -3792,6 +3802,12 @@ export class App {
         this.rerunSearch();
       } else if (btn.hasAttribute('data-exit-xform')) {
         this.transformMode = false;
+        this.state.sqlMode = false;
+        if (isSqlQueryText(this.state.query)) {
+          this.state.query = '';
+          const sin = this.toolbar.querySelector('.search input') as HTMLInputElement | null;
+          if (sin) sin.value = '';
+        }
         this.rerunSearch();
       } else if (btn.classList.contains('filter-btn')) {
         this.state.filterOnly = !this.state.filterOnly;

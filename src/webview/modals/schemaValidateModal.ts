@@ -1,7 +1,9 @@
-// Modular JSON Schema Validation modal (load .schema.json or paste inline schema, validate records, filter violations).
+// Modular JSON Schema Validation modal (load .schema.json or paste inline schema, non-blocking sliced validation, filter violations).
 import { t } from '../../shared/i18n';
+import { runSliced } from '../compute';
+import { icon } from '../icons';
 import { esc, type JVal } from '../json';
-import { validateRecordsAgainstSchema, type SchemaValidationReport } from '../schemaValidate';
+import { validateSingleRecord, type SchemaValidationReport, type SchemaViolation } from '../schemaValidate';
 import { trapModalTabKey } from '../stateMachines';
 
 export interface SchemaValidateHost {
@@ -17,6 +19,7 @@ export class SchemaValidateModal {
   private schemaText = '{\n  "type": "object",\n  "required": []\n}';
   private schemaName = '';
   private lastReport: SchemaValidationReport | null = null;
+  private runAbort: AbortController | null = null;
 
   constructor(private readonly host: SchemaValidateHost) {
     this.el = document.createElement('div');
@@ -37,31 +40,33 @@ export class SchemaValidateModal {
 
   open(): void {
     this.el.innerHTML = `
-      <div class="edit-head">
-        <strong>${esc(t('Validate JSON Schema'))}</strong>
+      <div class="ep-head">
+        <span class="ep-title">${icon('check-doc', 14)} ${esc(t('Validate JSON Schema'))}</span>
         <span class="dim val-meta">${esc(this.schemaName)}</span>
-        <span class="spring"></span>
-        <button class="btn" data-val-pick>${esc(t('Load .schema.json…'))}</button>
-        <button class="btn" data-val-run>${esc(t('Validate'))}</button>
-        <button class="btn" data-val-close>${esc(t('Close'))}</button>
       </div>
       <div class="val-split">
-        <textarea class="edit-text val-input mono" spellcheck="false" aria-label="${esc(t('JSON Schema'))}">${esc(this.schemaText)}</textarea>
+        <textarea class="val-input mono" spellcheck="false" aria-label="${esc(t('JSON Schema'))}">${esc(this.schemaText)}</textarea>
         <div class="val-results"></div>
+      </div>
+      <div class="ep-actions">
+        <button class="btn primary" data-val-run>${esc(t('Validate'))}</button>
+        <button class="btn" data-val-pick>${esc(t('Load .schema.json…'))}</button>
+        <span class="spring"></span>
+        <button class="btn" data-val-close>${esc(t('Close'))} <kbd>Esc</kbd></button>
       </div>`;
 
     const ta = this.el.querySelector('.val-input') as HTMLTextAreaElement;
     this.el.querySelector('[data-val-pick]')?.addEventListener('click', () => this.host.pickSchemaFile());
     this.el.querySelector('[data-val-run]')?.addEventListener('click', () => {
       this.schemaText = ta.value;
-      this.runValidation();
+      void this.runValidation();
     });
     this.el.querySelector('[data-val-close]')?.addEventListener('click', () => this.host.onClose());
     ta.addEventListener('keydown', (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
         this.schemaText = ta.value;
-        this.runValidation();
+        void this.runValidation();
       }
     });
 
@@ -77,11 +82,15 @@ export class SchemaValidateModal {
       const meta = this.el.querySelector('.val-meta') as HTMLElement | null;
       if (ta) ta.value = text;
       if (meta) meta.textContent = name;
-      this.runValidation();
+      void this.runValidation();
     }
   }
 
-  private runValidation(): void {
+  private async runValidation(): Promise<void> {
+    this.runAbort?.abort();
+    const abort = new AbortController();
+    this.runAbort = abort;
+
     const out = this.el.querySelector('.val-results') as HTMLElement | null;
     if (!out) return;
     let parsed: unknown;
@@ -91,7 +100,48 @@ export class SchemaValidateModal {
       out.innerHTML = `<div class="val-err">${esc(t('Invalid JSON Schema: {0}', e instanceof Error ? e.message : String(e)))}</div>`;
       return;
     }
-    const rep = validateRecordsAgainstSchema(this.host.records(), parsed);
+
+    const items: { line: number; value: JVal }[] = [];
+    for (const r of this.host.records()) items.push(r);
+
+    let validLines = 0;
+    const invalidLines: number[] = [];
+    const violations: SchemaViolation[] = [];
+    const ruleMap = new Map<string, number>();
+
+    const completed = await runSliced(
+      items.length,
+      (i) => {
+        const { line, value } = items[i];
+        const lv = validateSingleRecord(line, value, parsed);
+        if (lv.length === 0) {
+          validLines++;
+        } else {
+          invalidLines.push(line);
+          for (const v of lv) {
+            ruleMap.set(v.rule, (ruleMap.get(v.rule) ?? 0) + 1);
+            if (violations.length < 500) violations.push(v);
+          }
+        }
+      },
+      {
+        signal: abort.signal,
+        onProgress: (done, total) => {
+          if (done < total && out.isConnected) {
+            out.innerHTML = `<div class="dim">${esc(`${Math.round((done / Math.max(1, total)) * 100)}% (${done.toLocaleString()} / ${total.toLocaleString()})`)}</div>`;
+          }
+        },
+      },
+    );
+    if (!completed || abort.signal.aborted || this.el.hidden) return;
+
+    const rep: SchemaValidationReport = {
+      checked: items.length,
+      validLines,
+      invalidLines,
+      violations,
+      ruleCounts: [...ruleMap.entries()].map(([rule, count]) => ({ rule, count })).sort((a, b) => b.count - a.count),
+    };
     this.lastReport = rep;
     const summary =
       rep.invalidLines.length === 0
@@ -130,6 +180,8 @@ export class SchemaValidateModal {
   }
 
   close(): void {
+    this.runAbort?.abort();
+    this.runAbort = null;
     this.el.hidden = true;
     this.el.innerHTML = '';
   }

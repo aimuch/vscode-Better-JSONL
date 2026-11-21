@@ -5,6 +5,7 @@ import { Readable } from 'stream';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
 import { t } from './shared/i18n';
+import { minifyJson, splitJsonValues } from './shared/jsonText';
 import type { Compression } from './fileEdit';
 
 /** A large file goes to the webview in pieces of about this size. */
@@ -350,30 +351,88 @@ export async function streamDiffFiles(leftUri: vscode.Uri, rightUri: vscode.Uri,
     }
   }
 
+  // FN-4: Backfill missing leftText for up to maxEntries diff items located past line 20,000 in O(1) memory.
+  const needLeft = new Map<number, StreamDiffSummary['entries'][number][]>();
+  for (const en of entries) {
+    if (en.leftLine !== undefined && en.leftText === undefined) {
+      let arr = needLeft.get(en.leftLine);
+      if (!arr) {
+        arr = [];
+        needLeft.set(en.leftLine, arr);
+      }
+      arr.push(en);
+    }
+  }
+  if (needLeft.size > 0) {
+    for await (const { line, text } of readLinesStream(leftUri)) {
+      const targets = needLeft.get(line);
+      if (targets) {
+        const snippet = text.trim().slice(0, 16_384);
+        for (const en of targets) en.leftText = snippet;
+        needLeft.delete(line);
+        if (needLeft.size === 0) break;
+      }
+    }
+  }
+
   return { mode: keyField ? 'key' : 'line', keyField, added, removed, modified, unchanged, entries };
 }
 
 /**
  * Merges multiple JSON/JSONL/compressed files into a single JSONL stream with `_file` source metadata injected.
+ * Handles JSONL, pretty-printed `.json` arrays, and concatenated multi-line JSON streams cleanly.
  */
 export async function readMergedJsonl(uris: vscode.Uri[], maxBytes = 80 * 1024 * 1024): Promise<string> {
   const out: string[] = [];
   let bytes = 0;
+  const pushRecord = (base: string, compact: string): boolean => {
+    const trimmed = compact.trim();
+    if (!trimmed) return true;
+    const prefix = `{"_file":${JSON.stringify(base)},`;
+    const lineOut =
+      trimmed.startsWith('{') && trimmed.endsWith('}')
+        ? trimmed === '{}'
+          ? `{"_file":${JSON.stringify(base)}}`
+          : prefix + trimmed.slice(1)
+        : `{"_file":${JSON.stringify(base)},"value":${trimmed}}`;
+    bytes += lineOut.length + 1;
+    if (bytes > maxBytes) return false;
+    out.push(lineOut);
+    return true;
+  };
+
   for (const uri of uris) {
     const base = uri.path.split('/').pop() ?? uri.fsPath;
-    const prefix = `{"_file":${JSON.stringify(base)},`;
-    for await (const { text } of readLinesStream(uri)) {
-      const trimmed = text.trim();
-      if (!trimmed) continue;
-      let lineOut: string;
-      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-        lineOut = trimmed === '{}' ? `{"_file":${JSON.stringify(base)}}` : prefix + trimmed.slice(1);
-      } else {
-        lineOut = `{"_file":${JSON.stringify(base)},"value":${trimmed}}`;
+    const isPlainJsonExt = /\.json(\.(gz|br|zst))?$/i.test(uri.path);
+    if (isPlainJsonExt) {
+      // Read whole `.json` file (up to remaining budget) so pretty-printed arrays & multi-line objects stay valid.
+      const raw = await readAllUtf8(uri, Math.min(50 * 1024 * 1024, Math.max(1024, maxBytes - bytes)));
+      const trimmed = raw.trim();
+      if (trimmed.startsWith('[')) {
+        try {
+          const arr = JSON.parse(trimmed);
+          if (Array.isArray(arr)) {
+            for (const item of arr) {
+              if (!pushRecord(base, JSON.stringify(item))) break;
+            }
+            if (bytes > maxBytes) break;
+            continue;
+          }
+        } catch {
+          // Fall through to splitJsonValues / line mode
+        }
       }
-      bytes += lineOut.length + 1;
-      if (bytes > maxBytes) break;
-      out.push(lineOut);
+      const spans = splitJsonValues(raw);
+      if (spans.length >= 1) {
+        for (const sp of spans) {
+          if (!pushRecord(base, minifyJson(raw.slice(sp.start, sp.end)))) break;
+        }
+        if (bytes > maxBytes) break;
+        continue;
+      }
+    }
+    for await (const { text } of readLinesStream(uri)) {
+      if (!pushRecord(base, text)) break;
     }
     if (bytes > maxBytes) break;
   }

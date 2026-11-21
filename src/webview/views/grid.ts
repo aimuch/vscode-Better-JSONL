@@ -353,7 +353,22 @@ export class GridView implements View {
     this.colJob?.stop();
     const n = m.count;
     const arrays = cols.map(() => new Array<Cell>(n));
-    const keys = cols.map((c) => (c === VALUE_COL ? null : isPromotedCol(c) ? promotedSegs(c) : keyOf(c)));
+    const keys = cols.map((c) => {
+      if (c === VALUE_COL) return null;
+      if (isPromotedCol(c)) return promotedSegs(c);
+      if (isComputedCol(c)) {
+        const def = this.app.state.grid.computedCols.find((x) => x.id === c);
+        if (!def) return { comp: null as Program | null };
+        let prog = this.compProgCache.get(def.expr);
+        if (prog === undefined) {
+          if (this.compProgCache.size >= 200) this.compProgCache.clear();
+          prog = compileQuery(def.expr).program ?? null;
+          this.compProgCache.set(def.expr, prog);
+        }
+        return { comp: prog };
+      }
+      return keyOf(c);
+    });
     let i = 0;
     let stop = () => undefined as void;
     const job = { cols, stop: () => stop() };
@@ -366,18 +381,22 @@ export class GridView implements View {
         const v = m.scanValue(i);
         for (let k = 0; k < cols.length; k++) {
           const key = keys[k];
-          const cell =
-            v === undefined
-              ? undefined
-              : key === null
-                ? isObj(v)
-                  ? undefined
-                  : v
-                : Array.isArray(key)
-                  ? getAt(v, key)
-                  : isObj(v) && Object.prototype.hasOwnProperty.call(v, key)
-                    ? v[key]
-                    : undefined;
+          let cell: JVal | undefined;
+          if (v === undefined) cell = undefined;
+          else if (key === null) cell = isObj(v) ? undefined : v;
+          else if (Array.isArray(key)) cell = getAt(v, key);
+          else if (typeof key === 'object') {
+            if (key.comp) {
+              try {
+                const res = key.comp.run(v);
+                cell = res.outs.length ? res.outs[0].v : undefined;
+              } catch {
+                cell = undefined;
+              }
+            }
+          } else {
+            cell = isObj(v) && Object.prototype.hasOwnProperty.call(v, key) ? v[key] : undefined;
+          }
           arrays[k][i] = shapeOf(cell);
         }
         if ((i & 255) === 255 && performance.now() > end) {
@@ -578,6 +597,7 @@ export class GridView implements View {
       if (!def) return undefined;
       let prog = this.compProgCache.get(def.expr);
       if (prog === undefined) {
+        if (this.compProgCache.size >= 200) this.compProgCache.clear();
         const compiled = compileQuery(def.expr);
         prog = compiled.program ?? null;
         this.compProgCache.set(def.expr, prog);
@@ -777,6 +797,7 @@ export class GridView implements View {
       this.rowIds = ids;
       this.sorted = activeSorts.length > 0;
       this.idToRow = null;
+      this.cellRange = null;
     }
     this.computeOffsets();
     this.paintHead();
@@ -949,6 +970,7 @@ export class GridView implements View {
     }
     this.rowsEl.style.transform = `translateY(${st + this.offsets[first] - virtTop}px)`;
     this.rowsEl.innerHTML = html.join('');
+    if (this.cellRange) this.markRangeCells();
     this.measure(first);
   }
 
@@ -1255,6 +1277,9 @@ export class GridView implements View {
     if (cellEl && colIdx >= 0 && rowIdx >= 0 && this.allCols()[colIdx] !== NUM) {
       if (e.shiftKey && this.cellRange) {
         this.cellRange = { r0: this.cellRange.r0, c0: this.cellRange.c0, r1: rowIdx, c1: colIdx };
+        this.markRangeCells();
+        this.app.paintChrome();
+        return;
       } else {
         this.cellRange = { r0: rowIdx, c0: colIdx, r1: rowIdx, c1: colIdx };
       }
@@ -1722,6 +1747,7 @@ export class GridView implements View {
       g.pinnedCols.clear();
       g.promotedCols = [];
       g.computedCols = [];
+      this.compProgCache.clear();
       g.colOrder = [];
       g.widths = {};
     } else if (btn.dataset.cpin !== undefined) {
